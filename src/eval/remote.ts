@@ -12,7 +12,7 @@ import { MCP_TOKEN_FILE } from '../server/mcp-http.js';
 import type { WorkerIdentity } from '../labeling/scheduler.js';
 import { WorkBroker } from '../work/broker.js';
 import type { EvalAgent, WorkTask } from '../work/broker.js';
-import { packFolder } from '../work/eval-archive.js';
+import { folderStamp, packFolder } from '../work/eval-archive.js';
 import { EVAL_FAMILIES, EvalSource, machineOf } from '../work/eval.js';
 import type { EvalCallSpec, EvalEligible, EvalFamily, EvalOutcome, EvalRunStatus, EvalSessionAnswer, EvalSessionSpec, EvalSlotSeen, EvalSourceOptions, EvalSpec } from '../work/eval.js';
 import type { EvalKind } from '../work/kinds.js';
@@ -189,6 +189,19 @@ interface Wanted {
 const POLL_WAIT_MS = 20_000;
 const PUBLISH_BATCH = 100;
 const POLL_KEYS = 4_000;
+
+/**
+ * Whether an archive request's 4xx is `serve` refusing it. 408 and 429 are
+ * not: the request did not arrive whole, or too many did. Nor is a 400 with
+ * nothing in it: `serve` words every refusal of its own, and the bare one is
+ * the HTTP server giving up on a request that stalled on its way. Those are
+ * waited out and sent again, as no answer is.
+ */
+function finalRefusal(status: number, body: string): boolean {
+  if (status < 400 || status >= 500) return false;
+  if (status === 408 || status === 429) return false;
+  return !(status === 400 && !body.trim());
+}
 
 /** `serve`'s broker, over the loopback producer channel and the data root's MCP token. */
 export class ServeQueue implements EvalQueue {
@@ -407,18 +420,57 @@ export class ServeQueue implements EvalQueue {
     return { offered: Boolean(body.offered), slots: { 'eval-call': body.slots?.['eval-call'] ?? [], 'eval-session': body.slots?.['eval-session'] ?? [] }, run: body.run ?? { waiting: 0, leased: 0 }, tasks };
   }
 
-  /** Packed, and uploaded unless `serve` holds it already: a folder every question reads goes up once. */
-  async archive(dir: string, signal: AbortSignal): Promise<{ sha256: string; bytes: number }> {
-    const packed = packFolder(dir);
-    const head = await fetch(`${this.serveUrl}/eval/v1/archives/${packed.sha256}`, { method: 'HEAD', headers: this.headers(false), signal });
-    if (head.ok) return { sha256: packed.sha256, bytes: packed.bytes };
-    if (head.status !== 404 && head.status >= 400 && head.status < 500) throw new ServeRefusedError('archives', head.status, 'serve refused the archive check');
-    const res = await fetch(`${this.serveUrl}/eval/v1/archives/${packed.sha256}`, {
-      method: 'PUT', headers: { ...this.headers(false), 'content-type': 'application/gzip' }, body: packed.gzip(), signal,
+  /** A folder packed once: its id by what its files were (`folderStamp`), so the next question does not read the corpus again. */
+  private readonly packed = new Map<string, { stamp: string; sha256: string; bytes: number }>();
+  /** The upload under way for a folder: the questions that ask together wait for the one. */
+  private readonly uploading = new Map<string, Promise<{ sha256: string; bytes: number }>>();
+
+  /**
+   * Packed, and uploaded unless `serve` holds it already: a folder every
+   * question reads is read once and goes up once. Every question still asks
+   * `serve` whether it holds the archive (it drops those nothing has needed
+   * for a day); only the packing is remembered, and only while no file of the
+   * folder has changed.
+   */
+  archive(dir: string, signal: AbortSignal): Promise<{ sha256: string; bytes: number }> {
+    let pending = this.uploading.get(dir);
+    if (!pending) {
+      pending = this.upload(dir, signal).finally(() => {
+        if (this.uploading.get(dir) === pending) this.uploading.delete(dir);
+      });
+      this.uploading.set(dir, pending);
+    }
+    return pending;
+  }
+
+  private async upload(dir: string, signal: AbortSignal): Promise<{ sha256: string; bytes: number }> {
+    const stamp = folderStamp(dir);
+    let held = this.packed.get(dir);
+    let folder: ReturnType<typeof packFolder> | null = null;
+    if (held?.stamp !== stamp) {
+      folder = packFolder(dir);
+      held = { stamp, sha256: folder.sha256, bytes: folder.bytes };
+      this.packed.set(dir, held);
+    }
+    const at = { sha256: held.sha256, bytes: held.bytes };
+    const head = await fetch(`${this.serveUrl}/eval/v1/archives/${at.sha256}`, { method: 'HEAD', headers: this.headers(false), signal });
+    if (head.ok) return at;
+    if (head.status !== 404) {
+      if (finalRefusal(head.status, 'check')) throw new ServeRefusedError('archives', head.status, 'serve refused the archive check');
+      throw new Error(`archive check failed: ${head.status}`);
+    }
+    folder ??= packFolder(dir);
+    if (folder.sha256 !== at.sha256) {
+      this.packed.delete(dir);
+      throw new Error(`${dir} changed while its archive was checked`);
+    }
+    const res = await fetch(`${this.serveUrl}/eval/v1/archives/${at.sha256}`, {
+      method: 'PUT', headers: { ...this.headers(false), 'content-type': 'application/gzip' }, body: folder.gzip(), signal,
     });
-    if (res.status >= 400 && res.status < 500) throw new ServeRefusedError('archives', res.status, (await res.text()).slice(0, 200));
-    if (!res.ok) throw new Error(`archive upload failed: ${res.status} ${(await res.text()).slice(0, 200)}`);
-    return { sha256: packed.sha256, bytes: packed.bytes };
+    if (res.ok) return at;
+    const text = (await res.text()).slice(0, 200);
+    if (finalRefusal(res.status, text)) throw new ServeRefusedError('archives', res.status, text);
+    throw new Error(`archive upload failed: ${res.status} ${text}`);
   }
 
   async lease(who: LocalSlotIdentity, kinds: EvalKind[]): Promise<WorkTask[]> {

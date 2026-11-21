@@ -39,22 +39,59 @@ function walk(root: string, rel = '', out: string[] = []): string[] {
   return out;
 }
 
-/** Pack a folder: its files in path order, as described above. */
+/**
+ * Pack a folder: its files in path order, as described above. The id is
+ * hashed a file at a time and the stream is only built when `gzip()` is
+ * called: a corpus of hundreds of megabytes that the server holds already
+ * costs one read, and nothing of it stays in memory.
+ */
 export function packFolder(dir: string): PackedFolder {
   const files = walk(dir).sort();
   if (files.length > ARCHIVE_MAX_FILES) throw new Error(`${dir}: ${files.length} files, more than an archive takes (${ARCHIVE_MAX_FILES})`);
-  const parts: Buffer[] = [Buffer.from(MAGIC)];
+  const hash = crypto.createHash('sha256').update(MAGIC);
+  let bytes = Buffer.byteLength(MAGIC);
   let total = 0;
   for (const rel of files) {
     const data = fs.readFileSync(path.join(dir, rel));
     total += data.length;
     if (total > ARCHIVE_MAX_BYTES) throw new Error(`${dir}: more than ${ARCHIVE_MAX_BYTES} bytes, more than an archive takes`);
-    parts.push(Buffer.from(`${JSON.stringify({ p: rel, n: data.length })}\n`), data);
+    const head = Buffer.from(`${JSON.stringify({ p: rel, n: data.length })}\n`);
+    hash.update(head).update(data);
+    bytes += head.length + data.length;
   }
-  const raw = Buffer.concat(parts);
-  const sha256 = crypto.createHash('sha256').update(raw).digest('hex');
+  const sha256 = hash.digest('hex');
   let gzip: Buffer | null = null;
-  return { sha256, bytes: raw.length, files: files.length, gzip: () => (gzip ??= zlib.gzipSync(raw, { level: 6 })) };
+  return {
+    sha256,
+    bytes,
+    files: files.length,
+    gzip: () => {
+      if (gzip) return gzip;
+      const parts: Buffer[] = [Buffer.from(MAGIC)];
+      for (const rel of files) {
+        const data = fs.readFileSync(path.join(dir, rel));
+        parts.push(Buffer.from(`${JSON.stringify({ p: rel, n: data.length })}\n`), data);
+      }
+      const raw = Buffer.concat(parts);
+      // read a second time: the bytes sent must be the bytes named
+      if (crypto.createHash('sha256').update(raw).digest('hex') !== sha256) throw new Error(`${dir} changed while it was packed`);
+      return (gzip = zlib.gzipSync(raw, { level: 6 }));
+    },
+  };
+}
+
+/**
+ * What a folder's files are without reading them: every path with its size
+ * and modification time. Two equal stamps are the same folder for packing; a
+ * file written again differs in one of the two.
+ */
+export function folderStamp(dir: string): string {
+  const hash = crypto.createHash('sha256');
+  for (const rel of walk(dir).sort()) {
+    const st = fs.statSync(path.join(dir, rel));
+    hash.update(`${rel}\0${st.size}\0${st.mtimeMs}\n`);
+  }
+  return hash.digest('hex');
 }
 
 /** A path inside the archive's folder, or an error: no absolute path, no climbing out, nothing hidden at the top that a CLI reads as its own. */
