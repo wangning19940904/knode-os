@@ -1,6 +1,6 @@
 # 36 — Evaluation protocol: what the next run must show, decided before it runs
 
-> **Record status (2026-11-22): run started 2026-11-21 20:32; Q2, Q3 and Q4 answered (§5); Q1 answered at budget 3 on one pack, the rest resumed after a stop (§6).** This is a decision record for one run, not the description of the system.
+> **Record status (2026-11-22): run started 2026-11-21 20:32 and finished 2026-11-22 05:14; all four questions answered (§5). Q1 is a tie at both budgets with knode costing more; reading it found two grading defects and wrong gold in the sample (§5, "What the reading of Q1 found").** This is a decision record for one run, not the description of the system.
 
 ## 0. Why
 
@@ -106,6 +106,56 @@ The wiki arm is within 0.02 of grep with an interval that holds zero: the 14 los
 | `agent-knode` (tools only) | 0.550 | +0.008 (−0.046 to +0.063; Holm p 0.85; 6 better, 6 worse) | 54,716 | 99,407 | 339 |
 
 Neither comparison clears zero, and neither reaches the 0.05 the protocol asks for. The budget held loosely: the brief names three commands and the cap is five steps, so the arms ran 3.5, 3.7 and 4.2 commands an answer. The full arm called a knode tool in none of its 120 answers (it read `wiki/index.md` and grepped), so at this budget it is the wiki arm; the tools-only arm, which can do nothing else, ties grep at 58% more tokens and loses 3 of 11 temporal questions. Aggregation, where the headroom was (59 questions): grep 0.305, full 0.356, tools 0.362, both intervals holding zero.
+
+The 0.537, 0.571 and 0.550 above are the scores as recorded. Two things found afterwards change how they read (below): an arm stopped at its sixth command records an empty answer (grep 4, full 7, tools-only 19 of 120), and the set questions were graded by the shape of the answer's `items` block. Read by content the three arms score 0.596, 0.588 and 0.584.
+
+### Q1, budget 3, `real-mudabench` (107) and pooled
+
+| arm | correctness | − grep (paired) | stopped at the sixth command |
+| --- | --- | --- | --- |
+| `agent-grep` | 0.416 | — | 13 of 107 |
+| `agent-knode-full` | 0.374 | −0.042 (95% CI −0.121 to +0.037; 8 better, 12 worse) | 30 |
+| `agent-knode` (tools only) | 0.087 (104 scored) | −0.341 (−0.433 to −0.250; 0 better, 36 worse) | 92 |
+
+The named comparisons, pooled over both packs with `real-loong-finance` read by content: full − grep −0.024 over 227 (95% CI −0.066 to +0.018; Holm p 0.28), tools-only − grep −0.168 over 223 (−0.217 to −0.121; Holm p < 0.001). As recorded they are −0.002 and −0.155. No arm is 0.05 above grep; the tools-only arm is far below it, and not because its answers are wrong: on the questions where both it and grep wrote an answer it ties (+0.005 over 100 on `real-loong-finance`; 15 questions on `real-mudabench`). A `real-mudabench` question needs a figure from 9 to 19 annual reports; one shell command reads them all, one `knode_grep` returns a capped slice, so the tools-only arm is still reading when it is stopped. At three commands knode's tools cost steps where the protocol asked whether they buy them.
+
+### Q1, budget 20
+
+`real-loong-finance`, 120 questions:
+
+| arm | recorded | read by content | − grep, by content | tokens an answer | per correct answer, against grep |
+| --- | --- | --- | --- | --- | --- |
+| `agent-grep` | 0.546 | 0.613 | — | 47,319 | 77,255 |
+| `agent-rag` | 0.567 | 0.600 | −0.013 (−0.033 to 0.000) | 53,648 | 1.16× (1.05 to 1.28) |
+| `agent-knode-wiki-sources` | 0.588 | 0.604 | −0.008 (−0.033 to +0.013) | 63,684 | 1.36× (1.25 to 1.50) |
+| `agent-knode-full` | 0.592 | 0.600 | −0.013 (−0.033 to 0.000) | 64,721 | 1.40× (1.27 to 1.54) |
+| `agent-knode` | 0.609 | 0.618 | 0.000 (−0.013 to +0.013; 119) | 71,134 | 1.51× (1.34 to 1.69) |
+
+`real-mudabench`, 107 questions, as recorded:
+
+| arm | correctness | − grep | tokens an answer | per correct answer, against grep |
+| --- | --- | --- | --- | --- |
+| `agent-grep` | 0.519 | — | 91,728 | 176,846 |
+| `agent-rag` | 0.523 | +0.005 (−0.051 to +0.061) | 101,483 | 1.10× (0.96 to 1.25) |
+| `agent-knode-wiki-sources` | 0.589 | +0.070 (+0.009 to +0.136; 10 better, 3 worse) | 102,338 | 0.98× (0.85 to 1.13) |
+| `agent-knode-full` | 0.533 | +0.014 (−0.037 to +0.065) | 114,282 | 1.21× (1.08 to 1.36) |
+| `agent-knode` | 0.548 (104) | +0.024 (−0.043 to +0.096) | 143,360 | 1.52× (1.28 to 1.79) |
+
+The named comparison, tokens per correct answer, full against grep, pooled over 227: 1.29× (95% CI 1.20 to 1.39), 1.22× as recorded. Correctness is a tie: pooled, full − grep 0.000 (−0.026 to +0.026), tools-only +0.011 (−0.022 to +0.045), wiki arm +0.029 (−0.002 to +0.062). The wiki arm's +0.070 on `real-mudabench` is description, not a named comparison (Holm p 0.11 among the four), on a pack where the same arm answered twice changes 3 to 6 of 30 answers (grep's second answers average 0.117 below its first); on `real-loong-finance` the repeats change 0 to 3 of 30. The full arm called a knode tool in 2 of 120 and 4 of 107 answers and in none at budget 3, so it is the wiki arm with a different seed. The campaign's one separation, grep 0.40 against 0.52 on 30 questions of `real-mudabench`, is not there on 107: grep scores 0.519.
+
+Single calls on every question: `knode-ask` 0.291 against `rag-hybrid` 0.123 over the 624 of `real-loong-finance` (+0.168, 95% CI +0.136 to +0.201); both 0.000 on `real-mudabench`, as in the campaign.
+
+By the rule of §1: a tie at both budgets with knode costing more. For an agent that has the files, pages and tools add no correct answers on these two packs and cost 14% to 53% more tokens for each one.
+
+### What the reading of Q1 found
+
+As recorded, the three knode arms were 0.04 to 0.06 above grep on `real-loong-finance` at budget 20, intervals clear of zero. None of it is there. `~/knode-eval/runs/protocol36-20261121/rescore_sets.py` reads the same answers again without a model.
+
+1. **Set questions are graded by the shape of the `items` block.** The gold of an aggregation question is one item a member ("亿纬锂能: 高利润"). The exact-set score pairs one returned item with one gold item, so an answer that lists a class with its members ("中利润：百亚股份、蓝晓科技") matches one member a class and scores 0 with every member in its class. Eight of grep's 65 aggregation answers were lost to this, against one or two of each knode arm's: that difference was the whole recorded gain. Read for the members and classes each label names, every answer scored 1 stays 1 and the arms are within 0.013 of each other.
+2. **The gold of the sample is wrong where the headroom was.** Of the 58 aggregation questions, all five arms are right on 23, some on 3, and none on 32; on each of those 32 all five arms put the same member in a class the gold does not, through three different interfaces. Four were checked against the filings and the gold is wrong in all four: 平安银行 reports in 人民币百万元 and its 18,525 is graded as a profit under 1,000,000,000; GSE Systems reports in thousands and its $4,746 is graded "below 100,000"; 格力电器's 5,318,471,160.65 is graded a loss; 联科科技's 5,117,932.64 is graded "above 10,000,000". The allocation by headroom took its questions from where the campaign's arms had scored low, which is where the gold is wrong: 32 of the 120 can be won by no arm, and on the other 88 grep scores 0.835. On `real-mudabench` the five arms return the same items and none is scored right on 21 of 107; those were not checked.
+3. **A stopped agent records nothing.** At budget 3 the agent is told three commands and its session is killed at the sixth, with an empty answer and no tokens recorded. The budget-3 score therefore mixes "can answer in five steps" with "stops when told", and the tokens of the arms that are stopped most are undercounted.
+
+Before another run reads correctness on these packs: the exact-set score has to read a grouped item as its members; the 32 questions (and the 21) have to be checked against the filings and repaired or removed, and headroom allocation has to draw from questions at least one arm has answered; a stopped agent has to be asked for its answer, or its stop recorded as its own outcome.
 
 ## 6. The stop on 2026-11-21, and what it changed
 
