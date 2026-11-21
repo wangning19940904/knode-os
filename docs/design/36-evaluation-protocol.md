@@ -1,6 +1,6 @@
 # 36 — Evaluation protocol: what the next run must show, decided before it runs
 
-> **Record status (2026-11-21): prepared; pilot and run not started.** This is a decision record for one run, not the description of the system.
+> **Record status (2026-11-22): run started 2026-11-21 20:32; Q2, Q3 and Q4 answered (§5); Q1 answered at budget 3 on one pack, the rest resumed after a stop (§6).** This is a decision record for one run, not the description of the system.
 
 ## 0. Why
 
@@ -74,3 +74,42 @@ Read as: wiki arm within 0.02 of grep, interval holding zero → the harness was
 | Q4 and the single-call track (2 systems) | — | about 3,700 | — |
 
 About 2,500 agent sessions against the campaign's 4,210, on four packs instead of 26.
+
+## 5. Results
+
+Run directory `~/knode-eval/runs/protocol36-20261121` (`run.sh`, `resume.sh`, `analyze.py`, `stages.log`); answers `spacex-aiops/gpt-6.1-sol` on the remote pool, judge `wangning/claude-sonnet-5-5[1m]`, no answer errors in any stage.
+
+### Q3 — answered: the harness was the cause
+
+Every update question of the two reports packs, after fresh builds whose update batches regenerated the pages they dirtied.
+
+| arm | zh (60) | en (61) | pooled − grep (121) | stale answers |
+| --- | --- | --- | --- | --- |
+| `agent-grep` | 1.000 | 0.934 | — | 0 of 68 |
+| `agent-knode-wiki-sources` | 1.000 | 0.918 | −0.008 (95% CI −0.025 to 0.000; 0 better, 1 worse) | 1 of 68 |
+| `agent-knode-full` | 1.000 | 0.951 | +0.008 (−0.017 to +0.041; 2 better, 1 worse) | 1 of 68 |
+| `knode-ask` | 0.733 | 0.689 | −0.256 (−0.347 to −0.174) | 16 of 68 |
+| `rag-hybrid` | 0.700 | 0.852 | −0.190 (−0.264 to −0.116) | 17 of 68 |
+
+The wiki arm is within 0.02 of grep with an interval that holds zero: the 14 lost update questions of the campaign were the harness leaving pages stale. Description, not a named comparison: Ask is wrong on a quarter of the update questions, by the previous value or by declining ("the current limit is unconfirmed; the last explicitly set amount was $5,000") while an agent with the same index's pages answers them all. Four English questions (`upd-metric-D1T3-01` to `-04`) are missed by every arm with different figures each: gold or question to check before they are used again.
+
+### Q2 — as the free gate said
+
+`knode-ask-hops` − `knode-ask`: 0.000 over 25 questions of `public-musique` (1 better, 1 worse), +0.017 over 30 of `public-musique-deep` (2 better, 2 worse).
+
+### Q1, budget 3, `real-loong-finance` (120 questions by headroom)
+
+| arm | correctness | − grep (paired) | weighted tokens an answer | per correct answer | median seconds |
+| --- | --- | --- | --- | --- | --- |
+| `agent-grep` | 0.537 | — | 34,672 | 64,507 | 186 |
+| `agent-knode-full` | 0.571 | +0.033 (95% CI −0.013 to +0.083; Holm p 0.34; 8 better, 3 worse) | 49,260 | 86,294 | 262 |
+| `agent-knode` (tools only) | 0.550 | +0.008 (−0.046 to +0.063; Holm p 0.85; 6 better, 6 worse) | 54,716 | 99,407 | 339 |
+
+Neither comparison clears zero, and neither reaches the 0.05 the protocol asks for. The budget held loosely: the brief names three commands and the cap is five steps, so the arms ran 3.5, 3.7 and 4.2 commands an answer. The full arm called a knode tool in none of its 120 answers (it read `wiki/index.md` and grepped), so at this budget it is the wiki arm; the tools-only arm, which can do nothing else, ties grep at 58% more tokens and loses 3 of 11 temporal questions. Aggregation, where the headroom was (59 questions): grep 0.305, full 0.356, tools 0.362, both intervals holding zero.
+
+## 6. The stop on 2026-11-21, and what it changed
+
+Three stages stopped early while the driver went on: `q1-b20` on both packs (after the grep, RAG and single-call arms; before the knode arms) and `q1-b3/real-mudabench` (before its first answer). `publishAgent` packed the corpus folder for every question, at once: 107 synchronous reads of a 140 MB folder, each copy kept in memory, so the run stalled, its requests to `serve` timed out half-sent (408, and one bare 400), and the harness took the timeout for a refusal and stopped the pack. The campaign had met the same and patched it at load time in its private hook; nothing of that was in the source.
+
+Fixed in c395e79: a folder is hashed a file at a time and its stream built only when sent (224 ms for the 140 MB folder, 7 s more to compress when it has to go up); the questions that ask together share one upload and a folder's id is remembered while none of its files changed (5 ms a question); 408, 429 and a bare 400 on the archive routes are waited out. The three stages were resumed from a frozen build of that commit (`resume.sh c395e79041`): the first rule of §2 is broken to that extent, and the difference between the two builds is `src/work/eval-archive.ts` and `src/eval/remote.ts`, neither of which an answer or a score passes through. `run.sh` also recorded `date`'s exit status as the stage's, so `stages.log` says "exit 0" for the stopped stages; `resume.sh` records the run's own.
+
