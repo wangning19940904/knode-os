@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { defaultConfig, defaultRoutedLlmConfig, KnodeConfig, LlmConnection } from '../../config.js';
+import { defaultConfig, defaultRoutedLlmConfig, KnodeConfig, LlmConnection, type SagSearchConfig } from '../../config.js';
 import { AppContext, createContext } from '../../context.js';
 import { runDocumentPass } from '../../ingest/background.js';
 import { sync } from '../../ingest/sync.js';
@@ -11,6 +11,8 @@ import { search } from '../../search/search.js';
 import { toDateString } from '../../store/temporal.js';
 import type { ChatMessage, LlmClient } from '../../llm/client.js';
 import { generateWiki } from '../../wiki/generate.js';
+import { refreshNavigationIfChanged } from '../../wiki/navigation.js';
+import { reconcileViews, type ReconcileStats } from '../../wiki/pages.js';
 import { refineWiki } from '../../wiki/refine.js';
 import { isolatedCopy, runAgent } from '../agent.js';
 import { formatTag } from '../meter.js';
@@ -506,6 +508,32 @@ async function drain(ctx: AppContext, env: SystemEnv): Promise<Record<string, nu
   return totals;
 }
 
+/**
+ * What `serve` does after a batch of new documents is extracted, past what a
+ * document pass does itself: its review round (src/labeling/followup.ts) runs
+ * the audits and `afterExtraction`, as `runDocumentPass` does, and then brings
+ * every page those steps or the new claims dirtied up to date without a model
+ * (`reconcileViews`, llm off) and refreshes the navigation. A pass leaves that
+ * to the next sync, and an update batch's next sync was the next batch's
+ * first step: without this a batch's pages were re-rendered only when the
+ * following batch arrived — its questions read the pages as of the batch
+ * before, beside the new document — and the last batch's never were (in the
+ * 2026-11 campaign 174 entity pages and a timeline of the 10× reports build
+ * were left dirty). Nothing more than serve does: no model
+ * pass over the wiki (`wiki generate`) and no refine, which serve runs only on
+ * its nightly schedule.
+ */
+async function reviewLikeServe(ctx: AppContext, env: SystemEnv): Promise<ReconcileStats> {
+  const views = await reconcileViews(ctx, { actor: 'tier1', llm: false });
+  try {
+    await refreshNavigationIfChanged(ctx, { actor: 'tier1' });
+  } catch (err) {
+    env.log(`knode update: navigation failed: ${err instanceof Error ? err.message : err}`);
+  }
+  env.log(`knode update: ${views.regenerated} pages regenerated, ${views.archived} archived, ${views.deferred} left for a model pass`);
+  return views;
+}
+
 function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], answers: boolean, extra: Partial<SystemUnderTest>): SystemUnderTest {
   return {
     id,
@@ -659,17 +687,59 @@ export function askOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): { compu
   return { ...(on !== undefined ? { computed: on } : {}), ...(now ? { now } : {}) };
 }
 
+/** What one Ask system answers with beyond the workspace's config: `ask`'s options, and retrieval settings over the build's. */
+interface AskTuning {
+  options: { computed?: boolean; now?: string };
+  /** Over the workspace's `retrieval.sag`, for every search this system's answers make. */
+  sag?: Partial<SagSearchConfig>;
+}
+
+/**
+ * `knode-ask-hops`: Ask with the retrieval built for hop and aggregate
+ * questions switched on, beside the default `knode-ask` on the same build —
+ * bridge terms on the SAG walk (src/search/bridge.ts; 20 terms with 70% of the
+ * places kept for the direct route, the setting the 2026-11 offline
+ * measurements found best: MuSiQue all-evidence@10 28.4 → 33.4) and sets,
+ * counts and values as of a day computed from the claims (docs/design/34 §1).
+ * Both are off by default in the product, and were off in the 2026-11
+ * campaign (its `run.json`: `askOptions: {}`; the workspaces' `retrieval.sag`
+ * had no `bridgeTerms`). The reference day is the run's, as for `knode-ask`.
+ * Rerank stays as the workspace has it: an evaluation starts no reranker.
+ */
+export const ASK_HOPS_SAG: Partial<SagSearchConfig> = { bridgeTerms: 20, directRatio: 0.7 };
+
+/** The workspace's config with `tuning`'s retrieval settings over it; the config itself when there are none. */
+function tunedConfig(config: KnodeConfig, tuning: AskTuning): KnodeConfig {
+  if (!tuning.sag) return config;
+  return { ...config, retrieval: { ...config.retrieval, sag: { ...config.retrieval.sag, ...tuning.sag } } };
+}
+
 export function knodeAsk(options: { computed?: boolean; now?: string } = askOptionsFromEnv()): SystemUnderTest {
+  return askSystem('knode-ask', 'knode-os ask (hybrid retrieval, cited answer)', { options });
+}
+
+export function knodeAskHops(env: NodeJS.ProcessEnv = process.env): SystemUnderTest {
+  // the run's reference day, as knode-ask has it; computed sets on, whatever KNODE_EVAL_ASK_COMPUTED says
+  const { now } = askOptionsFromEnv(env);
+  return askSystem('knode-ask-hops', `knode-os ask with bridge terms (${ASK_HOPS_SAG.bridgeTerms}, ${Math.round(ASK_HOPS_SAG.directRatio! * 100)}% direct) and computed sets`, {
+    options: { computed: true, ...(now ? { now } : {}) },
+    sag: ASK_HOPS_SAG,
+  });
+}
+
+function askSystem(id: string, label: string, tuning: AskTuning): SystemUnderTest {
+  const { options } = tuning;
   // as wide as the run's answer concurrency: every answer shares the one open context (docs/design/31 D2)
-  return knodeSystem('knode-ask', 'knode-os ask (hybrid retrieval, cited answer)', 'kb', true, {
+  return knodeSystem(id, label, 'kb', true, {
+    settings: { askOptions: options, ...(tuning.sag ? { sag: tuning.sag } : {}) },
     async answer(task, prompt, env) {
       const s = stateFor(env);
       const ctx = await open(s);
       // ask retrieves with its question: give it the question alone, and the shared output rules to its model call
       const rules = prompt.startsWith(task.question) ? prompt.slice(task.question.length) : '';
-      const llm = withAppendedRules(shimClient(env, { system: 'knode-ask', stage: 'answer', task: task.id }), rules);
+      const llm = withAppendedRules(shimClient(env, { system: id, stage: 'answer', task: task.id }), rules);
       // against the index as built: an answer records no hits, so no question moves another's ranking (docs/design/31 D3)
-      const res = await ask(ctx.store, ctx.config, ctx.embedder, llm, task.question, { mode: 'hybrid', track: false, ...options });
+      const res = await ask(ctx.store, tunedConfig(ctx.config, tuning), ctx.embedder, llm, task.question, { mode: 'hybrid', track: false, ...options });
       // ask's own [n] citations, each the documents of the passage or fact it numbers, and any [doc: path] the
       // answer wrote under the shared output rules
       const docs = new Set(env.staged.docs.map((d) => d.path));
@@ -685,7 +755,7 @@ export function knodeAsk(options: { computed?: boolean; now?: string } = askOpti
     async retrieve(query, k, env) {
       const s = stateFor(env);
       const ctx = await open(s);
-      const res = await ask(ctx.store, ctx.config, ctx.embedder, withoutModel(ctx.llm), query, { mode: 'hybrid', track: false, ...options });
+      const res = await ask(ctx.store, tunedConfig(ctx.config, tuning), ctx.embedder, withoutModel(ctx.llm), query, { mode: 'hybrid', track: false, ...options });
       return sentDocuments(s, res, new Set(env.staged.docs.map((d) => d.path))).slice(0, k);
     },
     async exportKnowledge(env) {
@@ -702,6 +772,7 @@ export function knodeAsk(options: { computed?: boolean; now?: string } = askOpti
         assertNoLeak(s.ws, env.pack.dir, `after update batch ${batch ?? ''}`.trim());
         await sync(ctx, { datasources: false });
         await drain(ctx, env);
+        await reviewLikeServe(ctx, env);
         readPageSources(s);
       } catch (err) {
         setState(s, (e) => ({ ...e, state: 'failed', error: `update ${batch ?? ''}: ${(err instanceof Error ? err.message : String(err)).slice(0, 500)}` }));

@@ -69,6 +69,11 @@ export interface SystemUnderTest {
   kind: 'reference' | 'agent' | 'pipeline' | 'kb';
   /** Does it produce answers (false: scored on retrieval only). */
   answers: boolean;
+  /**
+   * What it answers with beyond its build's own settings, for a run to record beside its answers: `knode-ask`'s
+   * options, and `knode-ask-hops`'s retrieval switches over the same build.
+   */
+  settings?: Record<string, unknown>;
   /** Do its answers cite corpus documents (false: they cite records of its own, and citation scores do not apply). */
   cites?: boolean;
   /** Can it run on this pack at all (a staged corpus too large for long context, an external system off this pack). */
