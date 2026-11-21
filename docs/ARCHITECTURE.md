@@ -294,6 +294,22 @@ Agents do not use `ask`; they browse with the MCP tools (`knode_search`,
 pack and plan from playbook packs, capabilities and intents; `knode_feedback`
 writes receipts that feed the learning pages in `wiki/learning/`.
 
+`knode_claims` (`src/store/claims.ts`) dates every claim by its event time,
+else the start of its validity, else a date its text states, else its first
+source, and both `event_range` and `order: "timeline"` use that date, so an
+undated restatement in a weekly report is placed by its week instead of
+sorting last or falling out of a window. A timeline includes superseded
+values by default and folds restatements (`src/graph/claim-timeline.ts`): a
+value repeated in later reports stays one entry with `repeats`, a value
+change starts a new one, and a measurement series (weekly progress, a metric)
+is one entry with each change in `readings`; `fold: false` lists every row,
+and `truncated` / `note` say what the limit left out. A subject reaches the
+entities merged into it and a short-name twin its aliases list; `related`
+adds its parts and members (`part_of` / `member_of` / `works_at`) and the
+claims with it as object; `first_mention` keeps each subject's earliest
+claim, for counting what was new in a period. `enumerateClaims` takes the
+same fold as an option (`fold`).
+
 ## 7. Work queue and remote workers
 
 One broker (`src/work/broker.ts`) leases pieces of the eight work kinds to

@@ -26,7 +26,7 @@ import { recordFeedback } from '../compiler/receipts.js';
 import { isVirtualPath, readVirtual } from '../compiler/vfs.js';
 import { renderCapabilityDts } from '../capability/dts.js';
 import { listCapabilities, locatorsForEntities } from '../capability/store.js';
-import { queryClaims } from '../store/claims.js';
+import { claimQueryFromArgs, queryClaims } from '../store/claims.js';
 import { CATALOG_SOURCE, CATALOG_VIEWS, catalogQuery } from '../store/catalog.js';
 import { resolveScopeFilter, resolveTemporal, SOURCE_KINDS } from '../store/resolver.js';
 import { listDatasets, listSuggestions } from '../store/queries.js';
@@ -433,7 +433,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
     {
       title: 'Query claims directly',
       description:
-        'Time-bound assertions as structured rows, instead of prose you have to read and trust. Each claim carries its world-time validity window, its status among conflicting sources (fact / suspected / disputed), its kind (fact / opinion / prediction / rumor), the source path that supports it and how many evidence rows back it. Use this when the question is "what do we hold about X, and since when", and for how something changed: order=timeline gives one entity\'s chronology (progress at each month-end, a risk from raised to closed) in one call; text= finds every claim with a word across all entities (everyone who moved teams). as_of asks what was believed then, valid_at / valid_range ask what holds in the world, and stale=true means the validity window has already closed. For a value now or as of a date, check the latest source: a document that changes a value under a code or short name may not have updated its claim.',
+        'Time-bound assertions as structured rows, instead of prose you have to read and trust. Each claim carries its world-time validity window, its status among conflicting sources (fact / suspected / disputed), its kind (fact / opinion / prediction / rumor), the source path that supports it and how many evidence rows back it, and `date` with its basis (event / validity / stated / document). Use this when the question is "what do we hold about X, and since when", and for how something changed: order=timeline gives one entity\'s chronology in one call, oldest first, superseded values included, each change once — a value restated in later reports folds into the entry where it first appeared (`repeats` gives how often and when), and a measurement series (weekly progress, a metric) is one entry with every change of value in `readings`; fold=false lists every claim. related=true adds the claims about its parts and members and those with it as the object (what changed in a team: people joining and leaving, its projects, settings and risks). text= finds every claim with a word across all entities (everyone who moved teams). event_range keeps claims dated in a window; first_mention=true keeps each subject\'s earliest claim, so text="INC-" with event_range="2024Q1" lists the incidents first reported that quarter. `truncated` and `note` say when limit cut entries off. as_of asks what was believed then, valid_at / valid_range ask what holds in the world, and stale=true means the validity window has already closed. For a value now or as of a date, check the latest source: a document that changes a value under a code or short name may not have updated its claim.',
       inputSchema: {
         subject: z.string().optional().describe('Entity id, name or alias the claim is about'),
         object: z.string().optional().describe('Entity id, name or alias on the other side of the claim'),
@@ -443,10 +443,13 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
         claim_kinds: z.array(z.enum(['fact', 'opinion', 'prediction', 'rumor'])).optional()
           .describe('What sort of assertion: fact = happened or holds; opinion = someone\'s view; prediction = a forecast; rumor = unconfirmed. Default: all'),
         text: z.string().optional().describe('Substring of the statement'),
-        event_range: z.string().optional().describe('Only claims whose event time falls in this window: "2026-01-01..2026-06-30", "2026Q2", "2026"'),
-        include_superseded: z.boolean().optional().describe('Also return facts a newer fact of the same subject and type replaced (hidden by default)'),
-        order: z.enum(['recent', 'timeline']).optional().describe('timeline = by event time ascending, for building a chronology'),
-        limit: z.number().int().min(1).max(500).optional().describe('Default 50'),
+        event_range: z.string().optional().describe('Only claims dated in this window — event time, else start of validity, else the date of the source: "2026-01-01..2026-06-30", "2026Q2", "2026"'),
+        include_superseded: z.boolean().optional().describe('Also return facts a newer fact of the same subject and attribute replaced: hidden by default, shown by default in a timeline'),
+        order: z.enum(['recent', 'timeline']).optional().describe('timeline = by date ascending, restatements folded, for building a chronology'),
+        fold: z.boolean().optional().describe('In a timeline, fold restated values and measurement series into one entry each (default true)'),
+        related: z.boolean().optional().describe('Also claims about the subject\'s parts and members, and claims with it as the object (default false)'),
+        first_mention: z.boolean().optional().describe('One claim per subject, its earliest dated one; with event_range, only subjects first dated in the window — for counting new incidents, hires or risks in a period (a later follow-up of an older one is not new)'),
+        limit: z.number().int().min(1).max(500).optional().describe('Entries to return, default 50'),
         as_of: asOfSchema,
         valid_at: validAtSchema,
         valid_range: validRangeSchema,
@@ -456,15 +459,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
         actor: actorSchema,
       },
     },
-    async ({ subject, object, types, statuses, claim_kinds, text, event_range, include_superseded, order, limit, as_of, valid_at, valid_range, kinds, sources, trust, actor }) =>
-      json(await queryClaims(ctx.store, {
-        subject, object, types, statuses, kinds: claim_kinds, text, limit,
-        eventRange: event_range ? (({ validFrom, validTo }) => ({ from: validFrom, to: validTo }))(resolveTemporal({ validRange: event_range })) : undefined,
-        includeSuperseded: include_superseded,
-        order,
-        temporal: resolveTemporal({ asOf: as_of, validAt: valid_at, validRange: valid_range }),
-        filter: resolveScopeFilter({ kinds, sources, trust, actor }),
-      })),
+    async (args) => json(await queryClaims(ctx.store, claimQueryFromArgs(args))),
   );
 
   server.registerTool(

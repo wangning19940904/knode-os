@@ -1,13 +1,17 @@
 import { CLAIM_KINDS, claimTypeOf } from '../graph/store.js';
+import { foldTimeline, TimelineEntry } from '../graph/claim-timeline.js';
 import { Store } from './db.js';
 import {
   NO_FILTER,
   NO_TEMPORAL,
   ResolvedScopeFilter,
   ResolvedTemporal,
+  SourceKind,
   evidenceFilterSql,
   idsPassingFilter,
   overlapsValidWindow,
+  resolveScopeFilter,
+  resolveTemporal,
   validOverlap,
 } from './resolver.js';
 import {
@@ -43,15 +47,82 @@ export interface ClaimQuery {
   kinds?: string[];
   /** Substring of the statement text. */
   text?: string;
-  /** Only claims whose event time falls in this window (ISO instants; open sides null). */
+  /**
+   * Only claims whose date falls in this window (ISO instants; open sides null). The date is the
+   * event time, else the start of validity, else the date the claim's source states or is dated
+   * by: a weekly report's "R-115 is still open" has no event time but is dated by its week.
+   */
   eventRange?: { from?: string | null; to?: string | null };
-  /** Also return facts a newer fact of the same subject and type replaced (default: hidden). */
+  /** Also return facts a newer fact of the same subject and type replaced. Default: hidden, except in a timeline, which is their history. */
   includeSuperseded?: boolean;
-  /** `timeline` orders by event time (then validity start) ascending; default is newest belief first. */
+  /**
+   * `timeline` orders by date ascending (see `eventRange`) and folds restatements into the
+   * change they restate (graph/claim-timeline.ts); default is newest belief first.
+   */
   order?: 'recent' | 'timeline';
+  /** In a timeline, fold repeated readings and series (default true); false lists every row. */
+  fold?: boolean;
+  /**
+   * Also the claims about the subject's parts and members (entities `part_of` / `member_of` /
+   * `works_at` it) and the claims with it as their object: what happened in a team, not only
+   * what was said of the team itself.
+   */
+  related?: boolean;
+  /**
+   * One claim per subject, its earliest dated one; with `eventRange`, the subjects first dated in
+   * the window. What a count of new things in a period reads ("incidents reported in Q1", "risks
+   * raised in 2025"): a later follow-up of an older incident is not a new one.
+   */
+  firstMention?: boolean;
   limit?: number;
   temporal?: ResolvedTemporal;
   filter?: ResolvedScopeFilter;
+}
+
+/** The `knode_claims` tool's arguments, as an agent sends them. */
+export interface ClaimToolArgs {
+  subject?: string;
+  object?: string;
+  types?: string[];
+  statuses?: string[];
+  claim_kinds?: string[];
+  text?: string;
+  event_range?: string;
+  include_superseded?: boolean;
+  order?: 'recent' | 'timeline';
+  fold?: boolean;
+  related?: boolean;
+  first_mention?: boolean;
+  limit?: number;
+  as_of?: string;
+  valid_at?: string;
+  valid_range?: string;
+  kinds?: SourceKind[];
+  sources?: string[];
+  trust?: 'trusted' | 'quarantined' | 'any';
+  actor?: string;
+}
+
+/** The query a `knode_claims` call runs: the one mapping from tool arguments, shared by the tool and offline replays. */
+export function claimQueryFromArgs(a: ClaimToolArgs): ClaimQuery {
+  const range = a.event_range ? resolveTemporal({ validRange: a.event_range }) : null;
+  return {
+    subject: a.subject,
+    object: a.object,
+    types: a.types,
+    statuses: a.statuses,
+    kinds: a.claim_kinds,
+    text: a.text,
+    limit: a.limit,
+    eventRange: range ? { from: range.validFrom, to: range.validTo } : undefined,
+    includeSuperseded: a.include_superseded,
+    order: a.order,
+    fold: a.fold,
+    related: a.related,
+    firstMention: a.first_mention,
+    temporal: resolveTemporal({ asOf: a.as_of, validAt: a.valid_at, validRange: a.valid_range }),
+    filter: resolveScopeFilter({ kinds: a.kinds, sources: a.sources, trust: a.trust, actor: a.actor }),
+  };
 }
 
 export interface ClaimRecord {
@@ -75,6 +146,17 @@ export interface ClaimRecord {
   eventAt: string | null;
   /** Date of the earliest source reporting it. */
   observedAt: string | null;
+  /** The date a timeline places it at and an event range filters on: eventAt, else validFrom, else its source's date. */
+  date: string | null;
+  /** Where `date` comes from: event | validity | stated (in the text, not as an event) | document (the first source's own date). */
+  dateBasis: 'event' | 'validity' | 'stated' | 'document' | null;
+  /** The subject's attribute this claim gives a value of, and that value (docs/design/29). */
+  attribute: string | null;
+  value: string | null;
+  /** In a folded timeline: the same value restated later — how often and on which dates (sources are in `sources`). */
+  repeats?: { count: number; dates: string[] };
+  /** In a folded timeline, a measurement series: each change of value, in date order. */
+  readings?: { date: string | null; value: string | null; source: string | null }[];
   /** A newer fact of the same subject and type replaced this one (kept for history, hidden by default). */
   supersededBy: string | null;
   superseded: boolean;
@@ -92,8 +174,13 @@ export interface ClaimRecord {
 
 export interface ClaimQueryResult {
   claims: ClaimRecord[];
-  /** Matches before `limit` was applied. */
+  /** Matching rows, before folding and `limit`. */
   matched: number;
+  /** Entries after folding (a timeline), before `limit`; equals `matched` when nothing was folded. */
+  entries: number;
+  /** `limit` cut entries off: `note` says what was left out and how to get it. */
+  truncated: boolean;
+  note?: string;
   /** What the resolver actually applied — echoed so agents can see the envelope. */
   applied: string[];
 }
@@ -117,23 +204,65 @@ interface Row {
   event_at?: string | Date | null;
   observed_at?: string | Date | null;
   superseded_by?: string | null;
+  effective_at?: string | Date | null;
+  date_source?: string | null;
+  attribute?: string | null;
+  value_num?: number | null;
+  value_text?: string | null;
+  unit?: string | null;
   source_path: string | null;
   evidence_count: number;
   tx_from: string | null;
 }
 
-/** Entity-reference predicate: id, exact name/alias, else a name substring. */
-function entityRefSql(column: string, p: Params, ref: string): string {
-  const match = () => {
-    const exact = p.add(ref);
-    const like = p.add(`%${ref}%`);
-    return `(er.id = ${exact} OR lower(er.name) = lower(${exact}) OR er.aliases::text ILIKE ${like} OR er.name ILIKE ${like})`;
-  };
-  // an entity merged into the referenced one answers as well
-  return `${column} IN (
-    SELECT er.id FROM entities er WHERE ${match()}
+/**
+ * The date a claim sits at in a timeline, as SQL over `claims cl`: event time, else the start of
+ * validity, else a date its text states, else the first source reporting it — a restated "still
+ * open" sits where it was first said, not at its newest restatement (effective_at), which is last.
+ */
+const dateKey = (a: string) => `COALESCE(${a}.event_at, ${a}.valid_from, CASE WHEN ${a}.date_source = 'stated' THEN ${a}.effective_at END, ${a}.observed_at, ${a}.effective_at)`;
+const DATE_KEY = dateKey('cl');
+
+/**
+ * The entities a reference names, as a subquery of ids: an id, a name or alias
+ * (exact, else as a substring); the entities merged into those; and an entity
+ * named by one of their aliases when nothing else goes by that alias — a
+ * report's short name for a setting ("the pool cap") extracted as an entity of
+ * its own, which the full name's aliases list.
+ */
+function entitySetSql(p: Params, ref: string): string {
+  const exact = p.add(ref);
+  const like = p.add(`%${ref}%`);
+  const match = `(er.id = ${exact} OR lower(er.name) = lower(${exact}) OR er.aliases::text ILIKE ${like} OR er.name ILIKE ${like})`;
+  const named = `SELECT er.id FROM entities er WHERE ${match}`;
+  const aliases = `jsonb_array_elements_text(CASE WHEN jsonb_typeof(er.aliases) = 'array' THEN er.aliases ELSE '[]'::jsonb END)`;
+  return `${named}
     UNION
-    SELECT em.id FROM entities em WHERE em.canonical_id IN (SELECT er.id FROM entities er WHERE ${match()}))`;
+    SELECT em.id FROM entities em WHERE em.canonical_id IN (${named})
+    UNION
+    SELECT et.id FROM entities er CROSS JOIN LATERAL ${aliases} AS a(alias)
+    JOIN entities et ON lower(et.name) = lower(a.alias) AND et.id <> er.id AND et.canonical_id IS NULL
+    WHERE ${match} AND length(a.alias) > 1
+      AND NOT EXISTS (
+        SELECT 1 FROM entities eo
+        WHERE eo.id <> er.id AND eo.id <> et.id AND eo.canonical_id IS DISTINCT FROM er.id
+          AND (lower(eo.name) = lower(a.alias) OR eo.aliases @> to_jsonb(a.alias)))`;
+}
+
+/** Relations that make their source a part or member of their target. */
+const PART_RELATIONS = ['part_of', 'member_of', 'works_at'];
+
+/** Claim-reference predicate on `column` for an entity reference. */
+function entityRefSql(column: string, p: Params, ref: string): string {
+  return `${column} IN (${entitySetSql(p, ref)})`;
+}
+
+/** `related`: claims about the entities or their parts and members, or with them as the object. */
+function relatedRefSql(p: Params, ref: string): string {
+  const set = entitySetSql(p, ref);
+  const parts = `SELECT r.source_id FROM relations r
+    WHERE r.tx_to IS NULL AND r.type IN (${PART_RELATIONS.map((x) => p.add(x)).join(',')}) AND r.target_id IN (${set})`;
+  return `(cl.subject_id IN (${set}) OR cl.subject_id IN (${parts}) OR cl.object_id IN (${set}))`;
 }
 
 export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<ClaimQueryResult> {
@@ -141,10 +270,13 @@ export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<Cla
   const f = q.filter ?? NO_FILTER;
   const limit = Math.min(Math.max(q.limit ?? 50, 1), 500);
   const now = new Date().toISOString();
+  const timeline = q.order === 'timeline';
+  const includeSuperseded = q.includeSuperseded ?? timeline;
+  const empty = (): ClaimQueryResult => ({ claims: [], matched: 0, entries: 0, truncated: false, applied: applied(t, f) });
 
   const p = new Params();
   const where: string[] = [];
-  if (q.subject) where.push(entityRefSql('cl.subject_id', p, q.subject));
+  if (q.subject) where.push(q.related ? relatedRefSql(p, q.subject) : entityRefSql('cl.subject_id', p, q.subject));
   if (q.object) where.push(entityRefSql('cl.object_id', p, q.object));
   if (q.types?.length) {
     const types = [...new Set(q.types.map((x) => claimTypeOf(x) ?? x))];
@@ -152,20 +284,24 @@ export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<Cla
   }
   if (q.statuses?.length) {
     const valid = q.statuses.filter((s) => STATUSES.has(s.toLowerCase()));
-    if (valid.length === 0) return { claims: [], matched: 0, applied: applied(t, f) };
+    if (valid.length === 0) return empty();
     where.push(`cl.status IN (${valid.map((x) => p.add(x.toLowerCase())).join(',')})`);
   }
   if (q.kinds?.length) {
     const valid = q.kinds.filter((k) => KINDS.has(k.toLowerCase()));
-    if (valid.length === 0) return { claims: [], matched: 0, applied: applied(t, f) };
+    if (valid.length === 0) return empty();
     where.push(`cl.kind IN (${valid.map((x) => p.add(x.toLowerCase())).join(',')})`);
   }
   if (q.text) where.push(`cl.statement ILIKE ${p.add(`%${q.text}%`)}`);
-  if (!q.includeSuperseded) where.push('cl.superseded_by IS NULL');
+  if (!includeSuperseded) where.push('cl.superseded_by IS NULL');
   // a merged group answers once, as its representative
   where.push('cl.canonical_id IS NULL');
-  if (q.eventRange?.from) where.push(`cl.event_at >= ${p.add(q.eventRange.from)}::timestamptz`);
-  if (q.eventRange?.to) where.push(`cl.event_at <= ${p.add(q.eventRange.to)}::timestamptz`);
+  if (q.firstMention) {
+    where.push(`${DATE_KEY} IS NOT NULL`);
+    where.push(`NOT EXISTS (SELECT 1 FROM claims c2 WHERE c2.subject_id = cl.subject_id AND c2.tx_to IS NULL AND c2.canonical_id IS NULL AND ${dateKey('c2')} < ${DATE_KEY})`);
+  }
+  if (q.eventRange?.from) where.push(`${DATE_KEY} >= ${p.add(q.eventRange.from)}::timestamptz`);
+  if (q.eventRange?.to) where.push(`${DATE_KEY} <= ${p.add(q.eventRange.to)}::timestamptz`);
 
   // `as_of` reads fold from evidence, so the tx window and the scope filter are
   // applied after the candidate scan rather than inside it.
@@ -176,25 +312,88 @@ export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<Cla
   const rows = await store.query<Row>(
     `SELECT cl.id, cl.subject_id, se.name AS subject, cl.object_id, oe.name AS object,
             cl.type, cl.statement, cl.status, cl.kind, cl.valid_from, cl.valid_to,
-            cl.event_at, cl.observed_at, cl.superseded_by,
+            cl.event_at, cl.observed_at, cl.superseded_by, cl.effective_at, cl.date_source,
+            cl.attribute, cl.value_num, cl.value_text, cl.unit,
             s.key AS source_path, cl.evidence_count, cl.tx_from
      FROM claims cl
      JOIN entities se ON se.id = cl.subject_id
      LEFT JOIN entities oe ON oe.id = cl.object_id
      LEFT JOIN scopes s ON s.id = cl.primary_scope_id
      ${scan.length ? `WHERE ${scan.join(' AND ')}` : ''}
-     ORDER BY ${q.order === 'timeline' ? 'COALESCE(cl.event_at, cl.valid_from) ASC NULLS LAST, cl.tx_from ASC' : 'cl.valid_from DESC NULLS LAST, cl.tx_from DESC'}`,
+     ORDER BY ${timeline ? `${DATE_KEY} ASC NULLS LAST, cl.tx_from ASC, cl.id` : 'cl.valid_from DESC NULLS LAST, cl.tx_from DESC'}`,
     p.list,
   );
 
-  const projected = t.txTime ? await foldAsOf(store, rows, t, f) : rows;
-  const page = projected.slice(0, limit);
-  const sources = await sourcesOf(store, page.map((r) => r.id));
-  return {
-    claims: page.map((r) => project(r, now, sources.get(r.id))),
+  const asOf = t.txTime ? await foldAsOf(store, rows, t, f) : rows;
+  // an as_of read re-dates rows from the evidence of then: order them again
+  const ordered = (timeline && t.txTime ? sortByDate(asOf) : asOf).map(dated);
+  // ties on the earliest date: one claim per subject still
+  const projected = q.firstMention ? ordered.filter((r, i, all) => all.findIndex((x) => x.subject_id === r.subject_id) === i) : ordered;
+  const entries: TimelineEntry<DatedRow>[] = timeline && q.fold !== false
+    // one subject asked for: the entities it names are one thing (its old name, its short name)
+    ? foldTimeline(projected, { acrossSubjects: Boolean(q.subject) && !q.related })
+    : projected.map((r) => ({ kind: 'single', head: r, members: [r], changes: [] }));
+  const page = entries.slice(0, limit);
+  const sources = await sourcesOf(store, page.flatMap((e) => e.members.map((m) => m.id)));
+  const truncated = entries.length > page.length;
+  const result: ClaimQueryResult = {
+    claims: page.map((e) => entryRecord(e, now, sources)),
     matched: projected.length,
+    entries: entries.length,
+    truncated,
     applied: applied(t, f),
   };
+  if (timeline && q.includeSuperseded === undefined) result.applied.push('timeline: superseded values included (include_superseded=false hides them)');
+  if (entries.length < projected.length) result.applied.push(`timeline: ${projected.length} claims folded into ${entries.length} entries (restated values and series; fold=false lists every claim)`);
+  if (truncated) {
+    const last = page[page.length - 1]?.head.on ?? null;
+    result.note = timeline
+      ? `showing the first ${page.length} of ${entries.length} entries, through ${last ?? 'the undated ones'}: ask again with event_range starting after ${last ?? 'that date'}, or a higher limit, for the rest`
+      : `showing the newest ${page.length} of ${entries.length}: narrow with event_range / types / text, or raise limit, for the rest`;
+  }
+  return result;
+}
+
+interface DatedRow extends Row {
+  on: string | null;
+}
+
+function dated(r: Row): DatedRow {
+  return { ...r, on: dateOf(r).date };
+}
+
+function dateOf(r: Row): { date: string | null; basis: ClaimRecord['dateBasis'] } {
+  const event = toDateString(r.event_at ?? null);
+  if (event) return { date: event, basis: 'event' };
+  const valid = toDateString(r.valid_from);
+  if (valid) return { date: valid, basis: 'validity' };
+  const effective = toDateString(r.effective_at ?? null);
+  if (effective && r.date_source === 'stated') return { date: effective, basis: 'stated' };
+  const observed = toDateString(r.observed_at ?? null) ?? effective;
+  return observed ? { date: observed, basis: 'document' } : { date: null, basis: null };
+}
+
+function sortByDate(rows: Row[]): Row[] {
+  const key = (r: Row) => dateOf(r).date ?? '￿';
+  return [...rows].sort((a, b) => key(a).localeCompare(key(b)) || String(a.tx_from ?? '').localeCompare(String(b.tx_from ?? '')) || a.id.localeCompare(b.id));
+}
+
+function valueOf(r: Row): string | null {
+  if (r.value_num !== null && r.value_num !== undefined) return r.unit ? `${r.value_num} ${r.unit}` : String(r.value_num);
+  return r.value_text ?? null;
+}
+
+/** One entry as a record: its head, with the sources of every row it stands for. */
+function entryRecord(e: TimelineEntry<DatedRow>, now: string, sources: Map<string, string[]>): ClaimRecord {
+  const merged = [...new Set(e.members.flatMap((m) => sources.get(m.id) ?? (m.source_path ? [m.source_path] : [])))].sort();
+  const rec = project(e.head, now, merged.length ? merged : undefined);
+  if (e.kind === 'repeat') {
+    rec.repeats = { count: e.members.length, dates: [...new Set(e.members.map((m) => m.on).filter((d): d is string => !!d))] };
+  } else if (e.kind === 'series') {
+    rec.readings = e.changes.map((c) => ({ date: c.on, value: valueOf(c), source: c.source_path }));
+    rec.repeats = { count: e.members.length, dates: [] };
+  }
+  return rec;
 }
 
 /** Claim id → the paths of every live source behind it and the claims merged into it. */
@@ -203,10 +402,10 @@ export async function sourcesOf(store: Store, ids: string[]): Promise<Map<string
   if (ids.length === 0) return out;
   const rows = await store.query<{ rep: string; key: string }>(
     `SELECT DISTINCT COALESCE(c.canonical_id, c.id) AS rep, s.key
-     FROM claims c
+     FROM (SELECT id, canonical_id FROM claims WHERE id = ANY($1::text[])
+           UNION ALL SELECT id, canonical_id FROM claims WHERE canonical_id = ANY($1::text[])) c
      JOIN evidence e ON e.kind = 'claim' AND e.target_id = c.id AND e.tx_to IS NULL
      JOIN scopes s ON s.id = e.scope_id
-     WHERE c.id = ANY($1::text[]) OR c.canonical_id = ANY($1::text[])
      ORDER BY s.key`,
     [ids],
   );
@@ -259,6 +458,7 @@ async function foldAsOf(store: Store, rows: Row[], t: ResolvedTemporal, f: Resol
 
 function project(r: Row, now: string, sources?: string[]): ClaimRecord {
   const validTo = toIso(r.valid_to);
+  const when = dateOf(r);
   return {
     id: r.id,
     subject: r.subject,
@@ -274,6 +474,10 @@ function project(r: Row, now: string, sources?: string[]): ClaimRecord {
     stale: Boolean(validTo && validTo < now),
     eventAt: toDateString(r.event_at ?? null),
     observedAt: toDateString(r.observed_at ?? null),
+    date: when.date,
+    dateBasis: when.basis,
+    attribute: r.attribute ?? null,
+    value: valueOf(r),
     supersededBy: r.superseded_by ?? null,
     superseded: Boolean(r.superseded_by),
     sourcePath: r.source_path,
