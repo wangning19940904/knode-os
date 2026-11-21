@@ -136,6 +136,8 @@ export interface SearchResult {
   signals: { vector?: number; keyword?: number; graph?: number; structural?: number; /** BM25 over the question's and the bridge terms, for a chunk a bridge term reached (search/bridge.ts). */ bridge?: number; /** The cross-encoder's score, when a rerank stage ran (src/search/rerank.ts). */ rerank?: number };
   /** Lines cut from the chunk because they hold what a list question names (search/excerpts.ts), not the whole chunk. */
   excerpt?: boolean;
+  /** More of its document than the chunk: the chunks (by `seq`, of `of`) `ask` joined into this passage (search/passages.ts). */
+  widened?: { seqs: number[]; of: number };
   /** The chunk is of a generated page (an entity page, a timeline: search/search.ts `SideSql.generated`), not of a source. Absent on a source's chunk. */
   generated?: true;
   /** Its 1-based rank in each recall channel that found it; only when the search was asked to explain. */
