@@ -254,9 +254,20 @@ function refusingEmbedder(identity: EmbeddingProvider): EmbeddingProvider {
   };
 }
 
+/**
+ * The commit this build is of: a `COMMIT` file beside the build's `dist` (a frozen build made for a run outside
+ * any checkout names its commit there), else the checkout the code runs from.
+ */
 function gitSha(): string | null {
+  const here = path.dirname(fileURLToPath(import.meta.url));
   try {
-    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: path.dirname(fileURLToPath(import.meta.url)), encoding: 'utf8' }).trim();
+    const frozen = fs.readFileSync(path.resolve(here, '..', '..', 'COMMIT'), 'utf8').trim();
+    if (/^[0-9a-f]{7,40}$/.test(frozen)) return frozen;
+  } catch {
+    // no such file: a checkout
+  }
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: here, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   } catch {
     return null;
   }
