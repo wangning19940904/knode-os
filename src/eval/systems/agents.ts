@@ -8,8 +8,32 @@ import { recordAgent, SystemEnv, SystemUnderTest } from './types.js';
  * question is whether any knowledge base beats this on quality per token.
  */
 
+/** Commands an answering agent is told it has, unless a run says otherwise (`eval run --agent-budget`). */
+export const AGENT_BUDGET = 20;
+
+/**
+ * The command budget of this run's answering agents: `KNODE_EVAL_AGENT_BUDGET`
+ * (set by `eval run --agent-budget`), 1 to 20, else 20. A low budget is the
+ * condition under which what an arm has beside grep can pay for itself: at 20
+ * every arm of the 2026-11 campaign answered in four to six commands, so the
+ * budget never bound and the arms differed only in what they spent.
+ */
+export function agentBudget(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number(env.KNODE_EVAL_AGENT_BUDGET);
+  return Number.isInteger(n) && n >= 1 && n <= AGENT_BUDGET ? n : AGENT_BUDGET;
+}
+
+/**
+ * The steps after which a session is stopped: the default (runAgent's 25) at the default budget, else the
+ * budget and two more — "about n commands" leaves room for one over and the answer.
+ */
+export function agentMaxSteps(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const n = agentBudget(env);
+  return n === AGENT_BUDGET ? undefined : n + 2;
+}
+
 export const AGENT_BRIEF = (where: string) => `You are answering a question about a document collection. ${where}
-Work read-only: search and read the files with shell commands (rg, grep, ls, sed -n, head, cat). You have a budget of about 20 commands; answer before you run out. Do not use the network.`;
+Work read-only: search and read the files with shell commands (rg, grep, ls, sed -n, head, cat). You have a budget of about ${agentBudget()} commands; answer before you run out. Do not use the network.`;
 
 /**
  * An agent arm's brief (docs/design/33 §2): the one skeleton every file agent
@@ -44,6 +68,7 @@ export function agentGrep(): SystemUnderTest {
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
+          maxSteps: agentMaxSteps(),
           prompt: `${armBrief(GREP_HAS)}\n\n${prompt}`,
         });
         recordAgent(env.meter, { system: 'agent-grep', stage: 'agent', task: task.id }, env.models.model, r);

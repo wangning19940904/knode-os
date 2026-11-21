@@ -28,6 +28,7 @@ import type { EvalFamily } from '../work/eval.js';
 import type { Placed } from './meter.js';
 import { closeAdapters } from './systems/external.js';
 import { askOptionsFromEnv, closeKnodeStates } from './systems/knode.js';
+import { AGENT_BUDGET, agentBudget } from './systems/agents.js';
 import { describeDatabase, EVAL_POOL_MAX, evalDatabase, orphanedEvalSchemas, sameDatabase } from './database.js';
 import { EvalRootPlacement, evalRootDir, evalRunId, initEvalRoot, liveDatabase, newEvalManifest, placeEvalWorkspace, readEvalManifest, readWorkspacePointer, WORKSPACE_POINTER, writeEvalManifest, writeWorkspacePointer } from './root.js';
 import { SCHEMA_VERSION } from '../store/migrations.js';
@@ -532,6 +533,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       const n = reuseBuilds(store, path.resolve(opts.reuseBuildsFrom), opts.packs, `${embedder.model} (${embedder.dimensions})`, fraction, seed, groups, rootPlace);
       progress(`reusing ${n.builds} builds and ${n.vectors} embedding vectors from ${opts.reuseBuildsFrom}${opts.rebuild?.length ? `; building ${opts.rebuild.join(', ')} afresh` : ''}`);
       if (n.updated.length) progress(`building again, since ${opts.reuseBuildsFrom} updated them after building: ${n.updated.join(', ')}`);
+      // the copied vectors are what the embedding endpoint is checked against below: the state was opened before them
+      if (n.vectors) state.vectors.reload();
       store.log('builds reused', { from: opts.reuseBuildsFrom, ...n });
     }
 
@@ -604,6 +607,12 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     };
     delete meta.stuck;
     recordAskOptions(meta, opts.systems);
+    // one budget a run directory: an answer's key does not say what budget it was given
+    const commands = agentBudget();
+    const recordedCommands = before ? before.agentBudget ?? AGENT_BUDGET : commands;
+    if (recordedCommands !== commands) throw new Error(`run ${before!.id} gave its agents a budget of ${recordedCommands} commands: resume it with --agent-budget ${recordedCommands}, or start a new run for ${commands}`);
+    if (commands !== AGENT_BUDGET) meta.agentBudget = commands;
+    else delete meta.agentBudget;
     store.writeMeta(meta);
     const tasksByKey = new Map<string, Task>();
     const corpusDocs = new Map<string, Set<string>>();

@@ -88,6 +88,8 @@ export interface RunMeta {
   evalRoot?: string;
   /** What knode-ask was asked beyond its defaults (KNODE_EVAL_ASK_COMPUTED / KNODE_EVAL_ASK_NOW, docs/design/34): `{}` when neither was set. Absent: no knode-ask in the run. */
   askOptions?: { computed?: boolean; now?: string };
+  /** The command budget the run's answering agents were told and held to, when not the default 20 (`eval run --agent-budget`). */
+  agentBudget?: number;
   /** The agent sample (`--agent-limit` and its allocation over task types): what it was, and what each pack took. Absent: a run from before, round-robin. */
   agentSample?: AgentSample;
 }

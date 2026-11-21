@@ -362,6 +362,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--agent-counts <type=n,…>', 'exactly this many agent tasks of each type (at most what the pack has), e.g. aggregate=12,timeline=12,*=1 (* = the types not named, default 0); --agent-limit does not apply')
     .option('--agent-headroom-from <records>', "derive the agent weights per pack from earlier records: run directories, report.json, scores.jsonl or a campaign.json, comma-separated — each type weighted by how far apart the agent arms' scores came on its questions (mean highest − lowest), ceiling families kept to the floor; score those records with the current list matching first (eval score), since two judge passes disagreeing on a list reads as spread between the arms")
     .option('--agent-floor <n>', 'with --agent-weights or --agent-headroom-from: agent tasks every type gets before the weights share the rest (default 0 with weights, 1 with headroom)')
+    .option('--agent-budget <n>', 'commands every answering agent is told it has and is held to (n and two more), 1 to 20 (default 20): a low budget tests whether what an arm has beside grep lets it answer in fewer steps; one budget a run directory')
     .option('--agent-update-limit <n>', 'at most n update tasks per pack for agent systems, seeded (default: all of them)')
     .option('--fraction <f>', 'share of the corpus to use; above 1, that many times its size with the pack\'s padding (scale curves)', '1')
     .option('--seed <seed>', 'sampling seed', '0')
@@ -388,6 +389,12 @@ export function registerEvalCommands(program: Command): void {
     .option('--repeat-sample <n>', 'with --repeat: repeat only a seeded sample of n tasks per pack, stratified by task type and the same for every repeated system (the first answer still covers every task)')
     .option('--no-lint', 'run even when `eval pack lint` finds something in a pack (it runs first otherwise, and a finding stops the run before anything is spent)')
     .action(async (opts) => {
+      // the agents' command budget, read where their briefs are written (systems/agents.ts)
+      if (opts.agentBudget !== undefined) {
+        const n = Number(opts.agentBudget);
+        if (!Number.isInteger(n) || n < 1 || n > 20) throw new Error('--agent-budget: a whole number of commands, 1 to 20');
+        process.env.KNODE_EVAL_AGENT_BUDGET = String(n);
+      }
       if (opts.lint !== false) {
         const gate = lintBeforeRun(csv(opts.pack)!.map(resolvePack).map((d) => loadPack(d)));
         if (!gate.ok) {

@@ -59,3 +59,25 @@ describe('the ladder\'s briefs', () => {
     expect([...named].filter((t) => !KNODE_FULL_TOOLS.includes(t))).toEqual([]);
   });
 });
+
+describe('the agents\' command budget', () => {
+  it('is 20 unless a run sets another, which the brief says and the session is held to', async () => {
+    const { AGENT_BRIEF, agentBudget, agentMaxSteps } = await import('../src/eval/systems/agents.js');
+    expect(agentBudget({})).toBe(20);
+    expect(agentMaxSteps({})).toBeUndefined();
+    expect(agentBudget({ KNODE_EVAL_AGENT_BUDGET: '3' })).toBe(3);
+    expect(agentMaxSteps({ KNODE_EVAL_AGENT_BUDGET: '3' })).toBe(5);
+    // not a budget: the default
+    for (const bad of ['0', '21', '2.5', 'x']) expect(agentBudget({ KNODE_EVAL_AGENT_BUDGET: bad })).toBe(20);
+    const before = process.env.KNODE_EVAL_AGENT_BUDGET;
+    try {
+      process.env.KNODE_EVAL_AGENT_BUDGET = '3';
+      expect(AGENT_BRIEF('X.')).toContain('a budget of about 3 commands');
+      delete process.env.KNODE_EVAL_AGENT_BUDGET;
+      expect(AGENT_BRIEF('X.')).toContain('a budget of about 20 commands');
+    } finally {
+      if (before === undefined) delete process.env.KNODE_EVAL_AGENT_BUDGET;
+      else process.env.KNODE_EVAL_AGENT_BUDGET = before;
+    }
+  });
+});

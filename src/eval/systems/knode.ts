@@ -20,7 +20,7 @@ import { currentRemote } from '../placement.js';
 import { listFiles } from '../pack.js';
 import { citationsIn } from '../prompts.js';
 import type { Citation, KnowledgeUnit } from '../types.js';
-import { AGENT_BRIEF, armBrief } from './agents.js';
+import { AGENT_BRIEF, agentMaxSteps, armBrief } from './agents.js';
 import { catalogGuide } from '../../mcp/catalog-guide.js';
 import { questionKindGuide } from '../../mcp/question-kinds.js';
 import { WIKI_SOURCES_HAS, wikiWithSources } from './llm-wiki.js';
@@ -827,6 +827,7 @@ export function agentKnode(): SystemUnderTest {
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
+          maxSteps: agentMaxSteps(),
           prompt: `${knodeAgentBrief()}\n\n${prompt}`,
           mcp: { name: 'knode', url: host.url, token: host.secret, enabledTools: KNODE_AGENT_TOOLS },
         });
@@ -856,6 +857,7 @@ export function agentKnodeWiki(): SystemUnderTest {
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
+          maxSteps: agentMaxSteps(),
           prompt: `${AGENT_BRIEF('The current directory is a wiki generated from the documents (start from index.md and sources/). The source documents themselves are not here; pages cite them as raw/docs/<path> — cite those paths.')}\n\n${prompt}`,
         });
         recordAgent(env.meter, { system: 'agent-knode-wiki', stage: 'agent', task: task.id }, env.models.model, r);
@@ -890,6 +892,7 @@ export function agentKnodeWikiSources(): SystemUnderTest {
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
+          maxSteps: agentMaxSteps(),
           prompt: `${armBrief(KNODE_WIKI_SOURCES_HAS)}\n\n${prompt}`,
         });
         recordAgent(env.meter, { system: 'agent-knode-wiki-sources', stage: 'agent', task: task.id }, env.models.model, r);
@@ -957,6 +960,7 @@ export function agentKnodeFull(): SystemUnderTest {
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
+          maxSteps: agentMaxSteps(),
           prompt: `${armBrief(AGENT_KNODE_FULL_HAS, knodeFullGuide())}\n\n${prompt}`,
           mcp: { name: 'knode', url: host.url, token: host.secret, enabledTools: KNODE_FULL_TOOLS },
         });

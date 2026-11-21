@@ -5,7 +5,7 @@ import type { EmbeddingProvider } from '../../ingest/embeddings.js';
 import { isolatedCopy, runAgent } from '../agent.js';
 import { Bm25, Chunk, chunkDocs, rrf, VectorIndex } from '../retrieval.js';
 import { startServedTools, ToolHost } from '../toolhost.js';
-import { armBrief, GREP_HAS } from './agents.js';
+import { armBrief, GREP_HAS, agentMaxSteps } from './agents.js';
 import { chat, recordAgent, SystemEnv, SystemUnderTest, taggedEmbedder } from './types.js';
 
 /**
@@ -194,6 +194,7 @@ export function agentRag(): SystemUnderTest {
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
+          maxSteps: agentMaxSteps(),
           prompt: `${armBrief(AGENT_RAG_HAS)}\n\n${prompt}`,
           mcp: { name: 'knode', url: host.url, token: host.secret, enabledTools: [RAG_SEARCH_TOOL] },
         });
