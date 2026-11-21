@@ -227,7 +227,9 @@ function open(s: KnodeState): Promise<AppContext> {
     // the index as built, for every answer: the store finishes its own upkeep in the background after it opens, and
     // until the substring indexes are marked ready the keyword channel takes another path that scores differently
     // (on PostgreSQL the first answers after an open did; on PGlite the upkeep ran first anyway)
-    await Promise.all([ctx.store.indexing, ctx.store.retype]);
+    // a build made under an older rule for a relation's source has its stored sources read again first, for the
+    // same reason: no answer sees them half moved (its pages stay as that build wrote them)
+    await Promise.all([ctx.store.indexing, ctx.store.retype, ctx.store.relationSources]);
     return ctx;
   })();
   s.ctx = opening;
@@ -1031,15 +1033,17 @@ async function exportUnits(s: KnodeState): Promise<KnowledgeUnit[]> {
     const aliases = Array.isArray(e.aliases) ? (e.aliases as string[]) : [];
     units.push({ id: `entity:${e.id}`, kind: 'entity', title: e.name, text: `${e.name} (${e.type}): ${e.description}`.trim() + (aliases.length ? `\naliases: ${aliases.join(', ')}` : ''), sources: sourcesOf.get(e.id) ?? [], links: [] });
   }
-  // a relation's documents are the ones its evidence came from, oldest first: the row's own document_id is unset
-  // for an extracted relation, whose evidence is written on the scope of the document read (`doc`, or `tier1`
-  // keyed by the same path — as an entity page names a relation's source, src/wiki/pages.ts). Without them every
+  // a relation's documents are the ones its evidence came from, after the one it cites (the row's document_id),
+  // in the order that one is chosen by: the earliest document date, then the path (store/temporal.ts
+  // relationSource), never the order they were extracted in, which differs from build to build. Evidence is
+  // written on the scope of the document read (`doc`, or `tier1` keyed by the same path). Without them every
   // relation unit had no source, and its link was judged against passages a keyword search of the corpus found.
   const evidenceOf = new Map<string, string[]>();
   for (const r of await ctx.store.query<{ target_id: string; path: string }>(
     `SELECT ev.target_id, s.key AS path FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
+     LEFT JOIN documents sd ON sd.path = s.key
      WHERE ev.kind = 'relation' AND ev.tx_to IS NULL AND s.kind IN ('doc', 'tier1')
-     GROUP BY ev.target_id, s.key ORDER BY min(ev.tx_from), s.key`,
+     GROUP BY ev.target_id, s.key ORDER BY min(sd.doc_date) ASC NULLS LAST, s.key COLLATE "C"`,
   )) (evidenceOf.get(r.target_id) ?? evidenceOf.set(r.target_id, []).get(r.target_id)!).push(...strip(r.path));
   for (const r of await ctx.store.query<{ id: string; head: string; tail: string; type: string; description: string; path: string | null; source_id: string; target_id: string }>(
     `SELECT r.id, s.name AS head, t.name AS tail, r.type, r.description, d.path, r.source_id, r.target_id

@@ -134,7 +134,14 @@ it. Merges are reversible `entity_links` on a `merge` scope. Types and relation
 types come from ontology packs (`playbooks/ontology/*.yaml`; default
 `core` + `organization`).
 
-**Relations** record the chunk and document they were read from (schema v20).
+**Relations** record the one document they cite and the passage in it (schema
+v20): of the documents that state the relation, the earliest by document date,
+then the first by path (`relationSource`, `src/store/temporal.ts`). The choice
+reads the corpus alone, never the order documents were processed in, so two
+builds of one corpus cite the same document; entity pages, the relation walk
+and `v_relations.source_path` all read that stored choice. When the rule
+changes, stored sources are read again in place at the next open
+(`src/lineage/relation-sources.ts`).
 `co_occurs` is not stored; it is derived at read time (`src/graph/cooccur.ts`).
 
 **Claims** carry `type`, `kind`, `status`, `event_at`, `observed_at`,

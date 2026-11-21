@@ -6,16 +6,18 @@ import { AppContext, createContext } from '../src/context.js';
 import { documentIdFor } from '../src/ingest/apply.js';
 import { sync } from '../src/ingest/sync.js';
 import { recountAll } from '../src/lineage/fold.js';
-import { fillRelationSources, RELATION_SOURCES_META } from '../src/store/migrations.js';
+import { refreshRelationSources } from '../src/lineage/relation-sources.js';
+import { RELATION_SOURCES_META } from '../src/store/migrations.js';
 import { relationSource } from '../src/store/temporal.js';
 
 /**
- * A relation names the document it was read from (relations.document_id) and
- * the passage (relations.chunk_id), as a claim does: of its live supporters
- * whose scope is a document's own or its tier-1 extraction, the earliest. The
+ * A relation names the document it cites (relations.document_id) and the
+ * passage (relations.chunk_id), as a claim does: of its live supporters whose
+ * scope read a document, the one of the earliest-dated document, then by path
+ * (tests/relation-source-order.test.ts builds one corpus in two orders). The
  * writer grounds a relation the extractor gave no passage to in the first
  * chunk mentioning both ends. Rows written before get their document from a
- * batched fill at open, which agrees with the fold.
+ * batched pass at open, which agrees with the fold.
  */
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-relation-sources-'));
@@ -91,20 +93,21 @@ describe('the source of a relation', () => {
     await asBefore(c);
     // stopped after one page of one relation: the rest waits for the next open
     let pages = 0;
-    const stopped = await fillRelationSources(c.store, { batch: 1, log: () => {}, stop: () => pages++ >= 1 });
-    expect(stopped).toMatchObject({ relations: 1, batches: 1 });
+    const stopped = await refreshRelationSources(c.store, { batch: 1, log: () => {}, stop: () => pages++ >= 1 });
+    expect(stopped).toMatchObject({ relations: 1, read: 1, batches: 1 });
     expect((await relations(c)).filter((r) => r.document_id).length).toBe(1);
-    expect((await c.store.getMeta<{ pending: boolean }>(RELATION_SOURCES_META))?.pending).toBe(true);
-    // resumed: a page per relation, the earliest of two supporters each, as the fold chose
-    const resumed = await fillRelationSources(c.store, { batch: 1, log: () => {} });
-    expect(resumed).toMatchObject({ relations: 2, batches: 2 });
+    // it says where it stopped, so the next open goes on from there
+    expect(await c.store.getMeta(RELATION_SOURCES_META)).toMatchObject({ pending: true, cursor: folded[0].id });
+    // resumed: a page per relation, the earlier report of two supporters each, as the fold chose
+    const resumed = await refreshRelationSources(c.store, { batch: 1, log: () => {} });
+    expect(resumed).toMatchObject({ relations: 2, read: 2, batches: 2 });
     const filled = await relations(c);
     expect(filled.map((r) => r.document_id)).toEqual(folded.map((r) => r.document_id));
     // the passage was never recorded for those: it stays empty until the document is applied again
     expect(filled.map((r) => r.chunk_id)).toEqual([null, null, null]);
     expect(filled.map((r) => r.fold_sha)).toEqual(folded.map((r) => r.fold_sha));
     // done: the next open does nothing
-    expect(await fillRelationSources(c.store, { log: () => {} })).toBeNull();
+    expect(await refreshRelationSources(c.store, { log: () => {} })).toBeNull();
     // a full refold agrees with the fill
     await c.store.tx((q) => recountAll(q));
     expect((await relations(c)).map((r) => [r.document_id, r.fold_sha])).toEqual(folded.map((r) => [r.document_id, r.fold_sha]));
@@ -123,7 +126,7 @@ describe('the source of a relation', () => {
       [rel.id],
     );
     await asBefore(c);
-    await fillRelationSources(c.store, { log: () => {} });
+    await refreshRelationSources(c.store, { log: () => {} });
     expect((await relations(c)).find((r) => r.id === rel.id)!.document_id).toBe(documentIdFor(FIRST));
     await c.store.tx((q) => recountAll(q));
     expect((await relations(c)).find((r) => r.id === rel.id)!.document_id).toBe(documentIdFor(FIRST));
@@ -139,16 +142,29 @@ describe('the source of a relation', () => {
     expect(after.map((r) => r.document_id)).toEqual([documentIdFor(SECOND), documentIdFor(SECOND), documentIdFor(SECOND)]);
   });
 
-  it('picks the earliest supporter that read a document', () => {
-    const ev = (scope: string, tx: string, segment: string | null) => ({ kind: 'relation', target_id: 'r', scope_id: scope, segment_id: segment, weight: 1, extractor: 'x', attrs: {}, tx_from: tx });
+  it('picks by the documents, never by when a supporter was written', () => {
+    const ev = (scope: string, tx: string, segment: string | null, extractor = 'x') => ({ kind: 'relation', target_id: 'r', scope_id: scope, segment_id: segment, weight: 1, extractor, attrs: {}, tx_from: tx });
+    const doc = (id: string, p: string, date: string | null, kind = 'tier1') => ({ documentId: id, key: p, path: p, date, kind });
     const docs = new Map([
-      ['a', { documentId: 'da', key: 'raw/docs/b.md' }],
-      ['b', { documentId: 'db', key: 'raw/docs/a.md' }],
+      ['march', doc('d-march', 'raw/docs/b.md', '2025-03-01T00:00:00.000Z')],
+      ['may', doc('d-may', 'raw/docs/a.md', '2025-05-01T00:00:00.000Z')],
+      ['may-too', doc('d-may-too', 'raw/docs/c.md', '2025-05-01T00:00:00.000Z')],
+      ['undated', doc('d-undated', 'raw/docs/0.md', null)],
+      ['march-own', doc('d-march', 'raw/docs/b.md', '2025-03-01T00:00:00.000Z', 'doc')],
     ]);
     // a merge or a person's edit read no document: never the source
-    expect(relationSource([ev('m', '2025-01-01T00:00:00Z', null), ev('a', '2025-02-01T00:00:00Z', 'c1')], docs)).toEqual({ documentId: 'da', chunkId: 'c1' });
-    // one instant: the scope key orders them
-    expect(relationSource([ev('a', '2025-02-01T00:00:00Z', 'c1'), ev('b', '2025-02-01T00:00:00Z', null)], docs)).toEqual({ documentId: 'db', chunkId: null });
+    expect(relationSource([ev('m', '2025-01-01T00:00:00Z', null), ev('may', '2025-02-01T00:00:00Z', 'c1')], docs)).toEqual({ documentId: 'd-may', chunkId: 'c1' });
     expect(relationSource([ev('m', '2025-01-01T00:00:00Z', null)], docs)).toBeNull();
+    // the earliest document date, whichever supporter was written first and in whatever order they are read
+    const three = [ev('may', '2025-01-01T00:00:00Z', 'c1'), ev('undated', '2025-01-02T00:00:00Z', 'c0'), ev('march', '2025-06-01T00:00:00Z', 'c2')];
+    expect(relationSource(three, docs)).toEqual({ documentId: 'd-march', chunkId: 'c2' });
+    expect(relationSource([...three].reverse(), docs)).toEqual({ documentId: 'd-march', chunkId: 'c2' });
+    // one date: the path orders them; no date: after every dated document
+    expect(relationSource([ev('may-too', '2025-01-01T00:00:00Z', 'c3'), ev('may', '2025-02-01T00:00:00Z', 'c1')], docs)).toEqual({ documentId: 'd-may', chunkId: 'c1' });
+    expect(relationSource([ev('undated', '2025-01-01T00:00:00Z', 'c0'), ev('may-too', '2025-02-01T00:00:00Z', 'c3')], docs)).toEqual({ documentId: 'd-may-too', chunkId: 'c3' });
+    // within one document: its own scope before its extraction, then a grounded supporter, then the passage id
+    const one = [ev('march', '2025-01-01T00:00:00Z', 'c9'), ev('march-own', '2025-02-01T00:00:00Z', null), ev('march', '2025-01-01T00:00:00Z', 'c2', 'w')];
+    expect(relationSource(one, docs)).toEqual({ documentId: 'd-march', chunkId: null });
+    expect(relationSource([ev('march', '2025-03-01T00:00:00Z', null), ev('march', '2025-01-01T00:00:00Z', 'c9'), ev('march', '2025-02-01T00:00:00Z', 'c2')], docs)).toEqual({ documentId: 'd-march', chunkId: 'c2' });
   });
 });

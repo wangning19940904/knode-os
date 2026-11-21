@@ -1,6 +1,6 @@
 import { builtinOntology } from '../graph/ontology.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
-import { SOURCE_SCOPE_KINDS, toDateString } from '../store/temporal.js';
+import { relationSourceSql, toDateString } from '../store/temporal.js';
 import { ClaimItem, SearchResult } from '../types.js';
 import { keywordTerms, termCount } from './search.js';
 import { asOfDate } from './claimset.js';
@@ -96,9 +96,7 @@ const WALK_BUDGET_MS = 1500;
  */
 const RELATIONS_OF = `SELECT f.id AS near_id, r.id, r.source_id, r.target_id, se.name AS source, te.name AS target, se.type AS source_type, te.type AS target_type,
          r.type, r.description, r.weight, r.valid_from, r.valid_to, r.document_id, r.chunk_id,
-         COALESCE((SELECT d.path FROM documents d WHERE d.id = r.document_id),
-                  (SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id AND s.kind IN (${SOURCE_SCOPE_KINDS.map((k) => `'${k}'`).join(', ')})
-                   WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
+         COALESCE((SELECT d.path FROM documents d WHERE d.id = r.document_id), ${relationSourceSql('r', 'path')}) AS path
   FROM unnest($1::text[]) AS f(id)
   CROSS JOIN LATERAL (
     (SELECT * FROM relations r WHERE (r.source_id = f.id OR r.target_id = f.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs'
@@ -586,8 +584,8 @@ export function chainOrder(steps: WalkStep[]): number[] {
 
 /**
  * For each step, the passage that states it: the chunk the relation was read from (relations record it since v20);
- * else a passage of its source document (the one it was read from, or else the first its evidence names in a
- * source scope: a page knode wrote is no source, `SOURCE_SCOPE_KINDS`) that
+ * else a passage of its source document (the one it cites, stored or else read from its evidence the same
+ * way, store/temporal.ts relationSource: a page knode wrote is no source) that
  * mentions both ends, or either. Only a relation with no recorded source falls back to a chunk that merely
  * mentions both ends, and that passage says so: on a knowledge base where two names appear together daily, a
  * co-mention is no statement of the relation. One bounded read per step; no document needs a date.
@@ -599,9 +597,7 @@ async function bridgePassages(store: Store, steps: WalkStep[]): Promise<SearchRe
      FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY AS pair(rid, a, b, i)
      JOIN relations r ON r.id = pair.rid
      CROSS JOIN LATERAL (
-       SELECT COALESCE(r.document_id, (
-         SELECT dd.id FROM evidence ev JOIN scopes s ON s.id = ev.scope_id AND s.kind = ANY($4::text[]) JOIN documents dd ON dd.path = s.key
-         WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL ORDER BY ev.tx_from, dd.id LIMIT 1)) AS doc
+       SELECT COALESCE(r.document_id, ${relationSourceSql('r', 'id')}) AS doc
      ) src
      CROSS JOIN LATERAL (
        SELECT y.chunk_id, y.rank FROM (
@@ -621,7 +617,7 @@ async function bridgePassages(store: Store, steps: WalkStep[]): Promise<SearchRe
      ) x
      JOIN chunks c ON c.id = x.chunk_id
      JOIN documents d ON d.id = c.document_id`,
-    [steps.map((s) => s.relationId), steps.map((s) => s.sourceId), steps.map((s) => s.targetId), [...SOURCE_SCOPE_KINDS]],
+    [steps.map((s) => s.relationId), steps.map((s) => s.sourceId), steps.map((s) => s.targetId)],
   );
   const byStep = new Map(rows.map((r) => [Number(r.i) - 1, r]));
   const seen = new Set<string>();
