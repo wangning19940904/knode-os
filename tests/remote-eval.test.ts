@@ -203,6 +203,18 @@ describe('the producer channel', () => {
     expect((await offer({ ...good, archive: { sha256: 'a'.repeat(64), bytes: 1 } })).status).toBe(400);
   });
 
+  it('says whether it holds an archive: 404 before the upload, 200 after', async () => {
+    const dir = path.join(tmp, 'held');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'a.md'), 'a');
+    const packed = packFolder(dir);
+    const at = `${base}/eval/v1/archives/${packed.sha256}`;
+    const auth = { authorization: `Bearer ${producerToken}` };
+    expect((await fetch(at, { method: 'HEAD', headers: auth })).status).toBe(404);
+    expect((await fetch(at, { method: 'PUT', headers: { ...auth, 'content-type': 'application/gzip' }, body: packed.gzip() })).status).toBe(200);
+    expect((await fetch(at, { method: 'HEAD', headers: auth })).status).toBe(200);
+  });
+
   it('lets an eval token lease only eval work, and a label token none of it', async () => {
     const tokens = new RemoteTokenStore(root);
     const label = tokens.create({ name: 'labeler', scopes: ['label'], workspaces: ['admin/default'] }).token;

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import zlib from 'node:zlib';
 
 /**
@@ -17,6 +18,7 @@ import zlib from 'node:zlib';
  */
 
 const MAGIC = 'KPA1\n';
+const gzipAsync = promisify(zlib.gzip) as (data: Buffer, options: zlib.ZlibOptions) => Promise<Buffer>;
 /** Above these the folder is no agent's corpus. */
 export const ARCHIVE_MAX_BYTES = 2 * 1024 ** 3;
 export const ARCHIVE_MAX_FILES = 200_000;
@@ -28,6 +30,8 @@ export interface PackedFolder {
   files: number;
   /** Compressed on first use: a folder the server holds already is never compressed. */
   gzip(): Buffer;
+  /** The same, compressed off the caller's thread: a corpus takes seconds, and a run polls while it uploads. */
+  gzipped(): Promise<Buffer>;
 }
 
 function walk(root: string, rel = '', out: string[] = []): string[] {
@@ -61,22 +65,23 @@ export function packFolder(dir: string): PackedFolder {
   }
   const sha256 = hash.digest('hex');
   let gzip: Buffer | null = null;
+  // read a second time: the bytes sent must be the bytes named
+  const stream = (): Buffer => {
+    const parts: Buffer[] = [Buffer.from(MAGIC)];
+    for (const rel of files) {
+      const data = fs.readFileSync(path.join(dir, rel));
+      parts.push(Buffer.from(`${JSON.stringify({ p: rel, n: data.length })}\n`), data);
+    }
+    const raw = Buffer.concat(parts);
+    if (crypto.createHash('sha256').update(raw).digest('hex') !== sha256) throw new Error(`${dir} changed while it was packed`);
+    return raw;
+  };
   return {
     sha256,
     bytes,
     files: files.length,
-    gzip: () => {
-      if (gzip) return gzip;
-      const parts: Buffer[] = [Buffer.from(MAGIC)];
-      for (const rel of files) {
-        const data = fs.readFileSync(path.join(dir, rel));
-        parts.push(Buffer.from(`${JSON.stringify({ p: rel, n: data.length })}\n`), data);
-      }
-      const raw = Buffer.concat(parts);
-      // read a second time: the bytes sent must be the bytes named
-      if (crypto.createHash('sha256').update(raw).digest('hex') !== sha256) throw new Error(`${dir} changed while it was packed`);
-      return (gzip = zlib.gzipSync(raw, { level: 6 }));
-    },
+    gzip: () => (gzip ??= zlib.gzipSync(stream(), { level: 6 })),
+    gzipped: async () => (gzip ??= await gzipAsync(stream(), { level: 6 })),
   };
 }
 
