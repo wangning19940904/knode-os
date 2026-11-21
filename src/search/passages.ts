@@ -77,27 +77,45 @@ export function joinChunks(parts: string[]): string {
   return out;
 }
 
+/** Consecutive word pairs of the question ("accounts payable", "cash equivalents"): a phrase names a line item that its words alone do not. */
+function phrases(question: string): string[] {
+  const words = question.toLowerCase().match(/[a-z][a-z0-9&.-]*/g) ?? [];
+  const out: string[] = [];
+  for (let i = 0; i + 1 < words.length; i++) {
+    if (words[i].length >= 3 && words[i + 1].length >= 3 && !PHRASE_STOP.has(words[i]) && !PHRASE_STOP.has(words[i + 1])) out.push(`${words[i]} ${words[i + 1]}`);
+  }
+  return out;
+}
+const PHRASE_STOP = new Set(['the', 'and', 'for', 'what', 'which', 'was', 'were', 'are', 'how', 'does', 'did', 'has', 'have', 'its', 'from', 'with', 'that', 'this', 'based', 'according']);
+
+/** Text matched word for word: case and runs of whitespace (a line break inside a table row) do not count. */
+const flat = (s: string) => s.toLowerCase().replace(/\s+/g, ' ');
+
 /**
  * The question's terms weighted by how rare each is among a document's chunks: a term in every chunk (the company,
- * the report) says nothing about which chunk answers; one in a single chunk says the most.
+ * the report) says nothing about which chunk answers; one in a single chunk says the most. A term on the document's
+ * cover (its first chunk: the company, the report's name) names the document rather than the line asked for, and
+ * counts for a quarter; a phrase of the question counts double.
  */
 export function termWeights(question: string, chunks: string[]): Map<string, number> {
-  const terms = keywordTerms(question, 64);
-  const lower = chunks.map((c) => c.toLowerCase());
+  const lower = chunks.map(flat);
   const n = chunks.length;
+  const cover = lower[0] ?? '';
   const out = new Map<string, number>();
-  for (const t of terms) {
+  const add = (t: string, factor: number) => {
     const df = lower.filter((c) => c.includes(t)).length;
     // absent, or in every chunk: says nothing about which chunk answers
-    if (df === 0 || df >= n) continue;
-    const w = Math.log((n + 1) / (df + 0.5));
-    if (w > 0) out.set(t, w * Math.min(4, t.length) / 2);
-  }
+    if (df === 0 || df >= n) return;
+    const w = Math.log((n + 1) / (df + 0.5)) * factor * (n > 1 && cover.includes(t) ? 0.25 : 1);
+    if (w > 0) out.set(t, w);
+  };
+  for (const t of keywordTerms(question, 64)) add(t, Math.min(4, t.length) / 2);
+  for (const t of phrases(question)) add(t, 4);
   return out;
 }
 
 const scoreOf = (content: string, weights: Map<string, number>) => {
-  const c = content.toLowerCase();
+  const c = flat(content);
   let s = 0;
   for (const [t, w] of weights) if (c.includes(t)) s += w;
   return s;
@@ -174,25 +192,40 @@ export async function widenPassages(store: Store, question: string, contexts: Se
     if (total <= WHOLE_DOC_MAX) {
       pick = chunks;
     } else {
-      const seqs = new Set(shown.map((c) => c.seq));
       const index = new Map(chunks.map((c) => [c.seq, c]));
-      // a table runs on past the chunk boundary
-      for (const c of shown) if (tableLike(c.content) && index.has(c.seq + 1)) seqs.add(c.seq + 1);
       const weights = termWeights(question, chunks.map((c) => c.content));
       const best = Math.max(0, ...chunks.map((c) => scoreOf(c.content, weights)));
       const possible = [...weights.values()].reduce((a, b) => a + b, 0);
-      const ranked = chunks
-        .filter((c) => !seqs.has(c.seq))
+      const shownSeqs = new Set(shown.map((c) => c.seq));
+      const top = chunks
+        .filter((c) => !shownSeqs.has(c.seq))
         .map((c) => ({ c, s: scoreOf(c.content, weights) }))
-        .sort((a, b) => b.s - a.s || a.c.seq - b.c.seq);
-      const top = ranked[0];
+        .sort((a, b) => b.s - a.s || a.c.seq - b.c.seq)[0];
+      // what the passage holds, most needed first, filled up to its cap: a document's title chunk (it says what the
+      // passage is from), the chunk naming what is asked and the row after it, the chunk the search returned, the
+      // rest shown, and the row after each table shown (a table runs on past the chunk boundary)
+      const wanted: number[] = [];
+      const head = index.get(0);
+      if (head && head.content.length <= 200) wanted.push(0);
       if (top && top.s > 0 && top.s >= MATCH_SHARE * possible && top.s >= 0.6 * best) {
-        seqs.add(top.c.seq);
-        if (tableLike(top.c.content) && index.has(top.c.seq + 1)) seqs.add(top.c.seq + 1);
+        wanted.push(top.c.seq);
+        if (tableLike(top.c.content)) wanted.push(top.c.seq + 1);
       }
-      // a document's first chunk is often just its title: kept when it is, so the passage says what it is from
-      if (index.has(0) && index.get(0)!.content.length <= 200) seqs.add(0);
-      pick = [...seqs].sort((a, b) => a - b).map((s) => index.get(s)!).filter(Boolean);
+      const anchorSeq = isSummary ? undefined : shown.find((c) => c.id === contexts[at].chunkId)?.seq;
+      if (anchorSeq !== undefined) wanted.push(anchorSeq);
+      for (const c of shown) wanted.push(c.seq);
+      for (const c of shown) if (tableLike(c.content)) wanted.push(c.seq + 1);
+      const seqs = new Set<number>();
+      let size = 0;
+      for (const seq of wanted) {
+        const c = index.get(seq);
+        if (!c || seqs.has(seq)) continue;
+        // the first chunk past the title always fits (it is cut to the cap below if it alone is longer)
+        if (size + c.content.length > PASSAGE_MAX && seqs.size > (seqs.has(0) ? 1 : 0)) continue;
+        seqs.add(seq);
+        size += c.content.length;
+      }
+      pick = [...seqs].sort((a, b) => a - b).map((s) => index.get(s)!);
     }
     // nothing more than what is shown, and shown as one passage already
     if (pick.every((c) => shownIds.has(c.id)) && shown.length <= 1) continue;
@@ -205,15 +238,17 @@ export async function widenPassages(store: Store, question: string, contexts: Se
     }
     let text = runs.map((r) => joinChunks(r.map((c) => c.content))).join('\n[…]\n');
     if (text.length > PASSAGE_MAX) text = `${text.slice(0, PASSAGE_MAX)}…`;
-    // the chunks of the document already shown are folded into the passage
-    const was = shown.reduce((n, c) => n + Math.min(c.content.length, 1500), 0);
+    // the chunks of the document already shown that the passage holds are folded into it
+    const held = new Set(pick.map((c) => c.id));
+    const folded = shown.filter((c) => held.has(c.id));
+    const was = folded.reduce((n, c) => n + Math.min(c.content.length, 1500), 0);
     const cost = text.length - was;
     if (cost > left) continue;
     left -= cost;
     documents++;
     const head = chunks[0];
     const passage: SearchResult = {
-      chunkId: isSummary ? (pick[0]?.id ?? head.id) : contexts[at].chunkId,
+      chunkId: isSummary || !held.has(contexts[at].chunkId) ? (pick[0]?.id ?? head.id) : contexts[at].chunkId,
       documentId: doc,
       path: head.path,
       title: head.title,
@@ -223,13 +258,10 @@ export async function widenPassages(store: Store, question: string, contexts: Se
       signals: contexts[at].signals,
       widened: { seqs: pick.map((c) => c.seq), of: chunks.length },
     };
-    if (isSummary) {
-      after.set(at, passage);
-      for (const c of shown) absorbed.add(c.id);
-    } else {
-      replace.set(at, passage);
-      for (const c of shown) if (c.id !== contexts[at].chunkId) absorbed.add(c.id);
-    }
+    // a source chunk's passage takes its place when it holds it, and follows it otherwise; a summary's follows it
+    if (isSummary || !held.has(contexts[at].chunkId)) after.set(at, passage);
+    else replace.set(at, passage);
+    for (const c of folded) if (c.id !== contexts[at].chunkId || isSummary) absorbed.add(c.id);
   }
   if (documents === 0) return { contexts, documents: 0, chars: 0 };
   const out: SearchResult[] = [];

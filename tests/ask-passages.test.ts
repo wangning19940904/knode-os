@@ -58,6 +58,16 @@ const filler = (i: number) => `全聚德2024年第一季度报告 第${i}节。�
 const filing = Array.from({ length: 12 }, (_, i) => filler(i));
 filing[9] = '全聚德2024年第一季度报告 合并资产负债表（续）\n项目 期末余额 上年年末余额\n应收账款 21,345.00 19,876.10\n一年内到期的非流动资产 15,491.66 14,203.11\n其他流动资产 8,102.33 7,955.00';
 
+// an annual report: the company on the cover and in many chunks, the line item asked for in a chunk that never names it
+const annual = Array.from({ length: 20 }, (_, i) => i === 0
+  ? 'Global Clean Energy Holdings, Inc. Annual Report on Form 10-K for 2024'
+  : i % 2 ? `Global Clean Energy Holdings discusses its renewable fuels business, risks and outlook in part ${i}. ${'Narrative text. '.repeat(30)}`
+    : `Notes to the financial statements, part ${i}. ${'Further narrative about accounts and policies. '.repeat(12)}`);
+annual[13] = 'CONSOLIDATED BALANCE SHEETS (in thousands)\nCurrent liabilities\nAccounts payable 14,802 9,311\nAccrued liabilities 7,220 6,105\nNotes payable 258,923 241,770\nTotal current liabilities 323,686 300,104';
+// a filing whose shown chunks fill the passage's cap: the matching chunk must still be in it
+const tables = Array.from({ length: 10 }, (_, i) => `利润表附注 第${i}部分\n项目 本期 上期\n${Array.from({ length: 30 }, (_, j) => `科目${i}-${j} ${1000 + j},000.00 ${900 + j},000.00`).join('\n')}`);
+tables[7] = '合并资产负债表（续）\n项目 期末余额\n一年内到期的非流动负债 1,150,005,581.95\n长期借款 2,003,114,000.00\n应付债券 0.00\n租赁负债 12,004,113.20';
+
 beforeAll(async () => {
   fs.mkdirSync(path.join(tmp, '.knode'), { recursive: true });
   store = await Store.open(tmp, embedder.dimensions);
@@ -65,6 +75,8 @@ beforeAll(async () => {
   await addDoc('gm-p51', 'raw/docs/GENERALMILLS_2020_10K/p51.md', statement);
   await addDoc('qjd', 'raw/docs/filings/zh/qjd.md', filing);
   // a summary page of the 10-K page, and one built from two documents
+  await addDoc('gceh', 'raw/docs/filings/en/gceh.md', annual);
+  await addDoc('enjie', 'raw/docs/filings/zh/enjie.md', tables);
   await addDoc('gm-sum', 'wiki/sources/general-mills-page-51.md', ['General Mills cash flow statement summary for fiscal 2020: operating cash flow was strong.']);
   await addDoc('two-sum', 'wiki/sources/two-documents.md', ['A page built from two documents.']);
   await store.query(`INSERT INTO pages (path, kind, generator, inputs_sha, tx_from) VALUES ('wiki/sources/general-mills-page-51.md', 'source_summary', 'test', 'x', now()), ('wiki/sources/two-documents.md', 'source_summary', 'test', 'y', now())`);
@@ -151,6 +163,23 @@ describe('widenPassages', () => {
     expect(out.contexts).toHaveLength(1);
     expect(out.contexts[0]).toMatchObject({ chunkId: 'gm-p51-3', widened: { seqs: [0, 1, 2, 3], of: 4 } });
     expect(out.contexts[0].content.indexOf('Operating Activities')).toBeLessThan(out.contexts[0].content.indexOf('Financing Activities'));
+  });
+
+  it('weighs a phrase of the question over the company the cover names', async () => {
+    const out = await widenPassages(store, 'What is the accounts payable of Global Clean Energy Holdings, Inc.?', [await chunkOf('gceh-3')]);
+    expect(out.contexts[0].widened?.seqs).toContain(13);
+    expect(out.contexts[0].content).toContain('Accounts payable 14,802');
+  });
+
+  it('keeps the chunk naming what is asked when the chunks shown would fill the passage', async () => {
+    const shown = await Promise.all(['enjie-1', 'enjie-2', 'enjie-3', 'enjie-4'].map(chunkOf));
+    const out = await widenPassages(store, '恩捷股份一年内到期的非流动负债是多少？', shown);
+    const passage = out.contexts.find((c) => c.widened)!;
+    expect(passage.content).toContain('一年内到期的非流动负债 1,150,005,581.95');
+    expect(passage.content.length).toBeLessThanOrEqual(4001);
+    // a shown chunk the passage could not hold keeps its own place
+    const held = new Set(passage.widened!.seqs);
+    for (const c of shown) if (!held.has(Number(c.chunkId.split('-')[1]))) expect(out.contexts.map((x) => x.chunkId)).toContain(c.chunkId);
   });
 
   it('stays within its budget', async () => {
