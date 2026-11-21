@@ -1,7 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { LoadedPack } from './pack.js';
+import { ABSENT_COVERAGE, absentCorpus, bestPassage } from './packs/absent.js';
 import { lexicalTokens } from './packs/separation.js';
+import { declines } from './score/values.js';
+import { extractFinalAnswer } from './metrics/text.js';
 import type { Task } from './types.js';
 
 /**
@@ -22,14 +25,27 @@ import type { Task } from './types.js';
  * - duplicate-text   two questions with the same text and different gold
  * - hop-shortcut     a multi-hop question whose answer stands on one line of some document beside a rare word of
  *                    the question: one grep skips the chain
+ * - abstain-in-corpus an "unanswerable" question (scoring abstain) whose distinctive terms stand together in one
+ *                    passage of a document (packs/absent.ts): a drafted unanswerable question about a detail the
+ *                    corpus does state, so a right answer scores 0 (medicine-us "How many participants were
+ *                    randomized in SURMOUNT-CN" — pubmed/38819983.md says 210). Questions a recipe plants from its
+ *                    own world model (`meta.subtype` unanswerable-*: a namesake on a third team, a false premise)
+ *                    name corpus terms on purpose and are left out: the recipe knows the fact does not exist; so
+ *                    is a task a person has checked against the passage (`meta.absenceChecked: true`)
  *
  * Words are the separation families' tokens (two-character sequences in
  * Chinese without a function character, content words in English); "rare" is
  * a document frequency of at most 0.5% of the corpus (at least 2 documents).
  */
 
-export const LINT_RULES = ['class-word', 'ambiguous-subject', 'file-names', 'family-minimum', 'duplicate-text', 'hop-shortcut'] as const;
+export const LINT_RULES = ['class-word', 'ambiguous-subject', 'file-names', 'family-minimum', 'duplicate-text', 'hop-shortcut', 'abstain-in-corpus'] as const;
 export type LintRule = (typeof LINT_RULES)[number];
+/**
+ * Rules that ask for a look rather than stop a run: `abstain-in-corpus` is lexical, and on the 2026-11 packs
+ * a third of what it flags was answered by the run's systems while the rest were look-alikes (the subject is
+ * in the corpus, the asked value is not). Their findings are reported before a run, which goes ahead.
+ */
+export const ADVISORY_RULES: ReadonlySet<LintRule> = new Set(['abstain-in-corpus']);
 
 export interface LintFinding { rule: LintRule; task?: string; message: string }
 export interface LintResult {
@@ -265,8 +281,85 @@ export function lintPack(pack: LoadedPack): LintResult {
     if (hit) add('hop-shortcut', `its answer stands on a line of ${hit.doc} beside the question's rare word "${hit.tok}"`, t.id);
   }
 
+  /* abstain-in-corpus */
+  for (const f of abstainInCorpus(pack)) add('abstain-in-corpus', f.message, f.task);
+
   const counts = Object.fromEntries(LINT_RULES.map((r) => [r, findings.filter((f) => f.rule === r).length])) as Record<LintRule, number>;
   return { pack: pack.manifest.id, findings, counts, families, strata, docs: N, tasks: tasks.length };
+}
+
+/** An abstain question a recipe planted from its own world model: it names corpus terms on purpose. */
+export const plantedAbstain = (t: Task) => String(t.meta?.subtype ?? '').startsWith('unanswerable-');
+
+/** The abstain tasks of a pack whose distinctive terms co-occur in one passage (packs/absent.ts), best passage first. */
+export function abstainInCorpus(pack: LoadedPack, threshold = ABSENT_COVERAGE): { task: string; doc: string; coverage: number; message: string }[] {
+  const asked = pack.tasks.filter((t) => t.scoring === 'abstain' && !plantedAbstain(t) && t.meta?.absenceChecked !== true);
+  if (!asked.length) return [];
+  const docs = pack.docs.flatMap((d) => {
+    const file = path.join(pack.dir, 'corpus', d.path);
+    return fs.existsSync(file) ? [{ path: d.path, text: fs.readFileSync(file, 'utf8') }] : [];
+  });
+  const corpus = absentCorpus(docs, asked.map((t) => t.question));
+  return asked.flatMap((t) => {
+    const hit = bestPassage(t.question, corpus);
+    if (!hit || hit.coverage < threshold) return [];
+    return [{ task: t.id, doc: hit.doc, coverage: hit.coverage, message: `${Math.round(hit.coverage * 100)}% of its weighted terms stand in one passage of ${hit.doc} ("${hit.terms.slice(0, 4).join('", "')}"): check the corpus does not answer it` }];
+  });
+}
+
+/* ------------------------------ checks against a run ------------------------------ */
+
+/** What a check against a run reads of an answer record (answers.jsonl). */
+export interface RunAnswer { system: string; taskId: string; text?: string; finalAnswer?: string; citations?: { doc: string }[] }
+/** What it reads of a score record (scores.jsonl). */
+export interface RunScore { system: string; taskId: string; metric: string; value: number | null }
+
+export interface AbstainAnswered {
+  task: string;
+  question: string;
+  /** Systems asked, systems that answered instead of declining. */
+  asked: string[];
+  answered: string[];
+  /** The document most answering systems cite, and how many cite it. */
+  doc: string;
+  citing: number;
+  /** Planted by its recipe from the world model (`plantedAbstain`): the fact does not exist, so a "yes" is the systems' or the judge's error, not the gold's. */
+  planted: boolean;
+  message: string;
+}
+
+/**
+ * The second signal for abstain tasks (rule `abstain-answered`): a run's
+ * answers. An abstain task that at least `minSystems` systems answer — not
+ * declining — while citing the same document is suspect: independent systems
+ * rarely invent the same answer from the same source. "Answered" is the
+ * judge's `abstain_correct` 0 where the run scored it, else an answer that
+ * does not decline (score/values.ts `declines`).
+ */
+export function abstainAnswered(pack: LoadedPack, answers: RunAnswer[], scores: RunScore[] = [], minSystems = 2): AbstainAnswered[] {
+  const asked = new Map(pack.tasks.filter((t) => t.scoring === 'abstain').map((t) => [t.id, t]));
+  const judged = new Map<string, number>();
+  for (const s of scores) if (s.metric === 'abstain_correct' && asked.has(s.taskId) && typeof s.value === 'number') judged.set(`${s.taskId}|${s.system}`, s.value);
+  const byTask = new Map<string, RunAnswer[]>();
+  for (const a of answers) if (asked.has(a.taskId)) (byTask.get(a.taskId) ?? byTask.set(a.taskId, []).get(a.taskId)!).push(a);
+  const out: AbstainAnswered[] = [];
+  for (const [id, list] of byTask) {
+    const answered = list.filter((a) => {
+      const v = judged.get(`${id}|${a.system}`);
+      return v !== undefined ? v === 0 : !declines(a.finalAnswer ?? extractFinalAnswer(a.text ?? ''));
+    });
+    const cites = new Map<string, Set<string>>();
+    for (const a of answered) for (const c of a.citations ?? []) (cites.get(c.doc) ?? cites.set(c.doc, new Set()).get(c.doc)!).add(a.system);
+    const top = [...cites].sort((x, y) => y[1].size - x[1].size || x[0].localeCompare(y[0]))[0];
+    if (!top || top[1].size < minSystems) continue;
+    const systems = [...new Set(list.map((a) => a.system))].sort();
+    out.push({
+      task: id, question: asked.get(id)!.question, asked: systems, answered: [...new Set(answered.map((a) => a.system))].sort(), doc: top[0], citing: top[1].size,
+      planted: plantedAbstain(asked.get(id)!),
+      message: `${top[1].size} of ${systems.length} systems answered it citing ${top[0]}${plantedAbstain(asked.get(id)!) ? ' (planted: check the answers and the judge, not the gold)' : ''}`,
+    });
+  }
+  return out.sort((a, b) => b.citing - a.citing || a.task.localeCompare(b.task));
 }
 
 /** A lint result as lines for the console: counts by rule, then up to `examples` findings of each. */
@@ -283,11 +376,15 @@ export function formatLint(r: LintResult, examples = 5): string {
 
 /**
  * `eval run`'s check before it spends anything: every pack linted, and a report of the ones with findings.
- * `ok` false stops the run (unless --no-lint).
+ * `ok` false stops the run (unless --no-lint); findings of advisory rules alone are reported and do not.
  */
 export function lintBeforeRun(packs: LoadedPack[]): { ok: boolean; report: string; results: LintResult[] } {
   const results = packs.map(lintPack);
-  const bad = results.filter((r) => r.findings.length);
-  const report = bad.length ? `${bad.map((r) => formatLint(r, 3)).join('\n')}\n\npack lint: ${bad.map((r) => r.pack).join(', ')} — fix the pack, or pass --no-lint to run it as it is` : '';
-  return { ok: !bad.length, report, results };
+  const bad = results.filter((r) => r.findings.some((f) => !ADVISORY_RULES.has(f.rule)));
+  const advised = results.filter((r) => !bad.includes(r) && r.findings.length);
+  const parts = [
+    ...(bad.length ? [`${bad.map((r) => formatLint(r, 3)).join('\n')}\n\npack lint: ${bad.map((r) => r.pack).join(', ')} — fix the pack, or pass --no-lint to run it as it is`] : []),
+    ...(advised.length ? [`${advised.map((r) => formatLint(r, 3)).join('\n')}\n\npack lint (advisory, the run goes ahead): ${advised.map((r) => r.pack).join(', ')} — check each flagged task, and mark one the corpus does not answer meta.absenceChecked`] : []),
+  ];
+  return { ok: !bad.length, report: parts.join('\n\n'), results };
 }

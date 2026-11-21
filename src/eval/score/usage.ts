@@ -14,7 +14,8 @@ export { scoreKey } from './keys.js';
  * system are stripped, and the order is shuffled so a batch mixes systems —
  * then exact match and F1 on the `Final answer:` line, citation precision and
  * recall against the task's evidence, and abstention read from the judge.
- * `value` tasks are scored without a model (docs/design/28): the final line
+ * A `keypoints` task's correctness is its keypoint recall (the judge's grade
+ * is kept as `grade`). `value` tasks are scored without a model (docs/design/28): the final line
  * names the gold value or it does not. Every answer also gets
  * `confident_wrong` (wrong and not declining) and, where the task names the
  * values the corpus once stated for the same thing, `stale_answer`.
@@ -79,8 +80,16 @@ export async function scoreUsage(input: UsageScoringInput, judge: Judge): Promis
     const v = verdicts.get(it.id);
     const { a, t } = it;
     if (!v) continue;
-    put(a, t, 'correctness', v.score / 2, { reason: v.reason });
-    if (t.keypoints?.length) put(a, t, 'keypoint_recall', v.keypoints.filter((k) => k >= 0 && k < t.keypoints!.length).length / t.keypoints.length);
+    const recall = t.keypoints?.length ? new Set(v.keypoints.filter((k) => k >= 0 && k < t.keypoints!.length)).size / t.keypoints.length : null;
+    // a keypoints task (a global question) is as right as the share of its key points the answer states: the
+    // 3-point grade put three quarters of every arm's answers at exactly 1 of 2 (docs/design/23 §5, 2026-11 campaign)
+    if (t.scoring === 'keypoints' && recall !== null) {
+      put(a, t, 'correctness', recall, { metric: 'keypoint_recall', grade: v.score / 2, reason: v.reason });
+      put(a, t, 'grade', v.score / 2);
+    } else {
+      put(a, t, 'correctness', v.score / 2, { reason: v.reason });
+    }
+    if (recall !== null) put(a, t, 'keypoint_recall', recall);
     if (t.scoring === 'abstain') {
       put(a, t, 'abstain_correct', v.score === 2 ? 1 : 0);
     } else {

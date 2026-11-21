@@ -1,4 +1,4 @@
-import type { Judge } from '../judge.js';
+import { canonicalListPairs as canonicalPairs, type Judge } from '../judge.js';
 import { hasCjk, normalizeAnswer } from '../metrics/text.js';
 import { parseStructured } from '../prompts.js';
 import type { AnswerRecord, GoldItem, ListSpec, ScoreRecord, Task } from '../types.js';
@@ -10,7 +10,9 @@ import { judgeItemKey, repeatOf, scoreKey } from './keys.js';
  * the sides of a contradiction or a profile, each answered as the same JSON
  * list and matched one-to-one against a gold list — without a model where the
  * gold allows it (an alias that occurs in the predicted label, or the
- * documents an item cites), by the judge otherwise. A timeline is also scored
+ * documents an item cites), by the judge otherwise — and a judge-matched list
+ * goes to the judge only for what its gold's own terms do not settle
+ * (`matchByAnchors`). A timeline is also scored
  * on order and dates; a contradiction match needs one of the documents that
  * take that side. The task's correctness is set F1 (recall where the gold is
  * a sample), times order accuracy for a timeline. A structured query
@@ -138,6 +140,53 @@ export function matchByFields(predicted: string[], gold: GoldItem[]): [number, n
   return out.sort((a, b) => a[0] - b[0]);
 }
 
+/**
+ * The pairs of a judge-matched list (`list.match` judge) that need no judge
+ * (2026-11 judge audit: a second pass agreed with the first on 69% of list
+ * verdicts, and nearly every disagreement was a list of ten or more entries
+ * with one or two borderline pairs). A predicted entry is paired with a gold
+ * entry when its label names a term of that gold entry — the label itself,
+ * or an alias: an id, a name, the value an event set — and no other unpaired
+ * gold entry's term, with the dates agreeing where both have one (`nearDate`).
+ * A term tells entries apart only where it is rare on both sides: one that
+ * the question holds, or that more than one predicted entry names (a team
+ * every entry is about), does not count, nor does a weak term — a number, or
+ * a word of under two CJK or four Latin characters: "原报240" names the old
+ * value of a change to 240. An entry that names several gold entries' terms is a merge, left to
+ * the judge, as is everything not paired here; the judge then sees only the
+ * unpaired entries of both lists. A contradiction's gold entries are topics
+ * ("Payments's headcount"), not statements, and are all left to the judge.
+ */
+export function matchByAnchors(items: { label: string; date?: string }[], gold: GoldItem[], question = '', type = ''): [number, number][] {
+  if (type === 'contradiction') return [];
+  const q = matchForm(question);
+  const strong = (term: string) => {
+    const f = matchForm(term);
+    if (/^[\d\s.,%-]+$/.test(f)) return false;
+    return hasCjk(f) ? [...f.replace(/[^\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu, '')].length >= 2 : f.replace(/[^a-z0-9]/g, '').length >= 4;
+  };
+  const terms = gold.map((g) => [...new Set([g.label, ...g.aliases].map((x) => x.trim()).filter((x) => x && matchForm(x) && !(q && q.includes(matchForm(x)))))]
+    .filter((x) => items.filter((it) => containsTerm(it.label, x)).length === 1));
+  const usedG = new Set<number>();
+  const out: [number, number][] = [];
+  items.forEach((it, pi) => {
+    const named: { gi: number; weak: boolean }[] = [];
+    gold.forEach((g, gi) => {
+      if (usedG.has(gi)) return;
+      const hit = terms[gi].filter((t) => containsTerm(it.label, t));
+      if (!hit.length) return;
+      if (g.date && it.date && !nearDate(it.date, g.date)) return;
+      named.push({ gi, weak: !hit.some(strong) });
+    });
+    // one gold entry named (after the dates ruled the others out), by a strong term
+    const pick = named.length === 1 && !named[0].weak ? named[0] : undefined;
+    if (!pick) return;
+    usedG.add(pick.gi);
+    out.push([pi, pick.gi]);
+  });
+  return out;
+}
+
 /** A cited path as a corpus document: prefixes the systems write stripped, a bare file name resolved when it names one document. */
 export function evidenceDoc(cited: string, docs: Set<string>): string | undefined {
   const p = cited.trim().replace(/^\.\//, '').replace(/^(?:raw\/docs|raw|corpus)\//, '').replace(/[)\].,;:，。]+$/, '');
@@ -175,7 +224,14 @@ const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', '
 /** A date as an answer writes it: 2026-04-12, 2026/4/12, 2026年4月12日, 4月12日, April 12, 2026, 12 April — or the gold's YYYY-MM. */
 export function parseLooseDate(s: string): LooseDate | null {
   const t = s.normalize('NFKC').toLowerCase();
-  let m = t.match(/(\d{4})\s*[-/.年]\s*(\d{1,2})(?:\s*[-/.月]\s*(\d{1,2}))?/);
+  // an ISO week (2024-W03, 2024年第3周, week 3 of 2024) as its Monday: the reports packs date a week's events so
+  let m = t.match(/(\d{4})\s*-?w(\d{1,2})\b/) ?? t.match(/(\d{4})\s*年\s*第\s*(\d{1,2})\s*周/);
+  const wk = m ? [m[1], m[2]] : t.match(/\bweek\s+(\d{1,2})\s+(?:of\s+)?(\d{4})/)?.slice(1, 3).reverse();
+  if (wk) {
+    const monday = isoWeekMonday(+wk[0], +wk[1]);
+    if (monday) return { y: monday.getUTCFullYear(), m: monday.getUTCMonth() + 1, d: monday.getUTCDate() };
+  }
+  m = t.match(/(\d{4})\s*[-/.年]\s*(\d{1,2})(?:\s*[-/.月]\s*(\d{1,2}))?/);
   if (m) return { y: +m[1], m: +m[2], ...(m[3] ? { d: +m[3] } : {}) };
   m = t.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]/);
   if (m) return { m: +m[1], d: +m[2] };
@@ -186,6 +242,30 @@ export function parseLooseDate(s: string): LooseDate | null {
   m = t.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?(?:,?\s+(\d{4}))?/);
   if (m) return { m: MONTHS.indexOf(m[2]) + 1, d: +m[1], ...(m[3] ? { y: +m[3] } : {}) };
   return null;
+}
+
+/** The Monday of ISO week `w` of `year`, or null for a week that is not one. */
+export function isoWeekMonday(year: number, w: number): Date | null {
+  if (!(w >= 1 && w <= 53)) return null;
+  const jan4 = new Date(Date.UTC(year, 0, 4));
+  const monday1 = new Date(jan4.getTime() - ((jan4.getUTCDay() + 6) % 7) * 86_400_000);
+  const d = new Date(monday1.getTime() + (w - 1) * 7 * 86_400_000);
+  return w === 53 && new Date(d.getTime() + 3 * 86_400_000).getUTCFullYear() !== year ? null : d;
+}
+
+/**
+ * Do a predicted and a gold date agree closely enough to tell one dated item from another: the gold date at
+ * its precision, or, both to the day, within `days` of each other (a weekly report dates its week's events by
+ * the week, an answer by the day it names).
+ */
+export function nearDate(predicted: string, gold: string, days = 6): boolean {
+  if (sameDate(predicted, gold)) return true;
+  const p = parseLooseDate(predicted);
+  const g = parseLooseDate(gold);
+  if (!p?.d || !g?.d || g.y === undefined) return false;
+  const pt = Date.UTC(p.y ?? g.y, p.m - 1, p.d);
+  const gt = Date.UTC(g.y, g.m - 1, g.d);
+  return Math.abs(pt - gt) <= days * 86_400_000;
 }
 
 /** Does a predicted date name the gold date, at the gold's precision (a missing year is taken as the gold's)? */
@@ -230,6 +310,9 @@ export interface ListInput {
 
 type Put = (a: AnswerRecord, t: Task, metric: string, value: number | null, detail?: Record<string, unknown>) => void;
 
+/** A predicted entry as the judge sees it: label and date. */
+const judgeEntry = (i: { label: string; date?: string }) => `${i.label}${i.date ? ` (${i.date})` : ''}`;
+
 /** The gold as the judge sees it: label, date and aliases on one line. */
 const goldLine = (g: GoldItem) => `${g.label}${g.date ? ` (${g.date})` : ''}${g.aliases.length ? ` / ${g.aliases.join(' / ')}` : ''}`;
 
@@ -239,7 +322,7 @@ export async function scoreLists(input: ListInput, judge: Judge): Promise<ScoreR
   const put: Put = (a, t, metric, value, detail) =>
     out.push({ key: scoreKey(a, metric), pack: a.pack, system: a.system, suite: t.suite, taskId: t.id, taskType: t.type, metric, value, at, ...(repeatOf(a) !== undefined ? { repeat: repeatOf(a) } : {}), ...(detail ? { detail } : {}) });
 
-  const toJudge: { id: string; a: AnswerRecord; t: Task; items: ReturnType<typeof parseStructured>['items'] }[] = [];
+  const toJudge: { id: string; a: AnswerRecord; t: Task; items: ReturnType<typeof parseStructured>['items']; anchored: [number, number][]; restP: number[]; restG: number[] }[] = [];
   for (const a of input.answers) {
     const t = input.tasks.get(`${a.pack}|${a.taskId}`);
     if (!t || !t.list || t.scoring !== 'set' || !t.items?.length || a.leaked?.length) continue;
@@ -249,7 +332,14 @@ export async function scoreLists(input: ListInput, judge: Judge): Promise<ScoreR
     const items = spec.match === 'alias' ? splitListedItems(given, t.items) : given;
     put(a, t, 'items_returned', items.length);
     if (spec.match === 'judge' && items.length) {
-      toJudge.push({ id: judgeItemKey('list', a), a, t, items });
+      // the pairs the gold's own terms settle, then the judge on what is left of both lists
+      const anchored = matchByAnchors(items, t.items, t.question, t.type);
+      // in a canonical order: the same entries in another order are the same question to the judge (and its cache)
+      const restP = items.map((_, i) => i).filter((i) => !anchored.some(([p]) => p === i))
+        .sort((x, y) => judgeEntry(items[x]).localeCompare(judgeEntry(items[y])) || x - y);
+      const restG = t.items.map((_, i) => i).filter((i) => !anchored.some(([, g]) => g === i));
+      if (restP.length && restG.length) toJudge.push({ id: judgeItemKey('list', a), a, t, items, anchored, restP, restG });
+      else listScores(a, t, spec, anchored.sort((x, y) => x[0] - y[0]), items, input.corpusDocs.get(a.pack) ?? new Set(), put, { anchored: anchored.length, judged: 0 });
       continue;
     }
     const docs = input.corpusDocs.get(a.pack) ?? new Set<string>();
@@ -262,18 +352,16 @@ export async function scoreLists(input: ListInput, judge: Judge): Promise<ScoreR
 
   const verdicts = await judge.matchList(toJudge.map((j) => ({
     id: j.id,
-    predicted: j.items.map((i) => `${i.label}${i.date ? ` (${i.date})` : ''}`),
-    gold: j.t.items!.map(goldLine),
+    predicted: j.restP.map((i) => judgeEntry(j.items[i])),
+    gold: j.restG.map((i) => goldLine(j.t.items![i])),
   })));
   for (const j of toJudge) {
     const v = verdicts.get(j.id);
     if (!v) continue;
-    const gold = j.t.items!;
-    const used = { p: new Set<number>(), g: new Set<number>() };
-    const pairs = (v.pairs ?? []).filter(([p, g]) => Number.isInteger(p) && Number.isInteger(g) && p >= 0 && p < j.items.length && g >= 0 && g < gold.length)
-      .filter(([p, g]) => (used.p.has(p) || used.g.has(g) ? false : (used.p.add(p), used.g.add(g), true)))
-      .sort((x, y) => x[0] - y[0]);
-    listScores(j.a, j.t, listSpec(j.t), pairs, j.items, input.corpusDocs.get(j.a.pack) ?? new Set(), put);
+    // the judge's pairs are over the unpaired entries: back to the lists' own indices
+    const judged = canonicalPairs(v.pairs, j.restP.length, j.restG.length).map(([p, g]) => [j.restP[p], j.restG[g]] as [number, number]);
+    const pairs = [...j.anchored, ...judged].sort((x, y) => x[0] - y[0]);
+    listScores(j.a, j.t, listSpec(j.t), pairs, j.items, input.corpusDocs.get(j.a.pack) ?? new Set(), put, { anchored: j.anchored.length, judged: judged.length });
   }
   return out;
 }
@@ -281,7 +369,7 @@ export async function scoreLists(input: ListInput, judge: Judge): Promise<ScoreR
 /** Set precision / recall / F1 over the matched pairs, and what the task type adds: order and dates, attribution. */
 export function listScores(
   a: AnswerRecord, t: Task, spec: ListSpec, matched: [number, number][], items: { label: string; evidence: string[]; date?: string; confidence: number | null }[],
-  docs: Set<string>, put: Put,
+  docs: Set<string>, put: Put, how?: { anchored: number; judged: number },
 ): void {
   const gold = t.items!;
   const cited = (i: number) => new Set(items[i].evidence.map((e) => evidenceDoc(e, docs)).filter((d): d is string => Boolean(d)));
@@ -293,7 +381,7 @@ export function listScores(
   const recall = totalWeight ? hitWeight / totalWeight : 0;
   const f1 = precision + recall ? (2 * precision * recall) / (precision + recall) : 0;
   put(a, t, 'set_precision', precision);
-  put(a, t, 'set_recall', recall, { matched: pairs.map(([p, g]) => [items[p].label, gold[g].label]) });
+  put(a, t, 'set_recall', recall, { matched: pairs.map(([p, g]) => [items[p].label, gold[g].label]), ...(how ? { pairedBy: how } : {}) });
   put(a, t, 'set_f1', f1);
   // exact: the whole set, nothing missing and nothing extra
   let correctness = spec.primary === 'recall' ? recall : spec.primary === 'exact' ? (pairs.length === gold.length && items.length === gold.length ? 1 : 0) : f1;
