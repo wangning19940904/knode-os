@@ -228,7 +228,12 @@ knode-os eval report ~/knode-eval/runs/<stamp>
 
 - `--config-from` names the workspace whose embedder (the bge-m3 pool) the run borrows. Its config is only read.
 - Build effort defaults to low and answer effort to medium.
-- Agents answer at most 30 stratified tasks per pack (`--agent-limit`).
+- Agents answer at most 30 stratified tasks per pack (`--agent-limit`), round-robin over task types unless an allocation says
+  otherwise: `--agent-weights aggregate=4,*=1` or `--agent-counts timeline=12,*=1` by hand, or `--agent-headroom-from <run dirs |
+  campaign.json>`, which weights each type by how far apart the agent arms' scores came on it in those records (mean highest − lowest,
+  shrunk toward the type's mean over every pack) and gives every type a floor (`--agent-floor`, default 1). `--agent-update-limit`
+  caps the update tasks agents answer (default all). The allocation, and what each pack took, is in `run.json` `agentSample`; a resume
+  keeps it. The report opens with whether each pack's agent sample could separate the arms at all.
 - `--fraction` and `--seed` give scale curves and run-to-run variance. Above 1, `--fraction` stages the pack's padding (10 = ten times the
   documents); a pack with too little padding is refused. Long-context is applicable by the staged size.
 - `--types aggregate,timeline,contradiction,profile,deep-hop,update` runs only those tasks; `--reuse-builds-from <run>` starts from another

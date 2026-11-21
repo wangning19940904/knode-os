@@ -3,7 +3,8 @@ import path from 'node:path';
 import { mdTable } from '../bench/util.js';
 import { chartBlock } from '../research/chart.js';
 import { bootstrapMean, holm, mean, minimumDetectableEffect, pairedBootstrap, round, sd, wilson } from './metrics/stats.js';
-import { RunStore } from './runstore.js';
+import { describeAllocation, type AgentSample, type TypeEvidence } from './allocation.js';
+import { fileLines, RunStore } from './runstore.js';
 import { judgeItemKey } from './score/keys.js';
 import { SYSTEMS } from './systems/index.js';
 import { toolsOf, toolUse, type ToolUse } from './trace.js';
@@ -155,6 +156,33 @@ export interface Discrimination {
   byType: Record<string, DiscriminationCounts>;
 }
 
+/**
+ * Whether a pack's agent sample could tell the arms apart: over the questions
+ * every agent arm was scored on, those on which their correctness differed at
+ * all, and the smallest paired difference between two arms the sample could
+ * detect (α 0.05, power 0.8) — the median over the pairs of arms whose scores
+ * differ somewhere, and the range. `pack` is '' for every pack pooled.
+ */
+export interface PackSeparability {
+  pack: string;
+  agents: string[];
+  n: number;
+  allRight: number;
+  noneRight: number;
+  /** Questions on which the arms' correctness was not all the same: the only ones that can show a difference. */
+  differ: number;
+  mde: { median: number; min: number; max: number } | null;
+  /** One line when the pack cannot separate the arms at all; null otherwise. */
+  verdict: string | null;
+}
+
+export interface Separability {
+  packs: PackSeparability[];
+  overall: PackSeparability;
+  /** The run's agent sample (`run.json`): its limit, its allocation over types and what each pack took. */
+  sample?: AgentSample;
+}
+
 export interface KnodeToolRow {
   tool: string;
   /** Calls of the tool over the system's traced answers, and per traced answer. */
@@ -278,6 +306,8 @@ export interface ReportData {
   ladder?: LadderRow[];
   /** Questions every agent system got fully right, none did, and the rest (docs/design/33 §5). */
   discrimination?: Discrimination;
+  /** Per pack, whether its agent sample could tell the arms apart, first in the report. */
+  separability?: Separability;
   /** Per pack and system that called knode's tools: calls per tool, and correctness with and without each. */
   knodeTools?: Record<string, Record<string, KnodeToolRow[]>>;
   /** What one correct answer costs: weighted tokens and USD over the sum of correctness, per pack and system. */
@@ -482,6 +512,7 @@ export function buildReportData(runDir: string): ReportData {
   const costPerCorrect = costPerCorrectOf(answers, scores);
   const ladder = ladderOf(answers, correctness);
   const discrimination = discriminationOf(systems.filter(isAgentSystem), correctness, typeOf);
+  const separability = separabilityOf(correctness, store.meta()?.agentSample);
   const knodeTools = knodeToolsOf(answers, correctness);
   const variance = varianceOf(answers, scores);
   const repeatPairs = repeatPairsOf(answers, scores);
@@ -491,7 +522,7 @@ export function buildReportData(runDir: string): ReportData {
     : 0;
   return {
     run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, tools, builds, breakEven, lists, efficiency, updates, pooled, paired, byType, typesByPack, typeDeltas,
-    separation, costPerCorrect, ...(ladder.length ? { ladder } : {}), ...(discrimination ? { discrimination } : {}), ...(Object.keys(knodeTools).length ? { knodeTools } : {}),
+    separation, costPerCorrect, ...(ladder.length ? { ladder } : {}), ...(discrimination ? { discrimination } : {}), ...(separability ? { separability } : {}), ...(Object.keys(knodeTools).length ? { knodeTools } : {}),
     variance, repeatPairs, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 }, judgeAudit: judgeAuditOf(store),
     ranAt: ranAtOf(runDir, store.meta()?.work?.pool ?? 'local'),
   };
@@ -582,6 +613,187 @@ export function discriminationOf(agents: string[], correctness: ReadonlyMap<stri
     }
   }
   return overall.n ? { systems: [...agents].sort(), overall, byType } : null;
+}
+
+/** Correctness per question (pack, task) and agent arm, from a run's per-task means; arms by pack, those of at least one score. */
+function agentQuestions(correctness: ReadonlyMap<string, number>, isAgent: (system: string) => boolean = isAgentSystem): Map<string, { agents: Set<string>; questions: Map<string, Map<string, number>> }> {
+  const out = new Map<string, { agents: Set<string>; questions: Map<string, Map<string, number>> }>();
+  const known = new Map<string, boolean>();
+  for (const [k, v] of correctness) {
+    const [sys, pack, task] = k.split('\u0000');
+    if (!(known.get(sys) ?? known.set(sys, isAgent(sys)).get(sys))) continue;
+    const p = out.get(pack) ?? out.set(pack, { agents: new Set(), questions: new Map() }).get(pack)!;
+    p.agents.add(sys);
+    (p.questions.get(task) ?? p.questions.set(task, new Map()).get(task)!).set(sys, v);
+  }
+  return out;
+}
+
+/** Equal within rounding: the judge's scores are fractions of small integers. */
+const same = (vs: number[]) => Math.max(...vs) - Math.min(...vs) < 1e-9;
+
+/**
+ * Per pack and task type, over the questions every agent arm of the pack was
+ * scored on: how many, how many the arms' scores differed on, how many all
+ * got fully right and how many none did — what `--agent-headroom-from`
+ * derives its weights from. Packs with fewer than two agent arms are left out.
+ */
+export function typeEvidenceOf(correctness: ReadonlyMap<string, number>, typeOf: ReadonlyMap<string, string>, isAgent?: (system: string) => boolean): Record<string, Record<string, TypeEvidence>> {
+  const out: Record<string, Record<string, TypeEvidence>> = {};
+  for (const [pack, { agents, questions }] of agentQuestions(correctness, isAgent)) {
+    if (agents.size < 2) continue;
+    for (const [task, vs] of questions) {
+      if (vs.size < agents.size) continue;
+      const values = [...vs.values()];
+      const e = ((out[pack] ??= {})[typeOf.get(`${pack}\u0000${task}`) ?? 'untyped'] ??= { n: 0, differ: 0, spread: 0, allRight: 0, noneRight: 0 });
+      e.n++;
+      if (!same(values)) e.differ++;
+      e.spread += Math.max(...values) - Math.min(...values);
+      const right = values.filter((v) => v >= 1).length;
+      if (right === values.length) e.allRight++;
+      else if (right === 0) e.noneRight++;
+    }
+  }
+  return out;
+}
+
+/**
+ * Whether each pack's agent sample could tell the arms apart (see
+ * `PackSeparability`), and every pack pooled. Null with no pack of two agent
+ * arms. A pair of arms whose scores never differ has no spread to size an MDE
+ * by, and is left out of the MDE.
+ */
+export function separabilityOf(correctness: ReadonlyMap<string, number>, sample?: AgentSample, isAgent?: (system: string) => boolean): Separability | null {
+  const byPack = agentQuestions(correctness, isAgent);
+  const rows: PackSeparability[] = [];
+  const pooledDiffs = new Map<string, number[]>();
+  const all = { n: 0, allRight: 0, noneRight: 0, differ: 0, agents: new Set<string>() };
+  const mdeOf = (diffs: Map<string, number[]>) => {
+    const ms = [...diffs.values()].filter((d) => d.length >= 2 && d.some((x) => Math.abs(x) > 1e-9)).map((d) => minimumDetectableEffect(d)).sort((a, b) => a - b);
+    return ms.length ? { median: ms.length % 2 ? ms[(ms.length - 1) / 2] : (ms[ms.length / 2 - 1] + ms[ms.length / 2]) / 2, min: ms[0], max: ms.at(-1)! } : null;
+  };
+  for (const [pack, { agents, questions }] of [...byPack].sort(([a], [b]) => a.localeCompare(b))) {
+    if (agents.size < 2) continue;
+    const arms = [...agents].sort();
+    const c = { n: 0, allRight: 0, noneRight: 0, differ: 0 };
+    const diffs = new Map<string, number[]>();
+    for (const vs of questions.values()) {
+      if (vs.size < arms.length) continue;
+      const values = arms.map((a) => vs.get(a)!);
+      c.n++;
+      if (!same(values)) c.differ++;
+      const right = values.filter((v) => v >= 1).length;
+      if (right === values.length) c.allRight++;
+      else if (right === 0) c.noneRight++;
+      for (let i = 0; i < arms.length; i++) {
+        for (let j = i + 1; j < arms.length; j++) {
+          const pair = `${arms[i]}\u0000${arms[j]}`;
+          (diffs.get(pair) ?? diffs.set(pair, []).get(pair)!).push(values[i] - values[j]);
+          (pooledDiffs.get(pair) ?? pooledDiffs.set(pair, []).get(pair)!).push(values[i] - values[j]);
+        }
+      }
+    }
+    if (!c.n) continue;
+    for (const a of arms) all.agents.add(a);
+    all.n += c.n;
+    all.allRight += c.allRight;
+    all.noneRight += c.noneRight;
+    all.differ += c.differ;
+    rows.push({ pack, agents: arms, ...c, mde: mdeOf(diffs), verdict: verdictOf(c) });
+  }
+  if (!rows.length) return null;
+  const overall: PackSeparability = { pack: '', agents: [...all.agents].sort(), n: all.n, allRight: all.allRight, noneRight: all.noneRight, differ: all.differ, mde: mdeOf(pooledDiffs), verdict: verdictOf(all) };
+  return { packs: rows, overall, ...(sample ? { sample } : {}) };
+}
+
+function verdictOf(c: { n: number; allRight: number; noneRight: number; differ: number }): string | null {
+  if (c.differ) return null;
+  const parts = [`${c.allRight} fully right for every arm`, `${c.noneRight} for none`, `${c.n - c.allRight - c.noneRight} the same partial score`].filter((x) => !x.startsWith('0 '));
+  return `cannot separate the arms: every arm got the same score on all ${c.n} agent question(s) (${parts.join(', ')})`;
+}
+
+/**
+ * Per pack and type, what earlier runs saw of the agent arms (`typeEvidenceOf`),
+ * from their records, for `--agent-headroom-from`. Each source is a run
+ * directory (its `scores.jsonl`, else its `report.json`), a `scores.jsonl`, a
+ * `report.json` (its `discrimination.byType`: "the rest" stands for the
+ * questions that differ; a run of several packs counts for every pack's
+ * pooled type shares only), or a campaign's `campaign.json` (each entry's
+ * `runDir`). Only `correctness` is read, as the report reads it. A run of one
+ * pack is keyed by the pack directory's name its `run.json` records (two
+ * versions of a pack share a manifest id), any other by manifest id.
+ */
+export function headroomEvidence(sources: string[]): Record<string, Record<string, TypeEvidence>> {
+  const out: Record<string, Record<string, TypeEvidence>> = {};
+  const add = (pack: string, type: string, e: TypeEvidence) => {
+    const t = ((out[pack] ??= {})[type] ??= { n: 0, differ: 0, spread: 0, allRight: 0, noneRight: 0 });
+    t.n += e.n;
+    t.differ += e.differ;
+    t.spread += e.spread;
+    t.allRight += e.allRight;
+    t.noneRight += e.noneRight;
+  };
+  // a run of one pack is known by its directory's name, as the run recorded it: two versions of a pack share a manifest id
+  const fromScores = (file: string, as?: string) => {
+    const latest = new Map<string, ScoreRecord>();
+    for (const line of fileLines(file)) {
+      if (!line.includes('"correctness"')) continue;
+      try {
+        const r = JSON.parse(line) as ScoreRecord;
+        if (r.metric === 'correctness') latest.set(r.key, r);
+      } catch {
+        /* a line cut by a crash */
+      }
+    }
+    const perTask = new Map<string, number[]>();
+    const typeOf = new Map<string, string>();
+    for (const r of latest.values()) {
+      if (r.value === null || !Number.isFinite(r.value)) continue;
+      const k = `${r.system}\u0000${r.pack}\u0000${r.taskId}`;
+      (perTask.get(k) ?? perTask.set(k, []).get(k)!).push(r.value);
+      if (r.taskType) typeOf.set(`${r.pack}\u0000${r.taskId}`, r.taskType);
+    }
+    const found = typeEvidenceOf(new Map([...perTask].map(([k, vs]) => [k, mean(vs)])), typeOf);
+    const single = as && Object.keys(found).length === 1;
+    for (const [pack, types] of Object.entries(found)) {
+      for (const [type, e] of Object.entries(types)) add(single ? as : pack, type, e);
+    }
+  };
+  const fromReport = (file: string) => {
+    const r = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<ReportData>;
+    if (!r.discrimination) return;
+    const pack = r.packs?.length === 1 ? (r.run?.packs?.length === 1 ? r.run.packs[0] : r.packs[0]) : `(pooled) ${r.run?.id ?? path.basename(path.dirname(file))}`;
+    for (const [type, c] of Object.entries(r.discrimination.byType)) add(pack, type, { n: c.n, differ: c.rest, spread: c.rest, allRight: c.allRight, noneRight: c.noneRight });
+  };
+  const one = (src: string) => {
+    const at = path.resolve(src);
+    if (!fs.existsSync(at)) throw new Error(`--agent-headroom-from: ${src} does not exist`);
+    if (fs.statSync(at).isDirectory()) {
+      if (fs.existsSync(path.join(at, 'scores.jsonl'))) return fromScores(path.join(at, 'scores.jsonl'), oneRunPack(at));
+      if (fs.existsSync(path.join(at, 'report.json'))) return fromReport(path.join(at, 'report.json'));
+      if (fs.existsSync(path.join(at, 'campaign.json'))) return one(path.join(at, 'campaign.json'));
+      throw new Error(`--agent-headroom-from: ${src} holds no scores.jsonl, report.json or campaign.json`);
+    }
+    if (at.endsWith('.jsonl')) return fromScores(at, oneRunPack(path.dirname(at)));
+    const json = JSON.parse(fs.readFileSync(at, 'utf8')) as { entries?: { runDir?: string }[]; discrimination?: unknown };
+    if (Array.isArray(json.entries)) {
+      for (const e of json.entries) if (e.runDir && (fs.existsSync(path.join(e.runDir, 'scores.jsonl')) || fs.existsSync(path.join(e.runDir, 'report.json')))) one(e.runDir);
+      return;
+    }
+    return fromReport(at);
+  };
+  for (const src of sources) one(src);
+  return out;
+}
+
+/** The pack directory's name a run of one pack recorded (`run.json` `packs`), if it is one. */
+function oneRunPack(runDir: string): string | undefined {
+  try {
+    const packs = (JSON.parse(fs.readFileSync(path.join(runDir, 'run.json'), 'utf8')) as { packs?: string[] }).packs;
+    return packs?.length === 1 ? packs[0] : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -928,6 +1140,40 @@ function discriminationLines(d: Discrimination | undefined): string[] {
   return out;
 }
 
+/**
+ * Up front: whether each pack's agent sample could separate the arms at all
+ * (the share of its questions on which they differed, the smallest
+ * difference it could detect, a verdict where none differed), and how the
+ * sample was drawn.
+ */
+function separabilityLines(d: Separability | undefined): string[] {
+  if (!d) return [];
+  const pct = (x: number, n: number) => (n ? `${x} (${((x / n) * 100).toFixed(0)}%)` : '0');
+  const mde = (m: PackSeparability['mde']) => (m ? `${fmtMde(m.median)}${m.max - m.min > 5e-4 ? ` (${fmtMde(m.min)}–${fmtMde(m.max)})` : ''}` : '—');
+  const out = ['## Can this run separate the agents?', ''];
+  const blind = d.packs.filter((p) => p.verdict);
+  out.push(blind.length
+    ? `**${blind.length} of ${d.packs.length} pack(s) cannot separate the agent arms at all**: ${blind.map((p) => p.pack).join(', ')}. On those, no arm scored differently from another on any question, so a tie there says nothing about the arms.`
+    : `Every pack had at least one question on which the agent arms scored differently.`, '');
+  out.push(`Over the questions every agent arm (${d.overall.agents.join(', ')}) was scored on: those on which their correctness differed at all — the only ones that can show a difference — and the smallest paired difference between two arms the sample could detect (MDE, α 0.05, power 0.8; the median over the pairs of arms whose scores differ somewhere, the range in parentheses). Pairs that never differ have no spread and are left out of the MDE.`, '');
+  const row = (label: string, p: PackSeparability) => [label, p.n, pct(p.differ, p.n), pct(p.allRight, p.n), pct(p.noneRight, p.n), mde(p.mde), p.verdict ?? ''];
+  out.push(mdTable(['pack', 'agent questions', 'arms differ', 'all fully right', 'none fully right', 'MDE', 'verdict'], [...d.packs.map((p) => row(p.pack, p)), row('**all packs**', d.overall)]), '');
+  const s = d.sample;
+  if (s) {
+    out.push(`Agent sample: ${s.allocation?.mode === 'counts' ? 'the counts below' : `${s.limit} a pack`} by ${describeAllocation(s.allocation)}${s.updateLimit !== null ? `; at most ${s.updateLimit} update tasks a pack` : '; every update task'}.`);
+    const packs = Object.keys(s.byPack).sort();
+    if (s.allocation && packs.length) {
+      out.push('', mdTable(['pack', 'taken / available by type (weight)', 'update tasks'], packs.map((p) => [
+        p,
+        Object.entries(s.byPack[p]).sort(([, a], [, b]) => b.taken - a.taken || b.available - a.available).map(([t, c]) => `${t} ${c.taken}/${c.available}${c.weight !== undefined ? ` (${round(c.weight, 2)})` : ''}`).join(', '),
+        s.updates?.[p] ? `${s.updates[p].taken}/${s.updates[p].available}` : '—',
+      ])));
+    }
+    out.push('');
+  }
+  return out;
+}
+
 /** knode's tools per agent that called them: calls, and correctness of the answers that used each against the rest. */
 function knodeToolLines(rows: Record<string, KnodeToolRow[]> | undefined): string[] {
   if (!rows || !Object.keys(rows).length) return [];
@@ -989,6 +1235,7 @@ export function renderReport(d: ReportData): string {
     lines.push(`- Packs: ${d.packs.join(', ')}; systems: ${d.systems.join(', ')}; corpus fraction ${meta.fraction}, seed ${meta.seed}; git ${meta.gitSha?.slice(0, 10) ?? '?'}`);
     lines.push(`- Judge calls: ${d.judgeUsage.calls}`, '');
   }
+  lines.push(...separabilityLines(d.separability));
   lines.push(...placementLines(d));
   lines.push('Intervals are Wilson (rates) or bootstrap (means), 95%. Correctness is the judge score scaled to 0–1. "—" means not measured or not applicable (a system that does not cite has no citation score).', '');
   lines.push(...ladderLines(d.ladder));
