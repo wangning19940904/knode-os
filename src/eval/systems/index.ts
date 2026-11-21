@@ -1,7 +1,7 @@
 import { agentGrep } from './agents.js';
 import { LADDER_ARMS } from './briefs.js';
 import { externalSystem, EXTERNAL_SYSTEMS } from './external.js';
-import { agentKnode, agentKnodeFull, agentKnodeWiki, agentKnodeWikiSources, knodeAsk, knodeSag } from './knode.js';
+import { agentKnode, agentKnodeFull, agentKnodeWiki, agentKnodeWikiSources, knodeAsk, knodeAskHops, knodeSag } from './knode.js';
 import { llmWiki, llmWikiSources } from './llm-wiki.js';
 import { agentRag, ragBm25, ragHybrid, ragVector } from './rag.js';
 import { closedBook, longContext } from './refs.js';
@@ -10,6 +10,7 @@ import type { SystemUnderTest } from './types.js';
 /** Every system the suite knows, in the order a run takes them (knowledge bases first, references last). */
 export const SYSTEMS: Record<string, () => SystemUnderTest> = {
   'knode-ask': knodeAsk,
+  'knode-ask-hops': knodeAskHops,
   'knode-sag': knodeSag,
   'agent-knode': agentKnode,
   'agent-knode-wiki': agentKnodeWiki,
@@ -38,8 +39,11 @@ export const SYSTEM_TRACKS: Record<string, readonly string[]> = {
   'single-call': ['knode-ask', 'rag-hybrid'],
 };
 
-/** Diagnostics a run takes only when named (docs/design/33 D3): MCP tools with no files, the wiki with no sources. */
-export const DIAGNOSTIC_SYSTEMS = ['agent-knode', 'agent-knode-wiki'] as const;
+/**
+ * Systems a run takes only when named: the diagnostics (docs/design/33 D3) — MCP tools with no files, the wiki
+ * with no sources — and Ask's variant with the hop and aggregate retrieval on, answered beside `knode-ask` on its build.
+ */
+export const DIAGNOSTIC_SYSTEMS = ['agent-knode', 'agent-knode-wiki', 'knode-ask-hops'] as const;
 
 /** System ids with every track name replaced by its systems, in order, each once. */
 export function expandSystems(ids: readonly string[]): string[] {
