@@ -424,16 +424,24 @@ export class ServeQueue implements EvalQueue {
     return { offered: Boolean(body.offered), slots: { 'eval-call': body.slots?.['eval-call'] ?? [], 'eval-session': body.slots?.['eval-session'] ?? [] }, run: body.run ?? { waiting: 0, leased: 0 }, tasks };
   }
 
-  /** A folder packed once: its id by what its files were (`folderStamp`), and when `serve` last confirmed holding it. */
-  private readonly packed = new Map<string, { stamp: string; sha256: string; bytes: number; heldAt: number }>();
+  /** A folder packed once: its id by what its files were (`folderStamp`). */
+  private readonly packed = new Map<string, { stamp: string; sha256: string; bytes: number }>();
+  /**
+   * When `serve` last confirmed holding an archive, by its id and not by its
+   * folder: the knode arms give every question a fresh copy of the same
+   * pages and sources, a new folder each time with the same content.
+   */
+  private readonly heldAt = new Map<string, number>();
   /** The upload under way for a folder: the questions that ask together wait for the one. */
   private readonly uploading = new Map<string, Promise<{ sha256: string; bytes: number }>>();
 
   /**
    * Packed, and uploaded unless `serve` holds it already: a folder every
    * question reads is read once and goes up once. The packing is remembered
-   * while no file of the folder has changed, and so is `serve`'s word that
-   * it holds the archive, for an hour (`ARCHIVE_HELD_MS`): a `serve` built
+   * while no file of the folder has changed, and `serve`'s word that it
+   * holds an archive for an hour (`ARCHIVE_HELD_MS`), by the archive's id,
+   * so a copy of the folder made for the next question (same content,
+   * another path) is hashed and not sent: a `serve` built
    * before 2026-11-22 answers every check with 404 (its check was routed
    * as HEAD, which the router serves by the GET route, and there was
    * none), and asking it for every question sent the whole corpus up each
@@ -456,14 +464,14 @@ export class ServeQueue implements EvalQueue {
     let folder: ReturnType<typeof packFolder> | null = null;
     if (held?.stamp !== stamp) {
       folder = packFolder(dir);
-      held = { stamp, sha256: folder.sha256, bytes: folder.bytes, heldAt: 0 };
+      held = { stamp, sha256: folder.sha256, bytes: folder.bytes };
       this.packed.set(dir, held);
     }
     const at = { sha256: held.sha256, bytes: held.bytes };
-    if (Date.now() - held.heldAt < ARCHIVE_HELD_MS) return at;
+    if (Date.now() - (this.heldAt.get(at.sha256) ?? 0) < ARCHIVE_HELD_MS) return at;
     const head = await fetch(`${this.serveUrl}/eval/v1/archives/${at.sha256}`, { method: 'HEAD', headers: this.headers(false), signal });
     if (head.ok) {
-      held.heldAt = Date.now();
+      this.heldAt.set(at.sha256, Date.now());
       return at;
     }
     if (head.status !== 404) {
@@ -479,7 +487,7 @@ export class ServeQueue implements EvalQueue {
       method: 'PUT', headers: { ...this.headers(false), 'content-type': 'application/gzip' }, body: await folder.gzipped(), signal,
     });
     if (res.ok) {
-      held.heldAt = Date.now();
+      this.heldAt.set(at.sha256, Date.now());
       return at;
     }
     const text = (await res.text()).slice(0, 200);

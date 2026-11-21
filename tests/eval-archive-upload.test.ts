@@ -122,6 +122,21 @@ describe('a run uploads its corpus folder', () => {
     q.close();
   });
 
+  it('once for the copies of one folder a knode arm makes for each question', async () => {
+    const dir = corpus();
+    script.neverHeld = true;
+    const q = new ServeQueue(url, 't');
+    const ids = new Set<string>();
+    for (let i = 0; i < 6; i++) {
+      const copy = path.join(tmp, `copy-${i}`);
+      fs.cpSync(dir, copy, { recursive: true });
+      ids.add((await q.archive(copy, signal())).sha256);
+    }
+    expect(ids.size).toBe(1);
+    expect(seen.map((s) => s.method)).toEqual(['HEAD', 'PUT']);
+    q.close();
+  });
+
   it('packs it again once a file has changed (an update batch)', async () => {
     const dir = corpus();
     const q = new ServeQueue(url, 't');
