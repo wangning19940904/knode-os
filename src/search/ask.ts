@@ -116,7 +116,7 @@ export function claimTag(c: { status: string; kind?: string | null }): string {
 }
 
 /** A fact as the prompt may list it: a claim, an enumerated claim, or a relation walked. */
-type PromptFact = ClaimItem & { chunkId?: string | null; superseded?: boolean; sources?: string[]; date?: string | null };
+type PromptFact = ClaimItem & { chunkId?: string | null; superseded?: boolean; sources?: string[]; date?: string | null; repeats?: { count: number; dates: string[] } };
 
 /** The facts as the prompt lists them: numbered on from the chunks, each with its tag, date and source. */
 function renderFacts(facts: PromptFact[], firstRef: number, heading = 'Known facts'): string {
@@ -125,7 +125,9 @@ function renderFacts(facts: PromptFact[], firstRef: number, heading = 'Known fac
     const period = f.startDate || f.endDate ? ` (${f.startDate ?? '?'} ~ ${f.endDate ?? ''})` : '';
     const when = f.eventDate ? ` (${f.eventDate})` : f.date && !period ? ` (${f.date})` : period;
     const more = f.sources && f.sources.length > 1 ? ` (+${f.sources.length - 1} more source${f.sources.length > 2 ? 's' : ''})` : '';
-    return `[${firstRef + i}] [${claimTag(f)}${f.type === 'set' ? '; set' : ''}${f.superseded ? '; replaced later' : ''}] ${f.statement}${when}${f.path ? ` — ${f.path}${more}` : ''}`;
+    // a folded timeline entry: the same value restated later, said once with how long it was restated
+    const again = f.repeats && f.repeats.count > 1 ? ` (restated ${f.repeats.count - 1}×${f.repeats.dates.length > 1 ? `, last ${f.repeats.dates[f.repeats.dates.length - 1]}` : ''})` : '';
+    return `[${firstRef + i}] [${claimTag(f)}${f.type === 'set' ? '; set' : ''}${f.superseded ? '; replaced later' : ''}] ${f.statement}${when}${again}${f.path ? ` — ${f.path}${more}` : ''}`;
   });
   return `\n\n# ${heading}\n${lines.join('\n')}`;
 }
@@ -292,7 +294,9 @@ async function enumeratedAnswer(env: RouteEnv): Promise<AskResult | null> {
   if (named.length === 0 && types.length === 0) return null;
   const timeline = routed.kind === 'timeline';
   const limit = Math.max(1, router.enumerateLimit);
-  const query = { entities: named, types, range: routed.range, includeSuperseded: timeline, order: 'timeline' as const, limit };
+  // a timeline lists the subject's changes: a value restated in later reports is one fact with its dates, not a
+  // fact per report, so the limit holds the history rather than its first weeks (graph/claim-timeline.ts)
+  const query = { entities: named, types, range: routed.range, includeSuperseded: timeline, order: 'timeline' as const, limit, fold: timeline };
   let enumeration = await enumerateClaims(store, query);
   let usedTypes = types;
   // a type the question seems to name, but no claim of it about these entities: every type

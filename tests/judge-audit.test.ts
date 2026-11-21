@@ -123,4 +123,41 @@ describe('judge audit', () => {
     expect(offStore.allJudgeAudits()).toEqual([]);
     expect(() => judgeAuditFor(2, 'seed', offStore)).toThrow(/between 0 and 1/);
   });
+  it('audits the key points of a key-points grade, every such answer, under a kind of its own', async () => {
+    const dir = path.join(tmp, 'keypoints');
+    const store = new RunStore(dir);
+    const tasks = new Map<string, Task>();
+    const answers: AnswerRecord[] = [];
+    // one global question scored by its key points, and thirty plain judged ones around it
+    tasks.set('p|g1', { id: 'g1', suite: 'usage', type: 'global', scoring: 'keypoints', evidence: [], keypoints: ['a', 'b', 'c', 'd'], question: 'What changed?', answer: 'a; b; c; d' });
+    for (let n = 0; n < 30; n++) tasks.set(`p|j${n}`, { id: `j${n}`, suite: 'usage', type: 'single-hop', scoring: 'judge', evidence: [], question: `Q${n}?`, answer: `A${n}` });
+    for (const t of tasks.values()) answers.push({ key: `a-${t.id}`, pack: 'p', system: 'agent-grep', taskId: t.id, at: new Date().toISOString(), citations: [], retrieved: [], toolCalls: 0, usage: emptyUsage(), ms: 1, text: `answer to ${t.id}`, finalAnswer: 'x' });
+    // the two passes agree on every grade, and name different key points for the global answer
+    const client = twoMindedJudge(
+      () => ({ score: 1, keypoints: [0, 1], abstained: false, hallucinated: false, reason: 'first' }),
+      () => ({ score: 1, keypoints: [0, 2, 3], abstained: false, hallucinated: false, reason: 'second' }),
+    );
+    const judge = new Judge({ client, meter: new Meter(), cacheFile: path.join(dir, 'cache', 'judge.jsonl') }).audit(judgeAuditFor(0.05, 0, store));
+    const scores = await scoreUsage({ answers, tasks, citing: new Set() }, judge);
+    // the score of the global answer is the first pass's key points: 2 of 4
+    expect(scores.find((x) => x.taskId === 'g1' && x.metric === 'correctness')?.value).toBe(0.5);
+    const audits = store.allJudgeAudits();
+    const points = audits.filter((a) => a.kind === 'keypoints');
+    expect(points).toHaveLength(1);
+    expect(points[0].agree).toBe(false);
+    // the grades of the regular sample all agree: the key points' disagreement is not counted against them
+    const grades = audits.filter((a) => a.kind === 'grade');
+    expect(grades.length).toBeGreaterThanOrEqual(20);
+    expect(grades.every((a) => a.agree)).toBe(true);
+  });
+
+  it('matches one list a call unless told to batch them', async () => {
+    const lists = Array.from({ length: 6 }, (_, n) => ({ id: `l${n}`, predicted: [`p${n}`], gold: [`g${n}`] }));
+    const one = twoMindedJudge(() => ({ pairs: [[0, 0]] }), () => ({ pairs: [[0, 0]] }));
+    await new Judge({ client: one, meter: new Meter() }).matchList(lists);
+    expect(one.calls.map((c) => c.length)).toEqual([1, 1, 1, 1, 1, 1]);
+    const batched = twoMindedJudge(() => ({ pairs: [[0, 0]] }), () => ({ pairs: [[0, 0]] }));
+    await new Judge({ client: batched, meter: new Meter(), listBatchSize: 4 }).matchList(lists);
+    expect(batched.calls.map((c) => c.length).sort()).toEqual([2, 4]);
+  });
 });

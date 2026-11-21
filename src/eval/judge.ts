@@ -28,6 +28,12 @@ export interface JudgeOptions {
   quota?: QuotaGuard;
   cacheFile?: string;
   batchSize?: number;
+  /**
+   * Lists a call matches at once (`matchList`, `matchItems`; default 1). One list a call makes a list's verdict
+   * depend on that list alone, at the price of a call per list where `batchSize` lists shared one: raise it when
+   * the judge's calls are what a run is short of.
+   */
+  listBatchSize?: number;
   /** A fixed width: at most this many calls at once (default 2). */
   concurrency?: number;
   /** The width as it is now, read again as calls end and while some wait: the slots online that take the judge's calls. Wins over `concurrency`. */
@@ -148,6 +154,9 @@ export function canonicalListPairs(raw: unknown, predicted: number, gold: number
   return out;
 }
 
+/** Items audited at most for a verdict's second part (`audited`'s `also`). */
+const AUDIT_ALSO_MAX = 40;
+
 /** A long text in an audit record, cut. */
 const cut = (v: unknown): unknown => (typeof v === 'string' ? (v.length > 800 ? `${v.slice(0, 800)}…` : v) : Array.isArray(v) ? v.slice(0, 20).map(cut) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, cut(x)])) : v);
 
@@ -164,11 +173,13 @@ function unparsable(err: unknown): boolean {
 export class Judge {
   private readonly cache = new Map<string, unknown>();
   private readonly batchSize: number;
+  private readonly listBatchSize: number;
   /** One gate for every call of this judge, whichever `batch()` asked for it. */
   private readonly gate: Gate;
 
   constructor(private readonly opts: JudgeOptions) {
     this.batchSize = opts.batchSize ?? 8;
+    this.listBatchSize = Math.max(1, Math.trunc(opts.listBatchSize ?? 1));
     this.gate = new Gate(opts.width ?? (() => opts.concurrency ?? 2), opts.widthCheckMs);
     if (opts.cacheFile && fs.existsSync(opts.cacheFile)) {
       for (const line of fs.readFileSync(opts.cacheFile, 'utf8').split('\n')) {
@@ -204,12 +215,19 @@ export class Judge {
    */
   private async audited<I extends { id: string }, V>(
     kind: string, system: string, items: I[], render: (item: I) => unknown, verdicts: Verdicts<V>, view: (v: V, item: I) => unknown, size = this.batchSize,
+    also?: { kind: string; applies: (item: I) => boolean; view: (v: V, item: I) => unknown; max?: number },
   ): Promise<Verdicts<V>> {
     const a = this.auditing;
     if (!a) return verdicts;
     const judged = items.filter((i) => verdicts.has(i.id));
     const content = (i: I) => JSON.stringify([kind, system, render(i)]);
-    const sample = auditSample(judged, a.share, a.min ?? AUDIT_MIN_ITEMS, a.seed, content);
+    const regular = auditSample(judged, a.share, a.min ?? AUDIT_MIN_ITEMS, a.seed, content);
+    // a second part of the verdict that only some items have (a grade's key points): every such item is asked
+    // again, up to `max`, and its agreement recorded under a kind of its own — the regular sample would hold a
+    // handful of them, and the first kind's agreement stays that of the regular sample
+    const extra = also ? auditSample(judged.filter(also.applies), 1, 0, a.seed, content).slice(0, also.max ?? AUDIT_ALSO_MAX) : [];
+    const inRegular = new Set(regular.map((i) => i.id));
+    const sample = [...regular, ...extra.filter((i) => !inRegular.has(i.id))];
     if (!sample.length) return verdicts;
     const order = [...sample].sort((x, y) => fraction('audit-order', a.seed, content(x)) - fraction('audit-order', a.seed, content(y)));
     const again = await this.batch<I, V>(`${kind}:audit`, system, order.map((i) => ({ ...i, id: `${i.id}~audit` })), render, size);
@@ -218,10 +236,18 @@ export class Judge {
       const second = again.get(`${item.id}~audit`);
       if (second === undefined) continue;
       const first = verdicts.get(item.id)!;
-      a.record({
-        key: crypto.createHash('sha1').update(JSON.stringify(['judge-audit', content(item)])).digest('hex').slice(0, 20),
-        kind, id: item.id, item: cut(render(item)), first, second, agree: JSON.stringify(view(first, item)) === JSON.stringify(view(second, item)), at,
-      });
+      if (inRegular.has(item.id)) {
+        a.record({
+          key: crypto.createHash('sha1').update(JSON.stringify(['judge-audit', content(item)])).digest('hex').slice(0, 20),
+          kind, id: item.id, item: cut(render(item)), first, second, agree: JSON.stringify(view(first, item)) === JSON.stringify(view(second, item)), at,
+        });
+      }
+      if (also?.applies(item)) {
+        a.record({
+          key: crypto.createHash('sha1').update(JSON.stringify(['judge-audit', also.kind, content(item)])).digest('hex').slice(0, 20),
+          kind: also.kind, id: item.id, item: cut(render(item)), first, second, agree: JSON.stringify(also.view(first, item)) === JSON.stringify(also.view(second, item)), at,
+        });
+      }
     }
     return verdicts;
   }
@@ -317,8 +343,10 @@ export class Judge {
       return raw;
     };
     const raw = clamp(await this.batch<GradeItem, GradeVerdict>('grade', GRADE_SYSTEM, items, render));
-    // two grades agree on the score; the second is clamped as the first was
-    await this.audited('grade', GRADE_SYSTEM, items, render, raw, (v) => clampScore(v.score));
+    // two grades agree on the score; the second is clamped as the first was. A key-points answer is scored by the
+    // key points the grade names (score/usage.ts), so those are audited too, as the set of points each pass named
+    const points = (v: GradeVerdict, i: GradeItem) => [...new Set((Array.isArray(v.keypoints) ? v.keypoints.map(Number) : []).filter((k) => Number.isInteger(k) && k >= 0 && k < (i.keypoints?.length ?? 0)))].sort((x, y) => x - y);
+    await this.audited('grade', GRADE_SYSTEM, items, render, raw, (v) => clampScore(v.score), undefined, { kind: 'keypoints', applies: (i) => Boolean(i.keypoints?.length), view: points });
     return raw;
   }
 
@@ -343,7 +371,7 @@ export class Judge {
       gold: i.gold.map((g, n) => `${n}: ${g}`),
     });
     const view = (v: { pairs?: unknown }, i: (typeof items)[number]) => canonicalListPairs(v?.pairs, i.predicted.length, i.gold.length);
-    return this.audited('match', MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('match', MATCH_SYSTEM, items, render, 1), view, 1);
+    return this.audited('match', MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('match', MATCH_SYSTEM, items, render, this.listBatchSize), view, this.listBatchSize);
   }
 
   /**
@@ -358,7 +386,7 @@ export class Judge {
       gold: i.gold.map((g, n) => `${n}: ${g.slice(0, 400)}`),
     });
     const view = (v: { pairs?: unknown }, i: (typeof items)[number]) => canonicalListPairs(v?.pairs, i.predicted.length, i.gold.length);
-    return this.audited('list', LIST_MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('list', LIST_MATCH_SYSTEM, items, render, 1), view, 1);
+    return this.audited('list', LIST_MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('list', LIST_MATCH_SYSTEM, items, render, this.listBatchSize), view, this.listBatchSize);
   }
 
   async linkCorrect(items: { id: string; head: string; relation: string; tail: string; sources: string[] }[]): Promise<Verdicts<{ correct: boolean }>> {

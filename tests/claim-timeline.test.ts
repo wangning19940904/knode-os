@@ -104,7 +104,8 @@ beforeAll(async () => {
   await sync(ctx, { llmGraph: false });
   // a report's short name extracted as an entity of its own, which the full name's aliases list
   // (what the evaluation builds hold for "the pool cap" next to "order DB connection pool cap")
-  await ctx.store.query(`UPDATE entities SET name = '连接池上限' WHERE name = '池上限短名'`);
+  // of the full name's type, as the evaluation builds hold them (27 of 28 twins there share their type)
+  await ctx.store.query(`UPDATE entities SET name = '连接池上限', type = 'other' WHERE name = '池上限短名'`);
 });
 
 afterAll(async () => {
@@ -148,6 +149,30 @@ describe('knode_claims timelines', () => {
   it("reaches a short-name twin that the full name's aliases list", async () => {
     const r = await queryClaims(ctx.store, claimQueryFromArgs({ subject: '订单库连接池上限', order: 'timeline' }));
     expect(r.claims.map((c) => c.statement)).toEqual(['订单库连接池上限改为200个连接', '池上限短名改为240个连接']);
+  });
+
+  it('takes a twin only of the same type and only from an entity the reference names exactly', async () => {
+    // another type: a nickname in a company's aliases that is also the name of a concept is not the company
+    await ctx.store.query(`UPDATE entities SET type = 'concept' WHERE id = '池上限短名'`);
+    try {
+      const r = await queryClaims(ctx.store, claimQueryFromArgs({ subject: '订单库连接池上限', order: 'timeline' }));
+      expect(r.claims.map((c) => c.statement)).toEqual(['订单库连接池上限改为200个连接']);
+    } finally {
+      await ctx.store.query(`UPDATE entities SET type = 'other' WHERE id = '池上限短名'`);
+    }
+    // a loose match (the reference is a substring of the name) is still found, but nothing hops from it
+    const loose = await queryClaims(ctx.store, claimQueryFromArgs({ subject: '订单库连接池', order: 'timeline' }));
+    expect(loose.claims.map((c) => c.statement)).toEqual(['订单库连接池上限改为200个连接']);
+  });
+
+  it('marks the follow-ups of older subjects in a window read without first_mention', async () => {
+    const r = await queryClaims(ctx.store, claimQueryFromArgs({ text: 'INC-', event_range: '2024-03-10..2024-03-31' }));
+    expect(r.claims.map((c) => [c.subject, c.followUp ?? false]).sort()).toEqual([['INC-1', true], ['INC-2', false]]);
+    expect(r.applied.some((a) => a.includes('1 of the 2 subjects listed were first dated before it'))).toBe(true);
+    // nothing older: no mark and no note
+    const all = await queryClaims(ctx.store, claimQueryFromArgs({ text: 'INC-', event_range: '2024-03-01..2024-03-31' }));
+    expect(all.claims.some((c) => c.followUp)).toBe(false);
+    expect(all.applied.some((a) => a.startsWith('window:'))).toBe(false);
   });
 
   it('adds what happened to a team through its members, parts and objects with related', async () => {

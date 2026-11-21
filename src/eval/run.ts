@@ -192,6 +192,8 @@ export interface RunOptions {
    * pass; 0: off). Recorded in the run's `judge-audit.jsonl`.
    */
   judgeAudit?: number;
+  /** Lists the judge matches in one call (default 1: a list's verdict depends on that list alone; more saves judge calls). */
+  judgeListBatch?: number;
   /** Answer each task this many times, for run-to-run variance (default 1: today's keys). */
   repeat?: number;
   /** The systems answered `repeat` times (default: every system that answers). */
@@ -520,6 +522,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     const judge = new Judge({
       client: judgeClient, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl'),
       width: judgeWidth(remote, judgeFamily(opts.judgeProvider ?? 'claude-cli'), judgeEligible, judgeCap(opts, placement)),
+      listBatchSize: opts.judgeListBatch,
     });
     const models = { model: opts.model ?? '', buildEffort: opts.buildEffort ?? 'low', answerEffort: opts.answerEffort ?? 'medium' };
     judge.audit(judgeAuditFor(opts.judgeAudit, seed, store));
@@ -985,7 +988,7 @@ function where(p: Placed | null): { worker?: string; backend?: string } {
  * its records and the packs it names — with no model of its own running, so
  * only while the run itself is stopped.
  */
-export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; judgeAudit?: number; judgeConcurrency?: number; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
+export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; judgeAudit?: number; judgeListBatch?: number; judgeConcurrency?: number; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
   const store = new RunStore(runDir);
   const meta = store.meta();
   if (!meta) throw new Error(`not a run directory: ${runDir}`);
@@ -1027,7 +1030,7 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
       family, model: opts.judgeModel ?? '', effort: agent?.effort ?? null,
       eligible, backend: agent ? `${agent.family}-cli:${agent.model}` : null,
     });
-    const judge = new Judge({ client, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl'), width: judgeWidth(remote, family, eligible, judgeCap(opts, placement)) });
+    const judge = new Judge({ client, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl'), width: judgeWidth(remote, family, eligible, judgeCap(opts, placement)), listBatchSize: opts.judgeListBatch });
     for (const pack of packs) {
       for (const t of pack.tasks) tasks.set(`${pack.manifest.id}|${t.id}`, t);
       const docs = new Set(pack.docs.map((d) => d.path));

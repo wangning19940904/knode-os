@@ -155,6 +155,8 @@ export interface ClaimRecord {
   value: string | null;
   /** In a folded timeline: the same value restated later — how often and on which dates (sources are in `sources`). */
   repeats?: { count: number; dates: string[] };
+  /** With an event range and no first_mention: the subject was first dated before the window — a follow-up, not something new in it. */
+  followUp?: true;
   /** In a folded timeline, a measurement series: each change of value, in date order. */
   readings?: { date: string | null; value: string | null; source: string | null }[];
   /** A newer fact of the same subject and type replaced this one (kept for history, hidden by default). */
@@ -225,28 +227,49 @@ const DATE_KEY = dateKey('cl');
 
 /**
  * The entities a reference names, as a subquery of ids: an id, a name or alias
- * (exact, else as a substring); the entities merged into those; and an entity
- * named by one of their aliases when nothing else goes by that alias — a
- * report's short name for a setting ("the pool cap") extracted as an entity of
- * its own, which the full name's aliases list.
+ * (exact, else as a substring); the entities merged into those; and a
+ * short-name twin — an entity of the same type named by an alias of an entity
+ * the reference names exactly (its id, its name or one of its aliases), when
+ * nothing else goes by that alias: a report's short name for a setting ("the
+ * pool cap") extracted as an entity of its own, which the full name's aliases
+ * list.
+ *
+ * A twin is taken only from an exact match and only within its type: on a
+ * large workspace alias lists are noisy (a company's aliases there hold a
+ * nickname that is also the name of a concept, and a product that merely
+ * mentions the company matches as a substring), and a hop from every loose
+ * match brought a sector's claims into a company's. The matched entities are
+ * read once, and every entity going by one of their aliases once: the first
+ * form of this scanned the entities again for each alias (0.75 s for one
+ * subject on 164k entities).
  */
 function entitySetSql(p: Params, ref: string): string {
   const exact = p.add(ref);
   const like = p.add(`%${ref}%`);
-  const match = `(er.id = ${exact} OR lower(er.name) = lower(${exact}) OR er.aliases::text ILIKE ${like} OR er.name ILIKE ${like})`;
-  const named = `SELECT er.id FROM entities er WHERE ${match}`;
-  const aliases = `jsonb_array_elements_text(CASE WHEN jsonb_typeof(er.aliases) = 'array' THEN er.aliases ELSE '[]'::jsonb END)`;
-  return `${named}
+  const aliasesOf = (a: string) => `CASE WHEN jsonb_typeof(${a}.aliases) = 'array' THEN ${a}.aliases ELSE '[]'::jsonb END`;
+  const precise = `(er.id = ${exact} OR lower(er.name) = lower(${exact}) OR ${aliasesOf('er')} @> to_jsonb(${exact}::text))`;
+  return `WITH n AS MATERIALIZED (
+      SELECT er.id, er.type, er.aliases, ${precise} AS precise
+      FROM entities er
+      WHERE ${precise} OR er.aliases::text ILIKE ${like} OR er.name ILIKE ${like}),
+    al AS MATERIALIZED (
+      SELECT DISTINCT n.id AS owner, n.type, a.alias, lower(a.alias) AS la
+      FROM n CROSS JOIN LATERAL jsonb_array_elements_text(${aliasesOf('n')}) AS a(alias)
+      WHERE n.precise AND length(a.alias) > 1),
+    hit AS MATERIALIZED (
+      SELECT e.id, e.type, e.canonical_id, lower(e.name) AS ln, e.aliases
+      FROM entities e
+      WHERE EXISTS (SELECT 1 FROM al)
+        AND (lower(e.name) IN (SELECT la FROM al) OR (jsonb_typeof(e.aliases) = 'array' AND e.aliases ?| ARRAY(SELECT alias FROM al))))
+    SELECT n.id FROM n
     UNION
-    SELECT em.id FROM entities em WHERE em.canonical_id IN (${named})
+    SELECT em.id FROM entities em WHERE em.canonical_id IN (SELECT n.id FROM n)
     UNION
-    SELECT et.id FROM entities er CROSS JOIN LATERAL ${aliases} AS a(alias)
-    JOIN entities et ON lower(et.name) = lower(a.alias) AND et.id <> er.id AND et.canonical_id IS NULL
-    WHERE ${match} AND length(a.alias) > 1
-      AND NOT EXISTS (
-        SELECT 1 FROM entities eo
-        WHERE eo.id <> er.id AND eo.id <> et.id AND eo.canonical_id IS DISTINCT FROM er.id
-          AND (lower(eo.name) = lower(a.alias) OR eo.aliases @> to_jsonb(a.alias)))`;
+    SELECT et.id FROM al JOIN hit et ON et.ln = al.la AND et.id <> al.owner AND et.canonical_id IS NULL AND et.type = al.type
+    WHERE NOT EXISTS (
+      SELECT 1 FROM hit eo
+      WHERE eo.id <> al.owner AND eo.id <> et.id AND eo.canonical_id IS DISTINCT FROM al.owner
+        AND (eo.ln = al.la OR eo.aliases @> to_jsonb(al.alias)))`;
 }
 
 /** Relations that make their source a part or member of their target. */
@@ -345,6 +368,25 @@ export async function queryClaims(store: Store, q: ClaimQuery = {}): Promise<Cla
   };
   if (timeline && q.includeSuperseded === undefined) result.applied.push('timeline: superseded values included (include_superseded=false hides them)');
   if (entries.length < projected.length) result.applied.push(`timeline: ${projected.length} claims folded into ${entries.length} entries (restated values and series; fold=false lists every claim)`);
+  // a window read without first_mention holds follow-ups of older subjects beside the new ones: mark them, so a
+  // count of what was new in the period does not take a later report of an old incident for a new incident
+  if (q.eventRange?.from && !q.firstMention && !t.txTime && page.length) {
+    const subjects = [...new Set(page.map((e) => e.head.subject_id))];
+    const before = new Params();
+    const older = await store.query<{ subject_id: string }>(
+      `SELECT DISTINCT cl.subject_id FROM claims cl
+       WHERE cl.subject_id = ANY(${before.add(subjects)}::text[]) AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
+         AND ${DATE_KEY} < ${before.add(q.eventRange.from)}::timestamptz`,
+      before.list,
+    );
+    if (older.length) {
+      const old = new Set(older.map((r) => r.subject_id));
+      page.forEach((e, i) => {
+        if (old.has(e.head.subject_id)) result.claims[i].followUp = true;
+      });
+      result.applied.push(`window: ${old.size} of the ${subjects.length} subjects listed were first dated before it (followUp: true) — first_mention=true keeps only the subjects first dated in the window`);
+    }
+  }
   if (truncated) {
     const last = page[page.length - 1]?.head.on ?? null;
     result.note = timeline

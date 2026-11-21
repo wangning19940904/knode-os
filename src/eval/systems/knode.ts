@@ -920,7 +920,12 @@ export const KNODE_FULL_TOOLS = ['knode_search', 'knode_graph_search', 'knode_cl
 
 /** Arm D's sentence of the shared brief: arm C's folder, and knode's retrieval tools beside it. */
 /** Arm C's sentence: the knode wiki and the sources beside it, where its pages' links point. */
-export const KNODE_WIKI_SOURCES_HAS = WIKI_SOURCES_HAS('wiki/, generated pages; sources/ holds one summary per document', 'raw/docs/');
+/**
+ * The index and the summaries by their paths from the current directory: "its index.md" and "sources/" sent 630 of
+ * the 843 arm D sessions read from the 2026-11 campaign to a failing `cat index.md` first (arm C's sentence is the
+ * same, at the same cost).
+ */
+export const KNODE_WIKI_SOURCES_HAS = WIKI_SOURCES_HAS('wiki/, generated pages; wiki/sources/ holds one summary per document', 'raw/docs/', 'wiki/index.md');
 
 export const AGENT_KNODE_FULL_HAS = `${KNODE_WIKI_SOURCES_HAS} You also have knode's retrieval tools (on the MCP server knode) over an index built from the same documents: ${KNODE_FULL_TOOLS.join(', ')}. Their results name documents as raw/docs/<path> and pages as wiki/<page>, the paths of the current directory. A tool call counts against the budget as a command does.`;
 
