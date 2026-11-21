@@ -1,4 +1,4 @@
-import type { Judge } from '../judge.js';
+import { canonicalListPairs, type Judge } from '../judge.js';
 import { termMatches } from '../metrics/stylometry.js';
 import { normalizeAnswer } from '../metrics/text.js';
 import { parseStructured } from '../prompts.js';
@@ -59,21 +59,8 @@ export async function scoreEmergence(input: EmergenceInput, judge: Judge): Promi
     const v = verdicts.get(j.id);
     if (!v) continue;
     const gold = j.t.items!;
-    const pairs = oneToOne((v.pairs ?? []).filter(([p, g]) => Number.isInteger(p) && Number.isInteger(g) && p >= 0 && p < j.predicted.length && g >= 0 && g < gold.length));
+    const pairs = canonicalListPairs(v.pairs, j.predicted.length, gold.length);
     setScores(j.a, j.t, gold, pairs, j.predicted.length, j.items.map((i) => i.confidence), put);
-  }
-  return out;
-}
-
-function oneToOne(pairs: [number, number][]): [number, number][] {
-  const usedP = new Set<number>();
-  const usedG = new Set<number>();
-  const out: [number, number][] = [];
-  for (const [p, g] of pairs) {
-    if (usedP.has(p) || usedG.has(g)) continue;
-    usedP.add(p);
-    usedG.add(g);
-    out.push([p, g]);
   }
   return out;
 }

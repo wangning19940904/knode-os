@@ -130,8 +130,24 @@ export function auditSample<I>(items: I[], share: number, min: number, seed: str
   return ranked.slice(0, Math.min(items.length, Math.max(under, min))).map((r) => r.item);
 }
 
-/** Pairs as a set: the same pairs in any order are the same verdict. */
-const pairSet = (v: { pairs?: unknown }) => JSON.stringify((Array.isArray(v?.pairs) ? v.pairs : []).map((p) => JSON.stringify(p)).sort());
+/**
+ * A list verdict's pairs as the one-to-one matching scoring makes of them (score/lists.ts canonicalPairs, kept
+ * here so the judge does not import the scorer): in range, by predicted then gold index, each entry once.
+ */
+export function canonicalListPairs(raw: unknown, predicted: number, gold: number): [number, number][] {
+  const list = (Array.isArray(raw) ? raw : []).filter((p): p is [number, number] => Array.isArray(p) && Number.isInteger(p[0]) && Number.isInteger(p[1]) && p[0] >= 0 && p[0] < predicted && p[1] >= 0 && p[1] < gold);
+  const usedP = new Set<number>();
+  const usedG = new Set<number>();
+  const out: [number, number][] = [];
+  for (const [p, g] of [...list].sort((x, y) => x[0] - y[0] || x[1] - y[1])) {
+    if (usedP.has(p) || usedG.has(g)) continue;
+    usedP.add(p);
+    usedG.add(g);
+    out.push([p, g]);
+  }
+  return out;
+}
+
 /** A long text in an audit record, cut. */
 const cut = (v: unknown): unknown => (typeof v === 'string' ? (v.length > 800 ? `${v.slice(0, 800)}…` : v) : Array.isArray(v) ? v.slice(0, 20).map(cut) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, cut(x)])) : v);
 
@@ -187,7 +203,7 @@ export class Judge {
    * of its own and under ids of its own, so no request repeats the first.
    */
   private async audited<I extends { id: string }, V>(
-    kind: string, system: string, items: I[], render: (item: I) => unknown, verdicts: Verdicts<V>, view: (v: V) => unknown,
+    kind: string, system: string, items: I[], render: (item: I) => unknown, verdicts: Verdicts<V>, view: (v: V, item: I) => unknown, size = this.batchSize,
   ): Promise<Verdicts<V>> {
     const a = this.auditing;
     if (!a) return verdicts;
@@ -196,7 +212,7 @@ export class Judge {
     const sample = auditSample(judged, a.share, a.min ?? AUDIT_MIN_ITEMS, a.seed, content);
     if (!sample.length) return verdicts;
     const order = [...sample].sort((x, y) => fraction('audit-order', a.seed, content(x)) - fraction('audit-order', a.seed, content(y)));
-    const again = await this.batch<I, V>(`${kind}:audit`, system, order.map((i) => ({ ...i, id: `${i.id}~audit` })), render);
+    const again = await this.batch<I, V>(`${kind}:audit`, system, order.map((i) => ({ ...i, id: `${i.id}~audit` })), render, size);
     const at = new Date().toISOString();
     for (const item of sample) {
       const second = again.get(`${item.id}~audit`);
@@ -204,7 +220,7 @@ export class Judge {
       const first = verdicts.get(item.id)!;
       a.record({
         key: crypto.createHash('sha1').update(JSON.stringify(['judge-audit', content(item)])).digest('hex').slice(0, 20),
-        kind, id: item.id, item: cut(render(item)), first, second, agree: JSON.stringify(view(first)) === JSON.stringify(view(second)), at,
+        kind, id: item.id, item: cut(render(item)), first, second, agree: JSON.stringify(view(first, item)) === JSON.stringify(view(second, item)), at,
       });
     }
     return verdicts;
@@ -220,7 +236,7 @@ export class Judge {
    * block, the model answers {"verdicts":[{"id":…, …}]}. Items already judged
    * come from the cache; an item the model left out comes back undefined.
    */
-  async batch<I extends { id: string }, V>(kind: string, system: string, items: I[], render: (item: I) => unknown): Promise<Verdicts<V>> {
+  async batch<I extends { id: string }, V>(kind: string, system: string, items: I[], render: (item: I) => unknown, size = this.batchSize): Promise<Verdicts<V>> {
     const out: Verdicts<V> = new Map();
     const keyOf = (item: I) => crypto.createHash('sha256').update(JSON.stringify([kind, system, render(item)])).digest('hex');
     const todo: I[] = [];
@@ -230,7 +246,7 @@ export class Judge {
       else todo.push(item);
     }
     const batches: I[][] = [];
-    for (let i = 0; i < todo.length; i += this.batchSize) batches.push(todo.slice(i, i + this.batchSize));
+    for (let i = 0; i < todo.length; i += size) batches.push(todo.slice(i, i + size));
     // a reply that does not parse (cut off at its token budget, prose around it) is asked again in halves, down to
     // one item, which is tried twice and then left unjudged: one bad reply must not stop a pack
     // the first call of this batch that failed: no call of it starts after that, and it is what the batch throws
@@ -320,21 +336,29 @@ export class Judge {
     return this.batch('decompose', DECOMPOSE_SYSTEM, items, (i) => ({ text: i.text.slice(0, 4000) }));
   }
 
+  /** Themes and needs (emergence probes): one list per call and compared as matchings, as `matchList` is. */
   async matchItems(items: { id: string; predicted: string[]; gold: string[] }[]): Promise<Verdicts<{ pairs: [number, number][] }>> {
     const render = (i: (typeof items)[number]) => ({
       predicted: i.predicted.map((p, n) => `${n}: ${p}`),
       gold: i.gold.map((g, n) => `${n}: ${g}`),
     });
-    return this.audited('match', MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('match', MATCH_SYSTEM, items, render), pairSet);
+    const view = (v: { pairs?: unknown }, i: (typeof items)[number]) => canonicalListPairs(v?.pairs, i.predicted.length, i.gold.length);
+    return this.audited('match', MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('match', MATCH_SYSTEM, items, render, 1), view, 1);
   }
 
-  /** Corpus-level lists (aggregate, timeline, contradiction, profile): a stricter match than themes — same name, number and date. */
+  /**
+   * Corpus-level lists (aggregate, timeline, contradiction, profile): a stricter match than themes — same name,
+   * number and date. One list per call: a list's verdict depends on that list alone, not on the answers it
+   * happened to share a batch with, so asking it again asks the same question. The audit compares the
+   * one-to-one matchings the two replies come to (`canonicalListPairs`), not the order they were written in.
+   */
   async matchList(items: { id: string; predicted: string[]; gold: string[] }[]): Promise<Verdicts<{ pairs: [number, number][] }>> {
     const render = (i: (typeof items)[number]) => ({
       predicted: i.predicted.map((p, n) => `${n}: ${p.slice(0, 400)}`),
       gold: i.gold.map((g, n) => `${n}: ${g.slice(0, 400)}`),
     });
-    return this.audited('list', LIST_MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('list', LIST_MATCH_SYSTEM, items, render), pairSet);
+    const view = (v: { pairs?: unknown }, i: (typeof items)[number]) => canonicalListPairs(v?.pairs, i.predicted.length, i.gold.length);
+    return this.audited('list', LIST_MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('list', LIST_MATCH_SYSTEM, items, render, 1), view, 1);
   }
 
   async linkCorrect(items: { id: string; head: string; relation: string; tail: string; sources: string[] }[]): Promise<Verdicts<{ correct: boolean }>> {
