@@ -13,7 +13,8 @@ import { listRecipes, recipe } from './packs/index.js';
 import { measurePack, writeMeasure } from './packs/measure.js';
 import { extendPack } from './packs/extend.js';
 import './packs/recipes.js';
-import { buildScaleData, renderScale, writeReport } from './report.js';
+import { buildScaleData, headroomEvidence, renderScale, writeReport } from './report.js';
+import { headroomAllocation, type AgentAllocation } from './allocation.js';
 import { parseLocal, runEval, scoreRun } from './run.js';
 import { Meter, sumEvents } from './meter.js';
 import { RunStore } from './runstore.js';
@@ -108,6 +109,56 @@ function judgeAuditOption(opts: { judgeAudit?: string }): number | undefined {
   if (opts.judgeAudit === undefined) return undefined;
   const n = Number(opts.judgeAudit);
   if (!Number.isFinite(n) || n < 0 || n > 1) throw new Error('--judge-audit: a share between 0 and 1, e.g. 0.05 (0 turns the audit off)');
+  return n;
+}
+
+/** `--agent-weights` / `--agent-counts`: `type=n` pairs, `*` for every type not named. */
+function typeNumbers(flag: string, spec: string, whole: boolean): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const part of csv(spec) ?? []) {
+    const m = /^([^=\s]+)\s*=\s*(\S+)$/.exec(part);
+    if (!m) throw new Error(`${flag}: "${part}" is not type=number (e.g. aggregate=4,timeline=3,*=1)`);
+    const [, type, raw] = m;
+    if (type !== '*' && !(TASK_TYPES as readonly string[]).includes(type)) throw new Error(`${flag}: unknown task type ${type} (known: ${TASK_TYPES.join(', ')}, or * for the rest)`);
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0 || (whole && !Number.isInteger(n))) throw new Error(`${flag}: ${type}=${raw} is not ${whole ? 'a whole number' : 'a number'}, 0 or more`);
+    out[type] = n;
+  }
+  if (!Object.keys(out).length) throw new Error(`${flag}: name at least one type=number`);
+  return out;
+}
+
+/**
+ * The agent sample's allocation over task types: `--agent-weights`,
+ * `--agent-counts` or `--agent-headroom-from` (one of them), with
+ * `--agent-floor`. None: round-robin, as before (or, on a resume, what the
+ * run recorded).
+ */
+export function agentAllocationOption(opts: { agentWeights?: string; agentCounts?: string; agentHeadroomFrom?: string; agentFloor?: string }): AgentAllocation | undefined {
+  const given = [opts.agentWeights && '--agent-weights', opts.agentCounts && '--agent-counts', opts.agentHeadroomFrom && '--agent-headroom-from'].filter(Boolean);
+  if (given.length > 1) throw new Error(`${given.join(' and ')}: give one allocation`);
+  let floor: number | undefined;
+  if (opts.agentFloor !== undefined) {
+    floor = Number(opts.agentFloor);
+    if (!Number.isInteger(floor) || floor < 0) throw new Error('--agent-floor: a whole number of questions, 0 or more');
+    if (!opts.agentWeights && !opts.agentHeadroomFrom) throw new Error('--agent-floor: with --agent-weights or --agent-headroom-from');
+  }
+  if (opts.agentWeights) return { mode: 'weights', weights: typeNumbers('--agent-weights', opts.agentWeights, false), ...(floor !== undefined ? { floor } : {}) };
+  if (opts.agentCounts) return { mode: 'counts', counts: typeNumbers('--agent-counts', opts.agentCounts, true) };
+  if (opts.agentHeadroomFrom) {
+    const from = csv(opts.agentHeadroomFrom)!.map((p) => path.resolve(p));
+    const evidence = headroomEvidence(from);
+    if (!Object.keys(evidence).length) throw new Error(`--agent-headroom-from: no questions scored for two or more agent arms in ${from.join(', ')}`);
+    return headroomAllocation(evidence, { floor, from });
+  }
+  return undefined;
+}
+
+/** `--agent-update-limit`: update tasks a pack for agents (none given: all of them). */
+function agentUpdateLimitOption(opts: { agentUpdateLimit?: string }): number | undefined {
+  if (opts.agentUpdateLimit === undefined) return undefined;
+  const n = Number(opts.agentUpdateLimit);
+  if (!Number.isInteger(n) || n < 0) throw new Error('--agent-update-limit: a whole number of tasks, 0 or more');
   return n;
 }
 
@@ -281,6 +332,11 @@ export function registerEvalCommands(program: Command): void {
     .option('--limit <n>', 'tasks per pack (stratified by type)')
     .option('--types <list>', `only these task types, comma-separated (e.g. aggregate,timeline,contradiction,profile,deep-hop,update)`)
     .option('--agent-limit <n>', 'tasks per pack for agent systems', '30')
+    .option('--agent-weights <type=w,…>', 'spread the agent tasks over task types by these weights instead of evenly, e.g. aggregate=4,timeline=3,*=1 (* = the types not named, default 1; 0 leaves a type out)')
+    .option('--agent-counts <type=n,…>', 'exactly this many agent tasks of each type (at most what the pack has), e.g. aggregate=12,timeline=12,*=1 (* = the types not named, default 0); --agent-limit does not apply')
+    .option('--agent-headroom-from <records>', "derive the agent weights per pack from earlier records: run directories, report.json, scores.jsonl or a campaign.json, comma-separated — each type weighted by how far apart the agent arms' scores came on its questions (mean highest − lowest), ceiling families kept to the floor")
+    .option('--agent-floor <n>', 'with --agent-weights or --agent-headroom-from: agent tasks every type gets before the weights share the rest (default 0 with weights, 1 with headroom)')
+    .option('--agent-update-limit <n>', 'at most n update tasks per pack for agent systems, seeded (default: all of them)')
     .option('--fraction <f>', 'share of the corpus to use; above 1, that many times its size with the pack\'s padding (scale curves)', '1')
     .option('--seed <seed>', 'sampling seed', '0')
     .option('--local <slots>', "slots in this run's process that take its work like a worker, e.g. codex:6,claude:1 (Codex: model calls and agent sessions; claude: the judge). Without --local and without a worker nothing runs: the run waits")
@@ -356,6 +412,8 @@ export function registerEvalCommands(program: Command): void {
           return types as TaskType[] | undefined;
         })(),
         agentLimit: Number(opts.agentLimit),
+        agentAllocation: agentAllocationOption(opts),
+        agentUpdateLimit: agentUpdateLimitOption(opts),
         fraction: Number(opts.fraction),
         seed: opts.seed,
         packConcurrency: Number(opts.packConcurrency),

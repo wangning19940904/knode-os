@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { JudgeAuditRecord } from './judge.js';
+import type { AgentSample } from './allocation.js';
 import { AnswerRecord, BuildRecord, ScoreRecord } from './types.js';
 
 /**
@@ -87,6 +88,8 @@ export interface RunMeta {
   evalRoot?: string;
   /** What knode-ask was asked beyond its defaults (KNODE_EVAL_ASK_COMPUTED / KNODE_EVAL_ASK_NOW, docs/design/34): `{}` when neither was set. Absent: no knode-ask in the run. */
   askOptions?: { computed?: boolean; now?: string };
+  /** The agent sample (`--agent-limit` and its allocation over task types): what it was, and what each pack took. Absent: a run from before, round-robin. */
+  agentSample?: AgentSample;
 }
 
 export class RunStore {
