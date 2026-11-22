@@ -14,7 +14,9 @@ import { DepDecl } from './types.js';
  * citation rows of src/graph/citations.ts read. Here every `raw/docs/…` and
  * `raw/codebase/…` path the page's text names, in the body or the
  * frontmatter, with or without a `#L…` range, becomes one `deps` row of the
- * page on the cited document: `required: false` (a removed file never archives
+ * page on the cited document, under artifact kind `cites` (src/lineage/types.ts,
+ * so `propagate` never acts on it and the comparison reads these rows alone):
+ * `required: false` (a removed file never archives
  * a page an agent wrote) and the document's content hash, which is what a
  * later change is detected against (src/research/cited-refresh.ts).
  *
@@ -170,4 +172,32 @@ export async function planCitationDeps(q: Queryable, dataDir: string, text: stri
     if (commit) plan.commits[repo] = commit;
   }
   return plan;
+}
+
+/**
+ * A page re-applied with the same text (`sync --reapply`, a new embedding
+ * model, a version bump of these rules or of the citation rows) has been
+ * checked against nothing new, so it keeps its baseline. For each file it
+ * still cites, the hash recorded before stays, and so do the commits it was
+ * applied against. `since` is when the page's text last changed, which is
+ * what the audit counts repository updates from: the previous scope's own
+ * `citedSince`, else that scope's `applied_at`. Only a page whose text
+ * changed takes a new baseline (the caller does not call this then).
+ */
+export function carryCitationBaseline(
+  plan: CitationDepsPlan,
+  prev: { input_kind: string; input_id: string; input_sha: string | null }[],
+  live: { meta: Record<string, unknown>; applied_at: string | Date },
+): CitationDepsPlan & { since: string } {
+  const before = new Map(prev.filter((d) => d.input_kind === 'document' && d.input_sha).map((d) => [d.input_id, d.input_sha!]));
+  const recorded = live.meta.citedCommits && typeof live.meta.citedCommits === 'object' ? (live.meta.citedCommits as Record<string, string>) : {};
+  const commits: Record<string, string> = {};
+  for (const repo of Object.keys(plan.commits)) commits[repo] = recorded[repo] ?? plan.commits[repo];
+  const since = typeof live.meta.citedSince === 'string' ? live.meta.citedSince : new Date(live.applied_at).toISOString();
+  return {
+    ...plan,
+    deps: plan.deps.map((d) => ({ ...d, sha: before.get(d.id) ?? d.sha })),
+    commits,
+    since,
+  };
 }

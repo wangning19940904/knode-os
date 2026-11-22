@@ -15,7 +15,8 @@ import { applyTier1Scope, enqueueTier1, segmentRangesOf } from '../graph/tier1.j
 import { PageContext } from '../graph/store.js';
 import { applyWirePlan, extractWikilinks, planWireFromMarkdown, WikiIndex } from '../graph/wire.js';
 import { isReservedWikiFile } from '../lineage/declared.js';
-import { CITE_DEPS_VERSION, CitationDepsPlan, planCitationDeps } from '../lineage/page-deps.js';
+import { carryCitationBaseline, CITE_DEPS_VERSION, CitationDepsPlan, planCitationDeps } from '../lineage/page-deps.js';
+import { readDeps } from '../lineage/deps.js';
 import { applyScope, findLiveScope } from '../lineage/scope.js';
 import { ParsedMarkdown, parseFrontmatter, titleFromMarkdown } from '../markdown.js';
 import { isGeneratedConcept } from '../okf/index.js';
@@ -266,9 +267,14 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     wirePlan.citations = dedupeCitations([...wirePlan.citations, ...typed]);
   }
   // a wiki page no generator owns depends on the files it cites (docs/design/37 §5); a view's inputs are its generator's
-  const citeDeps: CitationDepsPlan | null = root === 'wiki' && isSource && !isReservedWikiFile(file)
+  let citeDeps: (CitationDepsPlan & { since?: string }) | null = root === 'wiki' && isSource && !isReservedWikiFile(file)
     ? await planCitationDeps(store, store.dataDir, raw)
     : null;
+  // the same text re-applied (--reapply, a new embedding model, a version bump) keeps the baseline it was checked
+  // against: otherwise a page whose cited files changed in the meantime would look clean afterwards
+  if (citeDeps && live && live.sha === sha) {
+    citeDeps = carryCitationBaseline(citeDeps, await readDeps(store, { kind: 'cites', id: file }), live);
+  }
   const declared = root === 'docs' && isSource ? frontmatterExtraction(fm) : null;
   // tier-0 links what the graph already knows and mines the rest; both are
   // planned here (two reads) so the scope body only writes
@@ -327,6 +333,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
         documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title, dateRules: DOC_DATE_RULES,
         ...(root === 'wiki' ? { citations: CITATIONS_VERSION, citeDeps: CITE_DEPS_VERSION } : {}),
         ...(citeDeps && Object.keys(citeDeps.commits).length ? { citedCommits: citeDeps.commits } : {}),
+        ...(citeDeps?.since ? { citedSince: citeDeps.since } : {}),
         ...(mindMapPlan ? { mindmap: MINDMAP_PLAN_VERSION } : {}),
       },
     },
@@ -341,7 +348,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
       );
       // the page's own deps row set: replacing the scope restores the previous set first, so a page that stops
       // citing a file stops depending on it
-      if (citeDeps?.deps.length) await w.deps({ kind: 'page', id: file }, citeDeps.deps);
+      if (citeDeps?.deps.length) await w.deps({ kind: 'cites', id: file }, citeDeps.deps);
       if (wirePlan) {
         const s = await applyWirePlan(w, page, wirePlan, { extractor: 'tier0.wikilink' });
         g = { entities: g.entities + s.entities, relations: g.relations + s.relations };

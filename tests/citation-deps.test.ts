@@ -29,6 +29,7 @@ let ctx: AppContext;
 const C1 = '4f1c2ab9d0e1f00000000000000000000000000a';
 const C2 = '9d0e7719aa11f00000000000000000000000000b';
 const C3 = 'c3c3c3c3c3c3f00000000000000000000000000c';
+const C4 = 'd4d4d4d4d4d4f00000000000000000000000000d';
 
 const PAGE = 'wiki/code/acme-tool/resuming-a-session.md';
 const OTHER = 'wiki/research/acme-overview.md';
@@ -118,7 +119,7 @@ describe('citations become dependencies', () => {
   });
 
   it('writes one required:false deps row per cited document with its content hash, and records the commit', async () => {
-    const deps = await readDeps(ctx.store, { kind: 'page', id: PAGE });
+    const deps = await readDeps(ctx.store, { kind: 'cites', id: PAGE });
     expect(deps.map((d) => d.input_id)).toEqual([DESIGN, A, B, C].sort());
     expect(deps.every((d) => d.input_kind === 'document' && d.required === false)).toBe(true);
     const docs = new Map((await ctx.store.query<{ path: string; sha256: string }>(`SELECT path, sha256 FROM documents`)).map((r) => [r.path, r.sha256]));
@@ -130,7 +131,7 @@ describe('citations become dependencies', () => {
     const scope = await findLiveScope(ctx.store, 'doc', PAGE);
     expect(scope!.meta.citedCommits).toEqual({ 'acme-tool': C1 });
     // a person's page depends on what it cites too; a page no generator owns has no pages row
-    expect((await readDeps(ctx.store, { kind: 'page', id: HUMAN })).map((d) => d.input_id)).toEqual([A]);
+    expect((await readDeps(ctx.store, { kind: 'cites', id: HUMAN })).map((d) => d.input_id)).toEqual([A]);
     expect(await ctx.store.query(`SELECT path FROM pages WHERE path = ANY($1::text[])`, [[PAGE, OTHER, HUMAN]])).toEqual([]);
   });
 
@@ -138,11 +139,11 @@ describe('citations become dependencies', () => {
     await ctx.store.query(`DELETE FROM deps WHERE artifact_id = $1`, [OTHER]);
     await ctx.store.query(`UPDATE scopes SET meta = meta - 'citeDeps' WHERE kind = 'doc' AND key = $1 AND status = 'active'`, [OTHER]);
     await sync(ctx, { llmGraph: false });
-    expect((await readDeps(ctx.store, { kind: 'page', id: OTHER })).map((d) => d.input_id)).toEqual([D]);
+    expect((await readDeps(ctx.store, { kind: 'cites', id: OTHER })).map((d) => d.input_id)).toEqual([D]);
   });
 
   it('a rebuild produces the same rows, although wiki pages are applied before the repositories', async () => {
-    const all = async () => ctx.store.query(`SELECT artifact_kind, artifact_id, input_kind, input_id, required, input_sha FROM deps WHERE artifact_kind = 'page' ORDER BY artifact_id, input_id`);
+    const all = async () => ctx.store.query(`SELECT artifact_kind, artifact_id, input_kind, input_id, required, input_sha FROM deps WHERE artifact_kind = 'cites' ORDER BY artifact_id, input_id`);
     const before = await all();
     expect(before.length).toBe(6);
     await rebuild(ctx, {});
@@ -252,7 +253,7 @@ describe('a changed cited file files a refresh suggestion', () => {
   it('a refreshed page depends on the files as they are now, and its pending suggestion goes stale', async () => {
     write(PAGE, agentPage(C2, '\nThe loader no longer reads c.\n').replace(`; ${C})`, ')'));
     await sync(ctx, { only: [PAGE], llmGraph: false });
-    expect((await readDeps(ctx.store, { kind: 'page', id: PAGE })).map((d) => d.input_id)).toEqual([DESIGN, A, B].sort());
+    expect((await readDeps(ctx.store, { kind: 'cites', id: PAGE })).map((d) => d.input_id)).toEqual([DESIGN, A, B].sort());
     expect(await citationChanges(ctx.store, dataDir, { pages: [PAGE] })).toEqual([]);
     expect((await suggestionsFor(PAGE)).map((x) => x.status)).toEqual(['stale']);
   });
@@ -263,12 +264,12 @@ describe('the audit', () => {
     ctx.config.research.auditAfterUpdates = 0;
     write(CARD, card(C3));
     await sync(ctx, { only: [CARD], llmGraph: false });
-    write(CARD, card(C1));
+    write(CARD, card(C4));
     await sync(ctx, { only: [CARD], llmGraph: false });
     expect(await suggestionsFor(OTHER)).toEqual([]);
 
     ctx.config.research.auditAfterUpdates = 3;
-    // OTHER was applied before three card versions (C2, C3, C1); PAGE was rewritten after C2, so it has seen two
+    // OTHER was written before three new card versions (C2, C3, C4); PAGE was rewritten after C2, so it has seen two
     await fileCitationRefreshes(ctx, { prefixes: [CARD] });
     const [s, ...more] = await suggestionsFor(OTHER);
     expect(more).toEqual([]);
@@ -285,5 +286,78 @@ describe('the audit', () => {
     expect(brief).toContain('**审计**');
     expect(brief).toContain('从头搜索并列出所有入口');
     ctx.config.research.auditAfterUpdates = 30;
+  });
+});
+
+describe('a re-apply of the same text keeps the baseline', () => {
+  const dir2 = path.join(tmp, 'ws2');
+  let c2: AppContext;
+  const P = 'wiki/research/keeps-baseline.md';
+  const F = 'raw/codebase/acme-tool/src/f.ts';
+  const G = 'raw/codebase/acme-tool/src/g.ts';
+  const w = (rel: string, content: string) => {
+    fs.mkdirSync(path.dirname(path.join(dir2, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir2, rel), content);
+  };
+  const pending = async () => (await c2.store.query<{ status: string; payload: Record<string, any> }>(
+    `SELECT status, payload FROM suggestions WHERE kind = 'wiki' AND payload->>'target' = $1`, [P])).map((r) => [r.status, r.payload.citations.changed]);
+
+  beforeAll(async () => {
+    w(F, 'export const f = 1;\n');
+    w(G, 'export const g = 1;\n');
+    w(CARD, card(C1));
+    w(P, `---\ntitle: Keeps its baseline\nactor: agent/claude-cli\nresearch: { job: r_k, at: "2026-11-20T00:00:00Z" }\n---\n# Keeps\n\nf（来源：${F}#L1）and g（来源：${G}）.\n`);
+    c2 = await createContext(dir2);
+    await sync(c2, { llmGraph: false });
+  });
+  afterAll(async () => {
+    await c2?.datasources.closeAll();
+    await c2?.store.close();
+  });
+
+  it('sync --reapply leaves a changed cited file changed, its suggestion pending, and embeds nothing again', async () => {
+    const shaBefore = (await readDeps(c2.store, { kind: 'cites', id: P })).find((d) => d.input_id === F)!.input_sha;
+    const since = (await findLiveScope(c2.store, 'doc', P))!.applied_at;
+    w(F, 'export const f = 2;\n');
+    await sync(c2, { only: [F], llmGraph: false });
+    expect(await pending()).toEqual([['pending', [F]]]);
+    const vectors = async () => (await c2.store.query<{ n: number }>(`SELECT count(*)::int AS n FROM embeddings`))[0].n;
+    const before = await vectors();
+
+    await sync(c2, { reapply: true, llmGraph: false });
+    const scope = (await findLiveScope(c2.store, 'doc', P))!;
+    expect(scope.applied_at).not.toBe(since);
+    expect(new Date(scope.meta.citedSince as string).toISOString()).toBe(new Date(since).toISOString());
+    expect(scope.meta.citedCommits).toEqual({ 'acme-tool': C1 });
+    expect((await readDeps(c2.store, { kind: 'cites', id: P })).find((d) => d.input_id === F)!.input_sha).toBe(shaBefore);
+    expect(await pending()).toEqual([['pending', [F]]]);
+    expect(await vectors()).toBe(before);
+  });
+
+  it('a version bump re-applies the page with a cited file changed in between, and the change is still found', async () => {
+    // as after a deploy that bumps CITE_DEPS_VERSION: the page is read again in the same sync that indexes g's new text
+    await c2.store.query(`UPDATE scopes SET meta = meta || '{"citeDeps": 0}'::jsonb WHERE kind = 'doc' AND key = $1 AND status = 'active'`, [P]);
+    w(G, 'export const g = 2;\n');
+    w(CARD, card(C2));
+    await sync(c2, { llmGraph: false });
+    expect((await findLiveScope(c2.store, 'doc', P))!.meta.citeDeps).toBe(1);
+    const [s] = await c2.store.query<{ payload: Record<string, any> }>(`SELECT payload FROM suggestions WHERE payload->>'target' = $1`, [P]);
+    expect(s.payload.citations.changed).toEqual([F, G]);
+    expect(s.payload.reasons).toEqual(['acme-tool：引用的 2 个文件中 2 个在 4f1c2ab 与 9d0e771 之间改变']);
+  });
+
+  it('the audit counts from when the text last changed, not from the last re-apply', async () => {
+    w(CARD, card(C3));
+    await sync(c2, { only: [CARD], llmGraph: false });
+    await sync(c2, { reapply: true, only: [P], llmGraph: false });
+    c2.config.research.auditAfterUpdates = 2;
+    const [change] = await citationChanges(c2.store, dir2, { pages: [P], auditAfter: 2 });
+    expect(change.audit).toEqual({ repository: 'acme-tool', updates: 2 });
+    // a new text is a new baseline: nothing changed against it, and no update has passed since
+    w(P, fs.readFileSync(path.join(dir2, P), 'utf8') + '\nRe-checked.\n');
+    await sync(c2, { only: [P], llmGraph: false });
+    expect(await citationChanges(c2.store, dir2, { pages: [P], auditAfter: 2 })).toEqual([]);
+    expect((await findLiveScope(c2.store, 'doc', P))!.meta.citedSince).toBeUndefined();
+    c2.config.research.auditAfterUpdates = 30;
   });
 });

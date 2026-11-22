@@ -27,7 +27,7 @@ import { Store } from '../store/db.js';
  * count right: a repository update re-indexes each changed file in its own
  * transaction, and only once the sync is over is "3 of 14 changed" known.
  *
- * The audit: a page that cites a repository and has not been rewritten for
+ * The audit: a page that cites a repository and whose text has not changed for
  * `research.auditAfterUpdates` new versions of that repository's card gets a
  * suggestion even if none of its own files changed, and its brief asks for
  * the entry points to be listed again from scratch.
@@ -71,18 +71,28 @@ interface DepState {
   status: string | null;
 }
 
-/** SQL for `matchesPrefixes` over `col`, the prefixes bound at `ph`. */
-function underPrefixes(col: string, ph: string): string {
-  return `(${col} = ANY(${ph}::text[]) OR EXISTS (SELECT 1 FROM unnest(${ph}::text[]) AS u(prefix) WHERE starts_with(${col}, u.prefix || '/')))`;
+/** SQL for `matchesPrefixes` over `col`: one `starts_with` per prefix (a scoped sync names a few), each bound in `params`. */
+function underPrefixes(col: string, prefixes: string[], params: unknown[]): string {
+  params.push(prefixes);
+  const exact = `${col} = ANY($${params.length}::text[])`;
+  const below = prefixes.map((p) => {
+    params.push(`${p}/`);
+    return `starts_with(${col}, $${params.length})`;
+  });
+  return `(${[exact, ...below].join(' OR ')})`;
 }
 
-/** A page's citation deps, joined to the documents they name. Only pages no generator owns (no live `pages` row). */
+/**
+ * A page's citation deps, joined to the documents they name. `artifact_kind = 'cites'` is the leading primary-key
+ * column, so this reads only citation rows, never the generated pages' inputs (an index range scan, then one
+ * `documents_path_idx` probe per row). Whether a page has become a view since is checked afterwards, for the few
+ * pages that differ, not with an anti-join over every `pages` row.
+ */
 const DEP_STATE_SQL = `
   SELECT dp.artifact_id AS page, dp.input_id AS path, dp.input_sha, d.sha256, d.status
   FROM deps dp
   LEFT JOIN documents d ON d.path = dp.input_id
-  WHERE dp.artifact_kind = 'page' AND dp.input_kind = 'document'
-    AND NOT EXISTS (SELECT 1 FROM pages p WHERE p.path = dp.artifact_id AND p.tx_to IS NULL)`;
+  WHERE dp.artifact_kind = 'cites' AND dp.input_kind = 'document'`;
 
 const DIFFERS = `(d.path IS NULL OR d.status = 'disposed' OR d.sha256 IS DISTINCT FROM dp.input_sha)`;
 
@@ -104,8 +114,7 @@ export async function citationChanges(store: Store, dataDir: string, opts: Citat
     conds.push(`dp.artifact_id = ANY($${params.length}::text[])`);
   }
   if (opts.prefixes) {
-    params.push(opts.prefixes);
-    conds.push(`(${underPrefixes('dp.input_id', `$${params.length}`)} OR ${underPrefixes('dp.artifact_id', `$${params.length}`)})`);
+    conds.push(`(${underPrefixes('dp.input_id', opts.prefixes, params)} OR ${underPrefixes('dp.artifact_id', opts.prefixes, params)})`);
   }
   const where = conds.length ? ` AND ${conds.join(' AND ')}` : '';
   const touched = new Set(
@@ -128,14 +137,19 @@ export async function citationChanges(store: Store, dataDir: string, opts: Citat
       `WITH cited AS (
          SELECT DISTINCT dp.artifact_id AS page, split_part(substr(dp.input_id, 14), '/', 1) AS repo
          FROM deps dp
-         WHERE dp.artifact_kind = 'page' AND dp.input_kind = 'document' AND starts_with(dp.input_id, 'raw/codebase/')${pageCond}
-           AND NOT EXISTS (SELECT 1 FROM pages p WHERE p.path = dp.artifact_id AND p.tx_to IS NULL)
+         WHERE dp.artifact_kind = 'cites' AND dp.input_kind = 'document' AND starts_with(dp.input_id, 'raw/codebase/')${pageCond}
        )
-       SELECT c.page, c.repo, count(DISTINCT cs.sha)::int AS updates
-       FROM cited c
-       JOIN scopes ps ON ps.kind = 'doc' AND ps.key = c.page AND ps.status = 'active' AND ps.parent_id IS NULL
-       JOIN scopes cs ON cs.kind = 'doc' AND cs.parent_id IS NULL AND cs.key = '${CODEBASE_CARDS}/' || c.repo || '.md' AND cs.applied_at > ps.applied_at
-       GROUP BY c.page, c.repo
+       , since AS (
+         SELECT c.page, c.repo, COALESCE((ps.meta->>'citedSince')::timestamptz, ps.applied_at) AS at
+         FROM cited c
+         JOIN scopes ps ON ps.kind = 'doc' AND ps.key = c.page AND ps.status = 'active' AND ps.parent_id IS NULL
+       )
+       -- a card version counts once, and only when it is new: a re-apply of a version the card already had then is no update
+       SELECT s.page, s.repo, count(DISTINCT cs.sha)::int AS updates
+       FROM since s
+       JOIN scopes cs ON cs.kind = 'doc' AND cs.parent_id IS NULL AND cs.key = '${CODEBASE_CARDS}/' || s.repo || '.md' AND cs.applied_at > s.at
+       WHERE NOT EXISTS (SELECT 1 FROM scopes old WHERE old.kind = 'doc' AND old.parent_id IS NULL AND old.key = cs.key AND old.sha = cs.sha AND old.applied_at <= s.at)
+       GROUP BY s.page, s.repo
        HAVING count(DISTINCT cs.sha) >= $1`,
       ap,
     );
@@ -146,12 +160,17 @@ export async function citationChanges(store: Store, dataDir: string, opts: Citat
     }
   }
   if (touched.size === 0) return [];
+  // a page that has become a view (a live pages row) belongs to its generator now
+  for (const r of await store.query<{ path: string }>(`SELECT path FROM pages WHERE path = ANY($1::text[]) AND tx_to IS NULL`, [[...touched]])) {
+    touched.delete(r.path);
+  }
+  if (touched.size === 0) return [];
 
   const pages = [...touched].sort();
   const states = await store.query<DepState>(`${DEP_STATE_SQL} AND dp.artifact_id = ANY($1::text[]) ORDER BY dp.artifact_id, dp.input_id`, [pages]);
   const scopes = new Map(
-    (await store.query<{ key: string; id: string; meta: Record<string, unknown> }>(
-      `SELECT key, id, meta FROM scopes WHERE kind = 'doc' AND key = ANY($1::text[]) AND status = 'active' AND parent_id IS NULL`,
+    (await store.query<{ key: string; id: string; meta: Record<string, unknown>; applied_at: string | Date }>(
+      `SELECT key, id, meta, applied_at FROM scopes WHERE kind = 'doc' AND key = ANY($1::text[]) AND status = 'active' AND parent_id IS NULL`,
       [pages],
     )).map((r) => [r.key, r]),
   );
@@ -203,10 +222,16 @@ export async function citationChanges(store: Store, dataDir: string, opts: Citat
       removed,
       repositories,
       audit,
-      fingerprint: sha16({ changed: changed.map((p) => [p, current.get(p)]), removed, audit: audit ? scope?.id ?? page : null }),
+      fingerprint: sha16({ changed: changed.map((p) => [p, current.get(p)]), removed, audit: audit ? textSince(scope) ?? page : null }),
     });
   }
   return out;
+}
+
+/** When the page's text last changed: a re-apply of the same text keeps it (src/lineage/page-deps.ts carryCitationBaseline). */
+function textSince(scope: { meta: Record<string, unknown>; applied_at: string | Date } | undefined): string | null {
+  if (!scope) return null;
+  return typeof scope.meta.citedSince === 'string' ? scope.meta.citedSince : new Date(scope.applied_at).toISOString();
 }
 
 function fileExists(dataDir: string, rel: string): boolean {
