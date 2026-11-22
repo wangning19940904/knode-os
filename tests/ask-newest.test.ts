@@ -149,16 +149,26 @@ afterAll(async () => {
 });
 
 describe('asksLatest', () => {
-  it('reads a question asking for the latest or current state', () => {
+  it('reads a question asking for the newest source or what it says', () => {
     for (const q of [
       "By Oslo Platform's latest weekly report, how many risks are still open?",
       'Which is the newest incident Oslo Platform has reported? Give its ID.',
+      "What service availability does Oslo Platform's most recent weekly report give?",
+      '按杭州平台组最新一周的周报，还有几个风险没有关闭？',
+      '杭州支付组最新报告的那起事故是哪一起？给出编号。',
+      '杭州平台组最近一次报告的事故是哪一起？',
+    ]) expect(asksLatest(q), q).toBe(true);
+  });
+
+  it('not a current value: it is in the source that last changed it, not in the newest (2026-11-22 model check)', () => {
+    for (const q of [
       "What is Oslo Growth's daily push cap now?",
       'Who currently leads the team?',
-      '按杭州平台组最新一周的周报，还有几个风险没有关闭？',
+      '杭州增长组的每日推送上限现在是多少？',
       '杭州支付组的单笔退款审批上限现在是多少？',
       '目前谁负责R-118？',
-    ]) expect(asksLatest(q), q).toBe(true);
+      '杭州平台组当前在岗多少人？',
+    ]) expect(asksLatest(q), q).toBe(false);
   });
 
   it('not a balance-sheet "current", a period, or a known date', () => {
@@ -246,6 +256,11 @@ describe('ask on a question asking for the latest state', () => {
     const past = capture();
     const b = await ask(store, defaultConfig(), embedder, past.llm, 'How many risks did Oslo Platform list in week 12 of 2026?', { mode: 'keyword', track: false });
     expect(b.route.newest).toBeUndefined();
+    // a current value: the team's newest reports, not naming the cap, led its prompt and it was answered from an older one
+    const now = capture();
+    const c = await ask(store, defaultConfig(), embedder, now.llm, "What is Oslo Growth's daily push cap now?", { mode: 'keyword', track: false });
+    expect(c.route.newest).toBeUndefined();
+    expect(now.prompts[0].system).not.toContain('A chunk marked "newest"');
   });
 
   it('labels a passage with its date', () => {

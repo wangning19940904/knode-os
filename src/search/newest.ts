@@ -5,7 +5,7 @@ import { keywordTerms } from './search.js';
 
 /**
  * The newest sources about what a question names, for a question asking for
- * the latest or current state.
+ * the latest source or what it says (`asksLatest`).
  *
  * Ask's search ranks passages by how well they match the question, and a
  * question's words match last year's report as well as last week's: on the
@@ -43,13 +43,19 @@ const TITLE_SHARE = 0.75;
 const HEAD_CHUNKS = 12;
 
 /**
- * Whether a question asks for the latest or current state: "latest", "newest", "most recent", "currently", "now",
- * "最新", "最近一次", "目前", "现在", "当前", "如今". Not a bare "current" ("current ratio", "current liabilities"),
- * nor "最近" alone, which names a period ("最近三个月").
+ * Whether a question asks for the newest source, or what the newest source says: "latest", "newest", "most
+ * recent", "最新", "最近一次". Not a bare "current" ("current ratio", "current liabilities"), nor "最近" alone, which
+ * names a period ("最近三个月").
+ *
+ * Nor "now", "currently", "现在", "目前", "当前": they ask for a thing's current value, which is in whichever source
+ * last changed it, not in the newest one. On the 2026-11-22 model check (docs/design/36 §5, Q3) "杭州增长组的每日推送
+ * 上限现在是多少？" was given the team's two newest reports, neither naming the cap (it changed in an older one,
+ * under a short name the search found), and was answered from a value set months before: the settings went 20 →
+ * 15 of 24 right while the questions asking for the latest report went 35 → 65 of 67.
  */
 export function asksLatest(question: string): boolean {
-  return /\b(?:latest|newest|most recent(?:ly)?|currently|now|nowadays|at present|as of today|these days)\b/i.test(question)
-    || /最新|最近(?:一次|一期|一周|一份|一篇|一起|的一|报告)|目前|现在|当前|如今|眼下/.test(question);
+  return /\b(?:latest|newest|most recent(?:ly)?)\b/i.test(question)
+    || /最新|最近(?:一次|一期|一周|一份|一篇|一起|的一|报告)/.test(question);
 }
 
 /**
