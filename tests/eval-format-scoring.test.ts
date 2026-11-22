@@ -93,6 +93,31 @@ describe('format-tolerant scoring: numbers', () => {
     // no tolerance, no conversion
     expect(namesValue('1,347,308人', ['135'], undefined, [1e4])).toBe(false);
   });
+
+  it('reads a figure at another scale than a gold written with its scale (upd-metric-D1T3-01, protocol 36)', () => {
+    // the generator writes "1837" and "1837k"; every agent arm answered "1,837,000" and was scored 0
+    const t: Task = { ...value('wau', '1837', { stale: ['1839'] }), answers: ['1837k'] };
+    expect(readValue(t, 'Final answer: 1,837,000 weekly active users.').gold).toBe(true);
+    expect(readValue(t, 'Final answer: 1.837 million weekly active users.').gold).toBe(true);
+    expect(readValue(t, 'Final answer: 1,837k weekly active users (1,837,000).').gold).toBe(true);
+    expect(readValue({ ...t, answer: '1830', answers: ['1830k'] }, 'Final answer: 1.83 million weekly active users.').gold).toBe(true);
+    // exactly: a rounded or a different figure is not the gold
+    expect(readValue(t, 'Final answer: 1.84 million weekly active users.').gold).toBe(false);
+    expect(readValue(t, 'Final answer: 1,830,000 weekly active users.').gold).toBe(false);
+    // a scale must end the word, and a gold with more after its scale is not read as a number
+    expect(namesValue('1837 kg', ['1837k'])).toBe(false);
+    expect(namesValue('1,837,000', ['1837k users'])).toBe(false);
+  });
+
+  it('reads an English scale after a number against the tolerance (loong-02af76bb-313d)', () => {
+    // the gold is in dollars; all five arms wrote "$9.932 million" and were scored 0
+    const t: Task = { ...value('ap', '$9,932,000', { tolerance: 1.01 }), answers: ['$9,932,000', '9932000'] };
+    expect(readValue(t, 'Final answer: $9.932 million as of March 31, 2024.').gold).toBe(true);
+    expect(readValue(t, 'Final answer: $9.9 million.').gold).toBe(false);
+    expect(numbersIn('$1.2bn and 3 M and 5 m and 40 thousand')).toEqual([
+      { value: 1.2, scaled: 1.2e9 }, { value: 3, scaled: 3e6 }, { value: 5, scaled: 5 }, { value: 40, scaled: 40_000 },
+    ]);
+  });
 });
 
 describe('format-tolerant scoring: two items in one entry', () => {

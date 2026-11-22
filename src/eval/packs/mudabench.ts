@@ -24,6 +24,10 @@ import { PackWriter } from './writer.js';
  * per-document values let a "top three" be recomputed, the recomputation is
  * kept in `meta.goldCheck` and a question it disagrees with is not primary.
  *
+ * A US report is headed with the fiscal year its 10-K cover states, and a
+ * question about a year reads the report for that year (`redateRows`):
+ * MuDABench files a calendar-year filer's 10-K under the year after.
+ *
  * Download: `downloads/mudabench/` holds simple.json, complex.json and
  * pdf/<id>.pdf for the three document types (SOURCE.md). The text pdf.js
  * reads from each PDF is cached in `text/<id>.txt` beside them.
@@ -96,7 +100,84 @@ export function scopeQuestion(row: MudaRow, lang: 'zh' | 'en', doctype: string):
   return `Here "your knowledge base" means the annual reports for ${span} of these ${codes.length} companies: ${codes.join(', ')}. ${row.question}`;
 }
 
-export function mudaTasks(rows: MudaRow[], complex: Map<string, string>, pathOf: (id: string) => string, unreadable: Set<string> = new Set()): Task[] {
+const MONTHS = 'January|February|March|April|May|June|July|August|September|October|November|December';
+const FISCAL_YEAR_ENDED = new RegExp(`fiscal\\s+year\\s+ended:?\\s*(?:${MONTHS})\\s+\\d{1,2}\\s*,?\\s*(\\d{4})`, 'i');
+
+/**
+ * The fiscal year a US annual report covers, read from its own cover ("For
+ * the fiscal year ended December 31, 2020"): the calendar year its fiscal year
+ * ends in, which is how MuDABench numbers the other 190 US reports (a year
+ * ended January 29, 2022 is its 2022). Undefined where the cover does not say
+ * (a scan). The Chinese reports are not read this way: their covers are
+ * images, traditional characters or Chinese numerals in 28 of 204, and one
+ * (002839's 2023 report) keeps last year's cover above pages headed 2023.
+ */
+export function reportYear(text: string): number | undefined {
+  const m = text.slice(0, 20_000).match(FISCAL_YEAR_ENDED);
+  return m ? Number(m[1]) : undefined;
+}
+
+/** A row's (company, year) that the dataset's own report does not cover: re-pointed to the one that does, or dropped. */
+export interface YearFix {
+  symbol: string;
+  year: number;
+  /** The report the dataset gives, and the year it covers. */
+  from: string;
+  covers: number;
+  /** The corpus's report for that year, when it holds one. */
+  to?: string;
+}
+
+export type RedatedRow = MudaRow & { yearFixes?: YearFix[]; scopeDropped?: string[] };
+
+/**
+ * MuDABench gives a calendar-year US filer's year as the report filed in it:
+ * UAA's and TG's "2021" are their 10-Ks for 2020, TG's "2022" its 10-K for
+ * 2021, while the per-report values are the year's own (UAA's 2021 net profit
+ * of 360.1M, where the report shows 2020's loss of 549.2M). Asked of the
+ * corpus, such a question reads the year before. Each (company, year) whose
+ * report covers another year is re-pointed to the corpus's report for that
+ * year, when there is one. Otherwise, where the gold is a list of codes that
+ * does not name the company, the company is taken out of the question's
+ * scope (the gold stays the top of the rest); else the question needs a
+ * report the corpus does not hold and is left out (`left`).
+ */
+export function redateRows(rows: MudaRow[], years: Map<string, number>, docMeta: Map<string, MudaMeta>): { rows: RedatedRow[]; left: { row: MudaRow; missing: YearFix[] }[] } {
+  const byKey = new Map<string, string>();
+  for (const [id, m] of docMeta) {
+    const y = years.get(id);
+    if (y !== undefined) byKey.set(`${m.doctype}|${m.symbol}|${y}`, id);
+  }
+  const out: RedatedRow[] = [];
+  const left: { row: MudaRow; missing: YearFix[] }[] = [];
+  for (const row of rows) {
+    const fixes: YearFix[] = [];
+    const metadata = row.metadata.map((m) => {
+      const covers = years.get(m.id);
+      if (covers === undefined || covers === m.year) return m;
+      const to = byKey.get(`${m.doctype}|${m.symbol}|${m.year}`);
+      fixes.push({ symbol: m.symbol, year: m.year, from: m.id, covers, ...(to ? { to } : {}) });
+      return to ? { ...m, id: to } : m;
+    });
+    if (!fixes.length) {
+      out.push(row);
+      continue;
+    }
+    const missing = fixes.filter((f) => !f.to);
+    const gone = [...new Set(missing.map((f) => f.symbol))];
+    if (gone.length) {
+      const named = ASKS_CODES.test(row.question) ? codesIn(row.final_answer, row.metadata.map((m) => m.symbol)) : [];
+      if (!named.length || gone.some((s) => named.includes(s))) {
+        left.push({ row, missing });
+        continue;
+      }
+    }
+    out.push({ ...row, metadata: metadata.filter((m) => !gone.includes(m.symbol)), yearFixes: fixes, ...(gone.length ? { scopeDropped: gone } : {}) });
+  }
+  return { rows: out, left };
+}
+
+export function mudaTasks(rows: RedatedRow[], complex: Map<string, string>, pathOf: (id: string) => string, unreadable: Set<string> = new Set()): Task[] {
   const tasks: Task[] = [];
   const ids = new Map<string, number>();
   for (const row of rows) {
@@ -112,6 +193,8 @@ export function mudaTasks(rows: MudaRow[], complex: Map<string, string>, pathOf:
     const meta = {
       source: 'mudabench', datasetId: row.question_id, datasetType: [...types][0], family: 'aggregates', hops: docs.length, stratum: kind.short,
       goldCheck, originalQuestion: row.question, ...(unread.length ? { unreadableEvidence: unread.map(pathOf) } : {}),
+      ...(row.yearFixes ? { yearFixes: row.yearFixes.map((f) => ({ symbol: f.symbol, year: f.year, from: pathOf(f.from), covers: f.covers, ...(f.to ? { to: pathOf(f.to) } : {}) })) } : {}),
+      ...(row.scopeDropped ? { scopeDropped: row.scopeDropped } : {}),
       ...(complex.get(row.question_id) ? { analyticAnswer: complex.get(row.question_id) } : {}),
     };
     // the dataset repeats a few question ids; the repeat gets a suffix
@@ -177,7 +260,17 @@ async function buildMudabench(dir: string, ctx: RecipeContext) {
   // a report whose PDF holds almost no text (a scan) cannot be read without a vision model: its questions are kept, not primary
   const unreadable = new Set(ids.filter((id) => MUDA_DOCTYPES[docMeta.get(id)!.doctype].short.startsWith('annual') && texts.get(id)!.replace(/<!-- page \d+ -->|\s/g, '').length < 5_000));
   if (unreadable.size) ctx.log(`MuDABench: ${unreadable.size} annual reports with almost no text in their PDF (scans): ${[...unreadable].join(', ')}`);
-  const all = mudaTasks(rows, complex, pathOf, unreadable);
+  // the year each US report covers, from its cover; a question about a year reads that year's report
+  const years = new Map<string, number>();
+  for (const id of ids) {
+    const y = MUDA_DOCTYPES[docMeta.get(id)!.doctype].lang === 'en' ? reportYear(texts.get(id)!) : undefined;
+    if (y !== undefined) years.set(id, y);
+  }
+  const misdated = ids.filter((id) => years.has(id) && years.get(id) !== docMeta.get(id)!.year);
+  if (misdated.length) ctx.log(`MuDABench: ${misdated.length} reports cover another year than the dataset gives: ${misdated.map((id) => `${docMeta.get(id)!.symbol} ${docMeta.get(id)!.year} is ${years.get(id)}`).join(', ')}`);
+  const redated = redateRows(rows, years, docMeta);
+  for (const { row, missing } of redated.left) ctx.log(`MuDABench: left out ${row.question_id}: no report for ${missing.map((f) => `${f.symbol} ${f.year}`).join(', ')} in the corpus`);
+  const all = mudaTasks(redated.rows, complex, pathOf, unreadable);
   const n = questionCount(ctx);
   const tasks = n ? sampleByStratum(all, n, ctx.seed ?? 0) : all;
   const writer = new PackWriter(dir, {
@@ -194,7 +287,8 @@ async function buildMudabench(dir: string, ctx: RecipeContext) {
   writer.addSource({ url: 'https://huggingface.co/datasets/Zhanli-Li/MuDABench/tree/main/data/pdf', license: LICENSE, note: `${docMeta.size} PDFs (A股年报, US Stock Annual Report, A股利润分配权益类公告); sha256 of each in the download's SHA256SUMS` });
 
   for (const id of ids) {
-    const m = docMeta.get(id)!;
+    // headed with the year the report covers, not the one the dataset files it under
+    const m = { ...docMeta.get(id)!, year: years.get(id) ?? docMeta.get(id)!.year };
     const kind = MUDA_DOCTYPES[m.doctype];
     const title = kind.title(m);
     writer.addDoc({ path: pathOf(id), title, date: String(m.year), lang: kind.lang, source: 'mudabench', kind: kind.short }, `# ${title}\n\n${texts.get(id)!.trim()}\n`);

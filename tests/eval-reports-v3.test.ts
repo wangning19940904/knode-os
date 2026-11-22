@@ -11,6 +11,7 @@ import '../src/eval/packs/recipes.js';
 import { settingTrueAt, V3_FAMILY_MIN, V3_STRATUM_MIN } from '../src/eval/packs/reports-v3-tasks.js';
 import { isoWeek, makeV3World, V3_CORPUS, weekLabel } from '../src/eval/packs/reports-v3.js';
 import { lexicalOverlap } from '../src/eval/packs/separation.js';
+import { readValue } from '../src/eval/score/values.js';
 import type { Task } from '../src/eval/types.js';
 
 let tmp: string;
@@ -199,6 +200,22 @@ describe('weekly reports v3: the questions', () => {
       expect(t.answer).toBe(String(f.actual));
       expect(t.meta!.stale).toEqual([String(f.reported)]);
       expect(t.question).toContain('以月报为准');
+    }
+  });
+});
+
+describe('weekly reports v3: update questions', () => {
+  it('reads a metric given at full size as the gold or as the stale value (upd-metric-*, protocol 36)', () => {
+    const ups = packs.en.tasks.filter((t) => t.id.startsWith('upd-metric-') && (t.answers ?? []).some((a) => /^\d+k$/.test(a)));
+    expect(ups.length).toBeGreaterThan(0);
+    for (const t of ups) {
+      const full = (k: string) => (Number(k.replace(/k$/, '')) * 1000).toLocaleString('en-US');
+      const unit = (t.answers ?? []).find((a) => /^\d+k$/.test(a))!;
+      expect(readValue(t, `Final answer: ${full(unit)} weekly active users.`).gold).toBe(true);
+      const stale = (t.meta?.staleText as string[] | undefined)?.[0];
+      if (!stale) continue;
+      expect(stale).toBe(`${t.meta!.stale![0]}k`);
+      expect(readValue(t, `Final answer: ${full(stale)}.`)).toMatchObject({ gold: false, stale: true });
     }
   });
 });

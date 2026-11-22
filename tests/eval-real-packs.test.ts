@@ -8,7 +8,7 @@ import { bodyOf, dateOf, ExcerptIndex } from '../src/eval/packs/crud-news.js';
 import { recipe } from '../src/eval/packs/index.js';
 import { describeReport, registrantOf, resolveDoc } from '../src/eval/packs/loong.js';
 import { cheapLint, type PackMeasure, questionTerms } from '../src/eval/packs/measure.js';
-import { checkTopThree, codesIn } from '../src/eval/packs/mudabench.js';
+import { checkTopThree, codesIn, redateRows, reportYear } from '../src/eval/packs/mudabench.js';
 import { plainNumber, roundingTolerance, sampleByStratum } from '../src/eval/packs/real-docs.js';
 import '../src/eval/packs/recipes.js';
 import { valueForms } from '../src/eval/packs/wiki-hops.js';
@@ -101,8 +101,8 @@ describe('real-loong-finance', () => {
 describe('real-mudabench', () => {
   it('scopes "your knowledge base" to the question\'s own reports', () => {
     const p = packs.muda;
-    // the ESG question is left out with its document type
-    expect(p.tasks).toHaveLength(3);
+    // the ESG question is left out with its document type, and one that needs a report the corpus lacks
+    expect(p.tasks).toHaveLength(5);
     const [all, five] = p.tasks.filter((t) => t.scoring === 'set');
     expect(all.question).toContain('以下6家公司2021年的年度报告：601398、002142、601166、600000、601288、601939。');
     expect(five.question).toContain('以下5家公司2021年的年度报告');
@@ -117,6 +117,46 @@ describe('real-mudabench', () => {
     expect(all.meta?.unreadableEvidence).toHaveLength(1);
     expect(five.primary).toBe(true);
     expect(task(p, (t) => t.scoring === 'judge')).toMatchObject({ type: 'aggregation', answer: '极差为4.5个百分点。' });
+  });
+
+  it('reads a question about a year from the report that covers it, not the one filed in it', () => {
+    const p = packs.muda;
+    const head = (sym: string, year: number) => p.docs.find((d) => d.title === `${sym} annual report, fiscal ${year}`);
+    // TGX's reports are filed under 2021 and 2022 and cover 2020 and 2021: headed by what they cover
+    const [tgx2020, tgx2021] = [head('TGX', 2020), head('TGX', 2021)];
+    expect(tgx2020 && tgx2021).toBeTruthy();
+    expect(head('TGX', 2022)).toBeUndefined();
+    expect(tgx2021!.date).toBe('2021');
+    expect(head('AAA', 2022)).toBeTruthy();
+    // 2021: re-pointed to the report for 2021, which the dataset files under 2022
+    const y2021 = task(p, (t) => t.meta?.datasetId === 'q_0000000000000005');
+    expect(y2021.evidence.map((e) => e.doc)).toContain(tgx2021!.path);
+    expect(y2021.evidence.map((e) => e.doc)).not.toContain(tgx2020!.path);
+    expect(y2021.items!.find((i) => i.label === 'TGX')!.docs).toEqual([tgx2021!.path]);
+    expect(y2021.meta?.yearFixes).toEqual([{ symbol: 'TGX', year: 2021, from: tgx2020!.path, covers: 2020, to: tgx2021!.path }]);
+    // 2022: no report for it; TGX is not in the gold, so it leaves the question's scope
+    const y2022 = task(p, (t) => t.meta?.datasetId === 'q_0000000000000006');
+    expect(y2022.question).toContain('the annual reports for 2022 of these 4 companies: AAA, BBB, CCC, DDD.');
+    expect(y2022.evidence).toHaveLength(4);
+    expect(y2022).toMatchObject({ type: 'aggregation', meta: { scopeDropped: ['TGX'] } });
+    // the same, with TGX in the gold: unanswerable from the corpus, left out
+    expect(p.tasks.find((t) => t.meta?.datasetId === 'q_0000000000000007')).toBeUndefined();
+  });
+
+  it('dates a US report by its cover and re-points or drops a misdated company', () => {
+    expect(reportYear('ANNUAL REPORT\nFor the fiscal year ended December 31, 2020\nor')).toBe(2020);
+    expect(reportYear('For the fiscal year ended: January 29 , 2022')).toBe(2022);
+    expect(reportYear('Form 10-K, no cover period')).toBeUndefined();
+    const m = (symbol: string, year: number, id: string) => ({ symbol, year, id, doctype: 'US Stock Annual Report' });
+    const docMeta = new Map([m('A', 2021, 'a21'), m('B', 2021, 'b21'), m('T', 2021, 't20'), m('T', 2022, 't21')].map((x) => [x.id, x]));
+    const years = new Map([['a21', 2021], ['b21', 2021], ['t20', 2020], ['t21', 2021]]);
+    const row = (year: number, answer: string, question = 'the top companies by revenue? Provide their stock symbols.') => ({ question_id: `q${year}${answer}`, question, metadata: [m('A', year, `a${year - 2000}`), m('B', year, `b${year - 2000}`), m('T', year, year === 2021 ? 't20' : 't21')], source_answer: [], final_answer: answer });
+    const { rows, left } = redateRows([row(2021, '[T], [A]'), row(2022, '[A], [B]'), row(2022, '[T]'), row(2022, 'about 4.5', 'the range of revenue?')], years, docMeta);
+    expect(rows[0].metadata.map((x) => x.id)).toEqual(['a21', 'b21', 't21']);
+    expect(rows[1].metadata.map((x) => x.symbol)).toEqual(['A', 'B']);
+    expect(rows[1].scopeDropped).toEqual(['T']);
+    // T in the gold, or a judged answer that may rest on T: needs a report the corpus lacks
+    expect(left.map((l) => l.row.final_answer)).toEqual(['[T]', 'about 4.5']);
   });
 
   it('reads codes and recomputes a top three', () => {
