@@ -10,6 +10,7 @@ import { search, SearchMode } from './search.js';
 import { EnumeratedClaim, Enumeration, enumerateClaims, typesInQuestion } from './enumerate.js';
 import { ComputedSet, computeClaimSet, SET_BUDGET_MS } from './claimset.js';
 import { secondRound } from './second.js';
+import { asksLatest, newestSources } from './newest.js';
 import { PASSAGE_MAX, widenPassages } from './passages.js';
 import { isChainQuestion, QuestionKind, QuestionRoute, questionRange, routeQuestion } from './route.js';
 import { stepsAsFacts, walkRelations } from './walk.js';
@@ -53,9 +54,11 @@ export interface AskRoute {
   second?: { chunks: number; facts: number; from: string[]; uncoveredNamed: string[]; missingTerms: string[]; statements: number; ms: number };
   /** The documents behind the first passages read further before the answer (search/passages.ts): how many, and the characters added. */
   widened?: { documents: number; chars: number };
+  /** For a question asking for the latest state: the newest sources about what it names, put first (search/newest.ts). */
+  newest?: { path: string; date: string | null }[];
 }
 
-const ASK_SYSTEM = `You answer questions from a personal knowledge base. You are given retrieved context chunks, each tagged [n] — one marked "excerpt" holds only the lines of its document that name what the question asks about, one marked "widened" holds more of its document than the search returned (the parts are in document order; "[…]" marks a gap) — and optionally a "Known facts" list: claims extracted from the whole knowledge base, each tagged [n] too, with its date and the document it comes from. The facts reach documents the chunks do not; a question that asks for every case, a list or a history is answered from both.
+const ASK_SYSTEM = `You answer questions from a personal knowledge base. You are given retrieved context chunks, each tagged [n] with its path and, when known, its source's date — one marked "excerpt" holds only the lines of its document that name what the question asks about, one marked "widened" holds more of its document than the search returned (the parts are in document order; "[…]" marks a gap) — and optionally a "Known facts" list: claims extracted from the whole knowledge base, each tagged [n] too, with its date and the document it comes from. The facts reach documents the chunks do not; a question that asks for every case, a list or a history is answered from both.
 
 Rules:
 - Answer in the question's language, concise but complete. Lead with the answer, then the caveats.
@@ -70,6 +73,10 @@ Rules:
 /** The rule an enumerated answer adds: the facts are the whole match, and the counts are over it. */
 const ENUMERATED_RULE = `
 - Known facts marked "enumerated" are every claim the knowledge base holds about what the question names (in the period it names): answer a list with every relevant item, merging the same item stated by several sources; count distinct items or events, not lines; the "Counts" section is computed over all matching claims, including any not listed. A fact marked "replaced later" was true until a newer fact replaced it: use it for history, not as the current state.`;
+
+/** The rule the newest sources add (search/newest.ts): the question asks for the latest state, and these are the newest sources about it. */
+const NEWEST_RULE = `
+- A chunk marked "newest" is from the most recent dated source the knowledge base holds about what the question names; "next newest" is the one before it; "newest with all the question's words" is the most recent holding everything the question asks about, which may be older. The question asks for the latest or current state: answer from the newest source that states it, and say the date it is as of. An older chunk, page or fact that gives another value is the earlier state, not a contradiction, unless it is dated later; a line saying what a value was first set at or used to be states an earlier value, however new the source restating it, and the current value is the latest change dated before the newest source. What the question asks of "the latest report" — a figure, a count, the items still open — is read from that report itself.`;
 
 /**
  * A set left uncomputed past its time budget. On PGlite (WASM on this thread) no timer fires while a statement runs,
@@ -202,6 +209,8 @@ export async function ask(
     now?: string;
     /** false: show the chunks as the search cut them, without reading further into their documents (search/passages.ts). */
     widen?: boolean;
+    /** false: no newest sources for a question asking for the latest state (search/newest.ts). */
+    newest?: boolean;
   } = {},
 ): Promise<AskResult> {
   const router = { ...defaultAskRouterConfig(), ...config.retrieval.router };
@@ -242,7 +251,7 @@ interface RouteEnv {
   embedder: EmbeddingProvider;
   llm: LlmClient;
   question: string;
-  opts: { k?: number; mode?: SearchMode; facts?: number; excerpts?: number; track?: boolean; second?: boolean; computed?: boolean; now?: string; widen?: boolean };
+  opts: { k?: number; mode?: SearchMode; facts?: number; excerpts?: number; track?: boolean; second?: boolean; computed?: boolean; now?: string; widen?: boolean; newest?: boolean };
   queryVector: number[] | undefined;
   router: ReturnType<typeof defaultAskRouterConfig>;
   routed: QuestionRoute;
@@ -439,6 +448,16 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
   }));
 }
 
+/** A passage's header in the prompt: its path, its source's date, and what it is (newest, excerpt, widened). */
+export function passageLabel(c: SearchResult): string {
+  const parts = [c.path];
+  if (c.docDate) parts.push(c.docDate);
+  if (c.newest) parts.push(c.newest.rank === 1 ? 'newest' : c.newest.full ? 'newest with all the question\'s words' : 'next newest');
+  if (c.excerpt) parts.push('excerpt');
+  else if (c.widened) parts.push('widened');
+  return parts.join(', ');
+}
+
 /** The one completion every route ends in, and its citations. */
 async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked: PromptFact[], counts: string, routedFirst: AskRoute, heading?: string): Promise<AskResult> {
   const { llm, question, computed } = env;
@@ -446,6 +465,16 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
   let contexts = firstContexts;
   let ranked = firstRanked;
   let routed = routedFirst;
+  // a question asking for the latest state is given the newest sources about what it names first: a search ranks
+  // last year's report as high as last week's
+  if (env.opts.newest !== false && asksLatest(question)) {
+    const newest = await newestSources(env.store, question, env.named, { now: env.opts.now }).catch(() => []);
+    if (newest.length > 0) {
+      const lead = new Set(newest.map((c) => c.chunkId));
+      contexts = [...newest, ...contexts.filter((c) => !lead.has(c.chunkId))];
+      routed = { ...routed, newest: newest.map((c) => ({ path: c.path, date: c.docDate ?? null })) };
+    }
+  }
   if (!computed && routedFirst.kind !== 'timeline' && (env.opts.second ?? env.router.secondRound !== false)) {
     const more = await secondRound(env.store, question, {
       named: env.named, contexts, facts: ranked, chain: routedFirst.kind === 'multihop' || isChainQuestion(question),
@@ -477,7 +506,7 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
     ? { ...routed, computed: { op: computed.op, scope: computed.scope, matched: computed.matched, items: computed.items, rows: setRows.length, ms: computed.ms } }
     : overBudget ? { ...routed, computedSkipped: { why: 'over its time budget', ...overBudget } } : routed;
   const budgetGap = overBudget ? [OVER_BUDGET_GAP] : [];
-  const system = `${ASK_SYSTEM}${route.enumerated ? ENUMERATED_RULE : ''}${computed ? COMPUTED_RULE : ''}`;
+  const system = `${ASK_SYSTEM}${route.enumerated ? ENUMERATED_RULE : ''}${computed ? COMPUTED_RULE : ''}${contexts.some((c) => c.newest) ? NEWEST_RULE : ''}`;
   // what a reference number stands for: the chunks first, then the facts
   const refs = [
     ...contexts.map((c) => ({ path: c.path, chunkId: c.chunkId })),
@@ -496,9 +525,7 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
     };
   }
 
-  const contextBlock = contexts
-    .map((c, i) => `[${i + 1}] (${c.path}${c.excerpt ? ', excerpt' : c.widened ? ', widened' : ''})\n${c.content.slice(0, c.widened ? PASSAGE_MAX + 1 : ASK_CONTEXT_CHARS)}`)
-    .join('\n\n');
+  const contextBlock = contexts.map((c, i) => `[${i + 1}] (${passageLabel(c)})\n${c.content.slice(0, c.widened ? PASSAGE_MAX + 1 : ASK_CONTEXT_CHARS)}`).join('\n\n');
   const raw = await llm.complete([
     { role: 'system', content: system },
     { role: 'user', content: `# Context\n${contextBlock}${renderFacts(facts, contexts.length + 1, heading)}${extra}\n\n# Question\n${question}` },

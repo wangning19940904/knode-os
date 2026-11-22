@@ -93,6 +93,36 @@ Every update question of the two reports packs, after fresh builds whose update 
 
 The wiki arm is within 0.02 of grep with an interval that holds zero: the 14 lost update questions of the campaign were the harness leaving pages stale. Description, not a named comparison: Ask is wrong on a quarter of the update questions, by the previous value or by declining ("the current limit is unconfirmed; the last explicitly set amount was $5,000") while an agent with the same index's pages answers them all. Four English questions (`upd-metric-D1T3-01` to `-04`) are missed by every arm with different figures each: gold or question to check before they are used again.
 
+#### Why Ask lost them (2026-11-22, no model)
+
+Ask's prompts replayed on the run's builds (read-only, the run's question vectors, a model stub that keeps the prompt). 117 questions (the four above left out), 34 scored 0:
+
+| class | n | Ask said | lost at |
+| --- | --- | --- | --- |
+| "By X's latest weekly report, how many risks are still open?" | 17 | declined | retrieval: the latest report was in none of the 17 prompts; nothing in the search, the facts or the enumeration orders sources by date |
+| "Which is the newest incident X has reported?" | 9 | the incident before | retrieval: the new incident's id was in none of the 9 prompts (neither passage nor fact); the newest incident shown was the one a monthly summary names |
+| "What is X's daily push cap / per-refund approval limit now?" | 6 | an older value (4); declined, quoting the initial value (2) | entity identity: the current value is stated under the setting's code or short name ("the push quota moves to 6 pushes") and extracted onto that twin entity, which Ask's named entities did not reach (`knode_claims` does); the setting's own entity holds the initial value, restated weekly |
+| graded wrong, answer right | 2 | "One risk—R-128—is still open" (gold 1); "released" (gold "launched") | value scoring |
+
+Ruled out: supersession (the new values are live, the old ones superseded where they share an entity); the 2026-11-21 answer rules (every decline had a prompt without the answer); wiki pages crowding the update's document (it was not ranked at all). The three `cfg` questions per pack whose gold was set before the batches (`-01`, `-02`) were not about the update at all.
+
+Fixed on branch `claude/ask-stale-update-answers-c8e221`:
+- `search/newest.ts`: a question asking for the latest or current state ("latest", "newest", "now", "最新", "目前", "现在"; not "current ratio", not "最近三个月") gets the newest dated sources about what it names, before the passages: of the entity's own sources (titled with its name) whose titles hold the question's words best, the newest, and the newest holding the question's other words (each weighted by the share of candidates holding it, so cross-word bigrams count for little). Marked `newest` with the date; a rule says the newest source decides and a restated initial value is history.
+- Every passage header carries its source's date.
+- `graph/resolve.ts` `shortNameTwins`: the named entities include short-name twins, by exact alias key (indexed), for entities with at most 16 aliases; a twin's claims are ranked under its owner's name too; claims about a specific named entity (≤ 30 candidates) rank by that beside words and embedding; "now"/"最新" no longer rank claims.
+
+Measured, same replay, before → after, the newest sources read at each batch's date (the search still sees the final build):
+
+| | before | after |
+| --- | --- | --- |
+| risks (17 wrong): the batch's report among the passages | 0 | 17, each first and marked newest |
+| incidents (9 wrong): the new incident's id in the prompt | 0 | 9 |
+| settings (6 wrong): the current value's claim in the prompt, dated | 0 | 5 (the sixth, zh `PAY1-C1-01`, was superseded by batch 02 in the final build and cannot be shown) |
+| all 117: the evidence document among the passages | 15 | 97 (82 first) |
+| prompt characters, mean | 27,985 | 30,215 |
+
+The 83 questions Ask got right keep the evidence they had (every incident id and setting value present before is present after). On `ws_finance_a8349022` (read-only) twins take 2–35 ms and the newest sources 85–550 ms under a machine load of about 45. Whether the answers follow needs a model run: both Ask builds over the 121 questions, rebuilt from the run's cached replies, under the protocol's rules with local Codex and a local Claude judge.
+
 ### Q2 — as the free gate said
 
 `knode-ask-hops` − `knode-ask`: 0.000 over 25 questions of `public-musique` (1 better, 1 worse), +0.017 over 30 of `public-musique-deep` (2 better, 2 worse).

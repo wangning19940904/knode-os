@@ -138,6 +138,11 @@ export interface SearchResult {
   excerpt?: boolean;
   /** More of its document than the chunk: the chunks (by `seq`, of `of`) `ask` joined into this passage (search/passages.ts). */
   widened?: { seqs: number[]; of: number };
+  /**
+   * One of the newest dated sources about what a question asking for the latest state names (search/newest.ts):
+   * rank 1 the newest; `full` the newest holding every word of the question the best-matching source holds.
+   */
+  newest?: { rank: number; full?: true };
   /** The chunk is of a generated page (an entity page, a timeline: search/search.ts `SideSql.generated`), not of a source. Absent on a source's chunk. */
   generated?: true;
   /** Its 1-based rank in each recall channel that found it; only when the search was asked to explain. */
