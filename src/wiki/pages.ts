@@ -23,7 +23,7 @@ import { readMatter, writeMatter } from '../markdown.js';
 import { isGeneratedConcept, okfGenerated } from '../okf/index.js';
 import { getDocHeat } from '../stats/heat.js';
 import { Store } from '../store/db.js';
-import { Params, toDateString, toIso } from '../store/temporal.js';
+import { Params, relationSourceSql, toDateString, toIso } from '../store/temporal.js';
 import { DocumentRow } from '../types.js';
 import { entitiesIndex, entitiesShelf, NavPageKind, overviewHoldings, pagesIndex, pagesShelf, sourcesIndex, sourcesShelf, wikiContents } from './nav-views.js';
 import { hasRegions, renderRegion, replaceRegion, splitRegions } from './regions.js';
@@ -195,14 +195,11 @@ const entityStub: PageGenerator = {
        ORDER BY eff DESC NULLS LAST, cl.tx_from DESC, cl.id LIMIT $2`,
       [subjects, ENTITY_PAGE_LINKED],
     );
-    // a relation's source: its document, else the document its evidence came
-    // from — tier 1 writes that evidence on a `tier1` scope keyed by the path
+    // a relation's source: the document it cites (the earliest-dated that states it, then by path: the fold
+    // stores it), else the same choice read from its evidence (store/temporal.ts relationSource)
     const relations = await ctx.store.query<PageRelation & { fold_sha: string }>(
       `SELECT r.id, r.type, r.description, (r.source_id = $1) AS out, o.name AS other, o.wiki_path AS other_page, r.fold_sha,
-              COALESCE(d.path, (
-                SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
-                WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL AND s.kind IN ('doc', 'tier1')
-                ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
+              COALESCE(d.path, ${relationSourceSql('r', 'path')}) AS path
        FROM relations r
        JOIN entities o ON o.id = CASE WHEN r.source_id = $1 THEN r.target_id ELSE r.source_id END
        LEFT JOIN documents d ON d.id = r.document_id

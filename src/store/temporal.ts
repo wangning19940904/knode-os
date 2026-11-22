@@ -88,34 +88,45 @@ export interface EvidenceAtRow {
   tx_from: string;
 }
 
-/** The document a scope read, for the scopes that read one: a document's own scope and its tier-1 child. */
+/** The document a scope read, for the scopes that read one: a document's own scope, its tier-1 child, a back-reference from one of its claims. */
 export interface ScopeDocument {
   documentId: string;
-  /** The scope's key (the document's path), which orders supporters of one instant. */
+  /** The scope's key (the document's path, for a document's own scope and its tier-1 child). */
   key: string;
+  /** The document's path and its date as they are now (`documents.doc_date`; null when it states none): what orders the sources of a relation. */
+  path: string;
+  date: string | null;
+  /** The scope's kind, one of SOURCE_SCOPE_KINDS. */
+  kind: string;
 }
 
 /**
  * The documents behind evidence scopes. A document's scope and its tier-1
  * child name it in `meta.documentId`; the human-prose scope of a generated
  * wiki page (`wiki-human`) names its page there too, but a page knode wrote is
- * no source, so it is left out with merges, research and a person's edits —
- * the scope kinds entity pages fall back to (src/wiki/pages.ts).
+ * no source, so it is left out with merges, research and a person's edits.
  */
 /** Scopes that read a document: its own, its tier-1 extraction, and a back-reference link made from one of its claims (meta.documentId). */
 export const SOURCE_SCOPE_KINDS = ['doc', 'tier1', 'backref'] as const;
+const SOURCE_KINDS_SQL = SOURCE_SCOPE_KINDS.map((k) => `'${k}'`).join(', ');
+/**
+ * The id of the document the source scope aliased `s` read: the one its meta
+ * names, as every scope an apply writes does; else the document at its key,
+ * the path of a document's own scope and of its tier-1 child.
+ */
+const scopeDocumentSql = (s: string) => `COALESCE(${s}.meta->>'documentId', (SELECT kd.id FROM documents kd WHERE kd.path = ${s}.key))`;
 
 export async function scopeDocuments(q: Queryable, scopeIds: Iterable<string>): Promise<Map<string, ScopeDocument>> {
   const ids = [...new Set(scopeIds)];
   const out = new Map<string, ScopeDocument>();
   if (ids.length === 0) return out;
-  const rows = await q.query<{ id: string; key: string; document_id: string }>(
-    `SELECT s.id, s.key, d.id AS document_id
-     FROM scopes s JOIN documents d ON d.id = s.meta->>'documentId'
+  const rows = await q.query<{ id: string; key: string; kind: string; document_id: string; path: string; doc_date: string | Date | null }>(
+    `SELECT s.id, s.key, s.kind, d.id AS document_id, d.path, d.doc_date
+     FROM scopes s JOIN documents d ON d.id = ${scopeDocumentSql('s')}
      WHERE s.id = ANY($1::text[]) AND s.kind = ANY($2::text[])`,
     [ids, [...SOURCE_SCOPE_KINDS]],
   );
-  for (const r of rows) out.set(r.id, { documentId: r.document_id, key: r.key });
+  for (const r of rows) out.set(r.id, { documentId: r.document_id, key: r.key, path: r.path, date: toIso(r.doc_date), kind: r.kind });
   return out;
 }
 
@@ -228,24 +239,76 @@ export interface RelationAsOf {
 }
 
 /**
- * The document a relation was read from, and the passage when its evidence was
- * grounded to one: of the live supporters whose scope read a document, the
- * earliest (by tx_from, then scope key and id) — the order entity pages and the
- * graph walk fall back to while `relations.document_id` is empty, and the one
- * migrations.ts fillRelationSources fills it by.
+ * The version of the rule below, kept in `meta.relation_sources.rule` once
+ * every live relation's stored source follows it (src/lineage/relation-sources.ts
+ * refreshRelationSources). Bump it whenever `relationSource` picks differently:
+ * the next open goes over the live relations again, in place.
  */
-export function relationSource(rows: EvidenceAtRow[], docs: ReadonlyMap<string, ScopeDocument>): { documentId: string; chunkId: string | null } | null {
-  let best: { r: EvidenceAtRow; doc: ScopeDocument } | null = null;
+export const RELATION_SOURCE_RULE = 2;
+
+/** Code-unit order, which `COLLATE "C"` gives the same strings in SQL (`localeCompare` and a database's own collation depend on where they run). */
+const byCode = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
+ * The one document a relation cites, and the passage when its evidence was
+ * grounded to one. Of the live supporters whose scope read a document: the
+ * document with the earliest date (`documents.doc_date`; a document that
+ * states no date comes after every dated one), then the first by path. That
+ * depends on the corpus alone. Rule 1 took the supporter written first
+ * (`tx_from`), so which document an entity page cited, and where the walk
+ * found a relation's passage, changed with the order extraction happened to
+ * finish in: two builds of one corpus disagreed.
+ *
+ * Within that document, its own scope (frontmatter, links) before its tier-1
+ * extraction before a back-reference, as they are written, then by extractor,
+ * a grounded supporter before one without a passage, the passage id: the
+ * supporter the passage is taken from is as fixed as the document.
+ *
+ * Entity pages, the graph walk and `v_relations` read the stored
+ * `relations.document_id` / `chunk_id` the fold writes by this rule;
+ * `relationSourceSql` is the same choice of document in SQL, for a row whose
+ * source is not stored yet.
+ */
+export type RelationSupporter = Pick<EvidenceAtRow, 'scope_id' | 'segment_id' | 'extractor'>;
+
+export function relationSource(rows: readonly RelationSupporter[], docs: ReadonlyMap<string, ScopeDocument>): { documentId: string; chunkId: string | null } | null {
+  const kindRank = (k: string) => {
+    const i = (SOURCE_SCOPE_KINDS as readonly string[]).indexOf(k);
+    return i < 0 ? SOURCE_SCOPE_KINDS.length : i;
+  };
+  let best: { r: RelationSupporter; doc: ScopeDocument } | null = null;
   for (const r of rows) {
     const doc = docs.get(r.scope_id);
     if (!doc) continue;
     if (!best) { best = { r, doc }; continue; }
-    const d = new Date(r.tx_from).getTime() - new Date(best.r.tx_from).getTime()
-      || (doc.key < best.doc.key ? -1 : doc.key > best.doc.key ? 1 : 0)
-      || (r.scope_id < best.r.scope_id ? -1 : r.scope_id > best.r.scope_id ? 1 : 0);
+    const d = (doc.date === null ? 1 : 0) - (best.doc.date === null ? 1 : 0)
+      || byCode(doc.date ?? '', best.doc.date ?? '')
+      || byCode(doc.path, best.doc.path)
+      || byCode(doc.documentId, best.doc.documentId)
+      || kindRank(doc.kind) - kindRank(best.doc.kind)
+      || byCode(r.extractor, best.r.extractor)
+      || (r.segment_id ? 0 : 1) - (best.r.segment_id ? 0 : 1)
+      || byCode(r.segment_id ?? '', best.r.segment_id ?? '')
+      || byCode(doc.key, best.doc.key)
+      || byCode(r.scope_id, best.r.scope_id);
     if (d < 0) best = { r, doc };
   }
   return best ? { documentId: best.doc.documentId, chunkId: best.r.segment_id ?? null } : null;
+}
+
+/**
+ * `relationSource`'s choice of document as a scalar subquery: the `path` or
+ * the `id` of the document the relation aliased `rel` cites, read from its
+ * live evidence. For readers of a row whose `document_id` is not stored
+ * (written before v20 and not yet filled, or in a build opened read-only):
+ * `COALESCE(<stored>, <this>)`.
+ */
+export function relationSourceSql(rel: string, column: 'path' | 'id'): string {
+  return `(SELECT sd.${column} FROM evidence ev
+      JOIN scopes s ON s.id = ev.scope_id AND s.kind IN (${SOURCE_KINDS_SQL})
+      JOIN documents sd ON sd.id = ${scopeDocumentSql('s')}
+      WHERE ev.kind = 'relation' AND ev.target_id = ${rel}.id AND ev.tx_to IS NULL
+      ORDER BY sd.doc_date ASC NULLS LAST, sd.path COLLATE "C", sd.id COLLATE "C" LIMIT 1)`;
 }
 
 export function foldRelationEvidence(row: { id: string; source_id: string; target_id: string; type: string }, rows: EvidenceAtRow[]): RelationAsOf | null {

@@ -21,13 +21,15 @@ import { sha16 } from '../digest.js';
  * claims from their *live* evidence, for exactly the ids an apply or dispose
  * touched, inside that same transaction.
  *
- * Rules are order-independent so a rebuild reproduces the same rows:
+ * Rules are meant to be order-independent so a rebuild reproduces the same rows:
  *   entity   name = highest-weight evidence (ties: earliest, then lexicographic),
  *            type = the most-read typed reading (the ontology's order breaks a
  *            tie; concept only when nothing typed was read), a person's
  *            correction over both, longest description, alias union,
  *            mention_count = distinct chunks mentioning it
- *   relation weight = SUM(evidence.weight), longest description
+ *   relation weight = SUM(evidence.weight), longest description; its cited
+ *            document = the earliest-dated that states it, then by path
+ *            (store/temporal.ts relationSource)
  *   claim    status: all-absent > disputed > fact > suspected; valid_from = MIN;
  *            valid_to = NULL if any evidence is open-ended else MAX
  * A row with zero live evidence (or a dead endpoint / subject) is tombstoned
@@ -218,11 +220,11 @@ async function foldRelations(q: Queryable, ids: string[], txTime: string, result
   const evidence = await liveEvidence(q, 'relation', ids);
   const current = await selectIn<{
     id: string; source_id: string; target_id: string; type: string; description: string; weight: number;
-    evidence_count: number; fold_sha: string; tx_to: string | null;
-  }>(q, ids, (ph) => `SELECT id, source_id, target_id, type, description, weight, evidence_count, fold_sha, tx_to FROM relations WHERE id IN (${ph})`);
+    evidence_count: number; fold_sha: string; tx_to: string | null; document_id: string | null;
+  }>(q, ids, (ph) => `SELECT id, source_id, target_id, type, description, weight, evidence_count, fold_sha, tx_to, document_id FROM relations WHERE id IN (${ph})`);
   const endpoints = [...new Set(current.flatMap((r) => [r.source_id, r.target_id]))];
   const alive = await entityLiveness(q, endpoints);
-  // the document (and passage) each relation was read from; provenance, so no part of fold_sha
+  // the document (and passage) each relation cites; provenance, so no part of fold_sha
   const docs = await scopeDocuments(q, [...evidence.values()].flatMap((rows) => rows.map((r) => r.scope_id)));
 
   for (const cur of current) {
@@ -240,8 +242,11 @@ async function foldRelations(q: Queryable, ids: string[], txTime: string, result
     }
     const foldSha = sha16([Number(folded!.weight.toFixed(3)), folded!.description, folded!.valid_from, folded!.valid_to]);
     if (!wasLive) result.reopened.relations.add(cur.id);
-    if (!wasLive || foldSha !== cur.fold_sha) result.changed.relations.add(cur.id);
     const source = relationSource(rows, docs);
+    // a page names the document: a relation that cites another now (a supporter of an earlier date, a
+    // document re-dated, a rule that picks otherwise) is planned again, though nothing the sha covers moved
+    const recited = cur.document_id !== (source?.documentId ?? null);
+    if (!wasLive || foldSha !== cur.fold_sha || recited) result.changed.relations.add(cur.id);
     await q.query(
       `UPDATE relations SET weight = $2, description = $3, evidence_count = $4, fold_sha = $5,
               valid_from = $7::timestamptz, valid_to = $8::timestamptz,

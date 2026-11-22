@@ -1,8 +1,9 @@
 import { DatabaseConfig } from '../config.js';
 import { ClaimTypeRefoldResult, claimTypesStale, refoldClaimTypes } from '../lineage/claim-types.js';
+import { refreshRelationSources, RelationSourcesResult, relationSourcesStale } from '../lineage/relation-sources.js';
 import { Backend, openBackend } from './backend.js';
 import { ensureMatchIndexes, MATCH_INDEXES, MatchIndexResult } from './grams.js';
-import { CoOccursCleanupResult, dropStoredCoOccurrence, fillRelationSources, migrate, MigrationResult, Queryable, RelationSourcesResult, SCHEMA_VERSION } from './migrations.js';
+import { CoOccursCleanupResult, dropStoredCoOccurrence, migrate, MigrationResult, Queryable, SCHEMA_VERSION } from './migrations.js';
 
 /**
  * Vector column type for the embeddings table.
@@ -101,9 +102,10 @@ export class Store implements Queryable {
    */
   public indexing: Promise<MatchIndexResult | null> = Promise.resolve(null);
   /**
-   * The batched follow-up of migration v20 (fillRelationSources): relations
-   * written before it get the document they were read from, in the background
-   * after `cleanup`; settled at once when nothing is pending.
+   * Every live relation's stored source read again (refreshRelationSources):
+   * when the rule that picks it has changed, and for relations written before
+   * v20, which have none. In the background after `cleanup`; settled at once
+   * when the stored sources already follow the rule.
    */
   public relationSources: Promise<RelationSourcesResult | null> = Promise.resolve(null);
   public readonly matchIndexes = new Set<string>();
@@ -230,13 +232,16 @@ export class Store implements Queryable {
           return null;
         });
     }
-    // relations written before v20 name their document: short batches, after the cleanup
-    this.relationSources = this.cleanup
-      .then(() => fillRelationSources(this, { stop: () => this.stopCleanup }))
-      .catch((err: unknown) => {
-        console.warn(`[knode-os] relation sources stopped: ${err instanceof Error ? err.message : String(err)}; the next open resumes it`);
-        return null;
-      });
+    // relations whose stored source follows an older rule, or was never stored (before v20), are read again:
+    // short batches, after the cleanup; a store without relations records the rule here and starts nothing
+    if (await relationSourcesStale(this)) {
+      this.relationSources = this.cleanup
+        .then(() => refreshRelationSources(this, { stop: () => this.stopCleanup }))
+        .catch((err: unknown) => {
+          console.warn(`[knode-os] relation sources stopped: ${err instanceof Error ? err.message : String(err)}; the next open resumes it`);
+          return null;
+        });
+    }
     // building the chunk index takes minutes on a large workspace; searches
     // scan without it until it is ready, and a stopped build starts over
     this.indexing = this.cleanup

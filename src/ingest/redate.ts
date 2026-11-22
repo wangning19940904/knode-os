@@ -12,7 +12,7 @@ import { ParsedMarkdown } from '../markdown.js';
 import { dateEnd, dateStart } from '../store/dates.js';
 import { Store } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
-import { toIso } from '../store/temporal.js';
+import { SOURCE_SCOPE_KINDS, toIso } from '../store/temporal.js';
 import { DocRoot } from '../types.js';
 import { docDateOf } from './docdate.js';
 
@@ -186,9 +186,11 @@ async function planScope(q: Queryable, scopeId: string, words: Words, extractor:
  * of its own frontmatter and of its stored tier-1 extraction (relative dates
  * read again from the stored words, `observed_at`, a claim stating none dated
  * by the document); and what folds from them, so its pages are re-planned and
- * the next refine supersedes by the new dates. Nothing is applied again: no
- * entity is resolved again, no scope replaced, no evidence row opened or
- * closed, and nothing anyone decided moves. A claim whose new dates make it
+ * the next refine supersedes by the new dates. The relations it supports are
+ * folded as well: which document a relation cites goes by the documents'
+ * dates. Nothing is applied again: no entity is resolved again, no scope
+ * replaced, no evidence row opened or closed, and nothing anyone decided
+ * moves. A claim whose new dates make it
  * a weekly reading of its own week keeps its id here and is left to the claim
  * re-key, which is set to visit it.
  *
@@ -267,6 +269,14 @@ export async function redateDocument(
     }
     await q.query(`UPDATE documents SET doc_date = $2::timestamptz WHERE id = $1`, [doc.docId, now]);
     touched.documents.add(doc.file);
+    // a relation cites the earliest-dated document that states it (store/temporal.ts relationSource): every
+    // relation this document supports is folded again, so the ones its new date gives or takes move with it
+    for (const r of await q.query<{ id: string }>(
+      `SELECT DISTINCT ev.target_id AS id FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
+       WHERE ev.kind = 'relation' AND ev.tx_to IS NULL AND s.kind = ANY($2::text[]) AND s.status <> 'disposed'
+         AND (s.meta->>'documentId' = $1 OR s.key = $3)`,
+      [doc.docId, [...SOURCE_SCOPE_KINDS], doc.file],
+    )) touched.relations.add(r.id);
     const fold = await foldTouched(q, touched, txTime, foldOptions(store.dataDir));
     await propagate(q, fold.changed, fold.tombstoned, txTime);
     await mark(q);

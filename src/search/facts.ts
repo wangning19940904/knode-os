@@ -1,7 +1,7 @@
 import { findLinks, tier0Known } from '../graph/concepts.js';
 import { expandGroups } from '../graph/resolve.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
-import { Params, toDateString } from '../store/temporal.js';
+import { Params, relationSourceSql, toDateString } from '../store/temporal.js';
 import { ClaimItem, SearchResult } from '../types.js';
 import { entityMatchSql, keywordTerms, termCount } from './search.js';
 
@@ -188,8 +188,7 @@ async function listRoutes(store: Store, named: string[], vector: { literal: stri
         LIMIT ${p.add(VARIANTS_CAP)})`
     : `(SELECT NULL::text AS id WHERE false)`;
   const sim = vector ? simOf(p.add(vector.literal), p.add(vector.model)) : 'NULL::float';
-  const relationPath = `(SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
-      WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL AND s.kind IN ('doc', 'tier1') ORDER BY ev.tx_from, s.key LIMIT 1)`;
+  const relationPath = relationSourceSql('r', 'path');
   const [relations, claims] = await Promise.all([
     store.query<Row>(
       `SELECT 'relation:' || r.id AS id, 0 AS via, se.name AS subject, te.name AS object, r.type,
