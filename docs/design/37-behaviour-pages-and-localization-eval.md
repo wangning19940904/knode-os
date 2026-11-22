@@ -1,6 +1,6 @@
 # 37 — Behaviour pages for code, kept true by diffs, and an evaluation that asks where a change lands
 
-Status: proposed (2026-11-22). Nothing here is built. Number 36 is taken by `36-evaluation-protocol.md` on branch `claude/kb-evaluation-analysis-f16ece`, which is not on main yet.
+Status: stage 0 built and stage 1 run (2026-11-22, branch `claude/localization-eval-a7f48b`): the gate failed — `agent-grep` scores mean F1 0.859 on 60 `plain` codex tasks, 3 under 0.5 (§11) — so stages 2 and 4 were not built. Stage 3 is a sibling branch's. Number 36 is `36-evaluation-protocol.md`, on the same branch line, not on main yet.
 
 Extends design 25 (its "Not done" list: module summaries, pinned citations), design 15 (a new study profile and page template) and design 33 (a new question family and a new report split). Changes none of their decisions.
 
@@ -166,3 +166,91 @@ Stage 3 does not depend on stages 1 and 2 passing: it is worth having for the re
 2. One base commit per repository keeps the build count at one, but later tasks apply to a tree that has moved. The 300-commit window is a guess; stage 0 should report F1 of the gold against the base tree by distance.
 3. Should a behaviour page span repositories? LiveX's do, because one team's feature crosses client and server. The agent-atlas repositories are independent projects, so the first version is one repository per page, and `repositories` is a list for later.
 4. Does the reading order help or only add steps on tasks where the index names nothing? The coverage split answers it.
+
+## 11. Results
+
+Run folder `~/knode-eval/runs/localization-20261122/` (`run.sh`, `status.sh`, `analyze.py`, `ESTIMATES.md`, `stages.log`; `stage0/` holds the drift measure). Frozen build `~/knode-eval/builds/bfe036ce70` (commit bfe036c).
+
+### Stage 0 — the pack (2026-11-22, no model)
+
+Built: the `code-localization` recipe (`src/eval/packs/code-localization.ts`, tests in `tests/eval-code-localization.test.ts`). Decisions the record left open, as built:
+
+- **Base and tip.** The tip is the clone's `origin/HEAD` as fetched; the base is the commit `window` (300) first-parent commits before it, the latest that leaves a full window. Both are recorded in `pack.json`, so the same options build the same pack.
+- **Kept files.** A touched path counts when design 25's path rules keep it; every such path must exist in the base tree, and the gold is those of them in the corpus (a file at the base that `planCodebase` leaves out as too large or generated cannot be named from the corpus). Rename detection is off (`--no-renames`): it would fetch blobs, and a rename is a delete plus a file created after the base, which the filter rejects anyway.
+- **Source file.** A code language (not prose or configuration) outside test paths (`tests/`, `__tests__`, `*_test.rs`, `*.test.ts` …). Test files touched by the commit stay in the gold.
+- **Strata.** `named`: the message holds a gold path, or a gold basename not inside a longer path or word. `symbol`: the message holds a name `extractSymbols` finds in a gold file at the base, when the name is at least four characters and either identifier-shaped (an underscore, a digit, or a capital after the first letter) or written as code (inside a backtick span, before `(` or `::`). A one-word lower-case name (`panel`, `session`) found in prose is an English word and does not count; nor does any three-character name (`new`, `run`).
+- **The question** is the message unchanged inside one fixed frame: "You have the code repository openai-codex as it was on 2026-11-17. A change to it was later described by the commit message below. Which existing files of the repository does that change modify?" The list rules ask for paths relative to the repository root, at most 20 items, matched by alias (a predicted label holding the gold path as a whole term, so `codebase/openai-codex/x.rs` and `./x.rs` both match `x.rs`'s full path) and scored by set F1.
+- **The leak rule on dates** is `pack.json` `cutoff` (the base's commit date): `validatePack` refuses a corpus document dated later, and a knode build's leak check after staging refuses a `raw/` Markdown file whose frontmatter `date` is later.
+- **Harness.** `eval run --strata plain` keeps the tasks of named strata; on a pack whose corpus is one `codebase/<repo>/`, `agent-grep` runs in the repository's own tree with the sentence "The current directory is the code repository openai-codex: its files as of one commit, without git history."
+
+| | `openai-codex` | `anomalyco-opencode` |
+| --- | --- | --- |
+| base → tip | 9a5a78925d55 (2026-11-17 05:52Z) → d4014cb19d23 (2026-11-21) | 5db3553efa5d (2026-11-17 17:37Z) → d03cb4a02420 (2026-11-21) |
+| files at the base / kept | 10,410 / 8,194 (109 MB) | 11,537 / 8,378 |
+| commits in the window → tasks | 300 → 126 | 300 → 1 |
+| named · symbol · plain | 0 · 32 · 94 | 0 · 0 · 1 |
+| rejected | too many kept files 68, a file created after the base 64, too few kept files 33, no source file 7, release 1, dependency 1 | short body 297, too many kept files 2 |
+
+**opencode does not serve.** Its pull requests are squash-merged with the title alone: 297 of the 300 commits have no body of 80 characters, and only 121 of its last 3,000 do. No base gives it 60 tasks.
+
+**Open question 1 (does the message give the answer away?).** On codex, rarely by name: no message names a gold path or basename, a quarter (32 of 126) name an identifier a gold file defines. The messages are long (median 770 characters, a "What changed / Testing" template) and written in behaviour words with configuration keys in code spans. They do describe the solution ("Escape installation directories in the generated `PATH` export"), and a description of the tests is often there, which points at test files.
+
+**Gold.** On `plain`, 2 to 15 files (median 5, mean 5.8; 21 tasks of 2 files, 21 of 9 or more); 60% of the gold files are source, 36% are tests.
+
+**Grepability** (`eval pack grepability`, terms from the message without the frame):
+
+| stratum | n | every gold file holds a rare message term | first gold file does | BM25 top 10 holds every gold file | holds the first |
+| --- | --- | --- | --- | --- | --- |
+| plain | 94 | 93% | 99% | 2% | 18% |
+| symbol | 32 | 78% | 94% | 3% | 25% |
+
+The first two columns say little here: a 770-character message has dozens of words found in at most 5% of 8,194 files, so almost any file holds one. The ranking columns are the informative ones: a lexical ranking of whole files puts the complete gold in its top ten for 2 of 94 `plain` tasks.
+
+**Open question 2 (gold against the base tree by distance).** For every first-parent commit after a base, the share of its kept touched files that exist at the base (the recall, and F1 with precision 1, of "the files at the base" as an answer), by distance; trees only (`stage0/drift.mts`, base = tip~1200, no blobs fetched):
+
+| commits after the base | codex: share at base · all at base · F1 | opencode: share · all · F1 |
+| --- | --- | --- |
+| 1–100 | 0.93 · 0.69 · 0.96 | 0.79 · 0.39 · 0.89 |
+| 101–200 | 0.86 · 0.52 · 0.92 | 0.57 · 0.08 · 0.73 |
+| 201–300 | 0.87 · 0.48 · 0.93 | 0.64 · 0.36 · 0.78 |
+| 301–400 | 0.85 · 0.49 · 0.92 | 0.48 · 0.38 · 0.64 |
+| 401–600 | 0.81–0.92 · 0.48–0.58 | 0.55–0.66 · 0.35–0.51 |
+| 601–1,200 | 0.80–0.88 · 0.43–0.49 · 0.89–0.93 | 0.50–0.70 · 0.23–0.49 · 0.67–0.83 |
+
+On codex the tree holds up: after the first hundred commits the share settles near 0.85 and does not keep falling, so the 300-commit window costs few tasks to drift (64 of 300 rejected for a file created after the base, most of them new test files). opencode moves faster (a large refactor 100–200 commits after its base). Within a 300-commit window on codex, task F1 by distance is reported with stage 1.
+
+### Stage 1 — the gate (2026-11-22): failed; stage 2 not built
+
+`agent-grep` alone, budget 20, on 60 `plain` tasks of `code-localization-openai-codex` (`--strata plain --agent-limit 60 --seed 0`), answers `spacex-aiops/gpt-6.1-sol` on the remote pool (all 60 served by workers), run directory `stage1/code-localization-openai-codex`, 09:22 to 09:35. Estimate written before it ran: 60 sessions of the record's 120 (`ESTIMATES.md`); spent 60 sessions, about 6.1M weighted tokens, no judge call (set scoring by path, model-free), no build, no embedding. A two-task pilot (`pilot/`) ran first.
+
+| | value |
+| --- | --- |
+| mean F1 | **0.859** (95% CI 0.816 to 0.897) |
+| tasks under 0.5 | **3 of 60 (5%)** |
+| F1 = 1 | 24 of 60 |
+| precision · recall | 0.892 · 0.856 |
+| commands an answer · weighted tokens an answer | 9.7 · 101,026 |
+| empty, capped, errors, leaked | 0, 0, 0, 0 |
+
+| | n | F1 |
+| --- | --- | --- |
+| 2 gold files | 14 | 0.905 |
+| 3–4 | 18 | 0.883 |
+| 5–8 | 20 | 0.826 |
+| 9–15 | 8 | 0.805 |
+| commits 1–100 after the base | 19 | 0.922 |
+| 101–200 | 22 | 0.805 |
+| 201–300 | 19 | 0.857 |
+
+**The gate: mean F1 under 0.7 and at least a third of tasks under 0.5. Both fail by a wide margin** (0.859; 5%). By §2 the pack does not separate, so behaviour pages (§3, §4, §6, §7) were not built and arms B–D did not run. Stage 4 needs stage 2's pages and did not run either.
+
+What was checked by reading, without a model:
+
+- **Scoring is clean.** All 253 matched pairs are the gold path itself, written from the repository root; no match came from one path holding another. Precision is below 1 on 22 answers, each an extra file named (usually a neighbouring test or a sibling module).
+- **It is search, not memory.** 252 of the 253 correctly named gold paths appear in the session's own commands, the heads of their outputs, or the files it touched. The PRs are dated 2026-11-17 to 2026-11-21.
+- **Why grep finds the files.** `plain` excludes names a gold file *defines*, but a codex message carries the strings the code *uses*: configuration keys, event and method names, flags, error texts, in code spans. Of the 94 `plain` messages, 61 have a code span of four characters or more, and in 46 of them a span occurs verbatim in a gold file (`features.guardianv3.message_board_in_memory`, `server/discover`, `lsof`). The first command of 24 of the 60 sessions already lists a gold path in the first 2,000 characters of its output. The agents then follow callers and the matching `_tests.rs` files, which is how they reach test files the message never names.
+- **The three tasks under 0.5** (0.40 to 0.47) are partly right, not lost: 4 of 13 files for a rollout-budget change, 6 of 8 with 5 extras for a Guardian message board, 1 of 2 for a queued-message fix.
+
+**The second repository did not run.** opencode yields one task (its squash commits have no bodies), no other clone was approved, and the result would not change the decision: for the pooled 120 tasks to pass, the second repository's 60 would need a mean F1 under 0.54 with 37 of them under 0.5, against 0.86 and 3 here with the same model and harness.
+
+**What this says about the design.** On a repository whose change requests are written by its own engineers, grep is not the weak arm: the request already holds the code's words, as every question of the protocol-36 packs did. Behaviour pages would be built on the guess §2 warned against. A test that could still show their value needs requests that do not carry the code's strings: a user's report or a product requirement (an issue body written before the change, not the commit message written after it), or the message with its code spans removed. Either is a new pack, not a rerun of this one: the issue route needs a download and a link from each commit to its issue; the redacted route rewrites the question, which §2 chose not to do.
