@@ -94,6 +94,8 @@ export interface SessionAnswer {
   lastMessage: string | null;
   /** An evaluation session (src/work/eval.ts): the worker stopped it at its step cap. */
   capped?: boolean;
+  /** An evaluation session's closing turn after its cap, as the worker ran it. */
+  closing?: 'answered' | 'no-answer' | 'used-a-tool' | 'not-run';
   /** An evaluation session: the folder it ran in and the worker's home, for the leak audit (src/eval/agent.ts). */
   cwd?: string;
   home?: string;

@@ -274,8 +274,11 @@ export interface ReportData {
   retrieval: Record<string, Record<string, Record<string, Cell>>>;
   emergence: Record<string, Record<string, Record<string, Cell>>>;
   generation: Record<string, Record<string, Record<string, Cell>>>;
-  /** `weightedTokens` and `costUsd` are means over the answers with usage on record: `unmetered` counts those stopped at their command cap before any was reported. */
-  perQuery: Record<string, Record<string, { latencyP50: number; toolCalls: number; weightedTokens: number; costUsd: number; n: number; capped: number; unmetered?: number; leaked: number; errors: number }>>;
+  /**
+   * `weightedTokens` and `costUsd` are means over the answers with usage on record: `unmetered` counts those stopped
+   * at their command cap before any was reported; `closed`, the capped ones answered in their closing turn.
+   */
+  perQuery: Record<string, Record<string, { latencyP50: number; toolCalls: number; weightedTokens: number; costUsd: number; n: number; capped: number; unmetered?: number; closed?: number; leaked: number; errors: number }>>;
   /**
    * What the agents did, per pack and agent system: tool calls per answer and
    * the programs (shell agents) or knode tools (the MCP agent) behind them,
@@ -395,13 +398,14 @@ export function buildReportData(runDir: string): ReportData {
 
   const perQuery: ReportData['perQuery'] = {};
   for (const a of answers) {
-    const p = ((perQuery[a.pack] ??= {})[a.system] ??= { latencyP50: 0, toolCalls: 0, weightedTokens: 0, costUsd: 0, n: 0, capped: 0, unmetered: 0, leaked: 0, errors: 0 });
+    const p = ((perQuery[a.pack] ??= {})[a.system] ??= { latencyP50: 0, toolCalls: 0, weightedTokens: 0, costUsd: 0, n: 0, capped: 0, unmetered: 0, closed: 0, leaked: 0, errors: 0 });
     p.n++;
     p.toolCalls += a.toolCalls;
     p.weightedTokens += a.usage.weightedTokens;
     p.costUsd += a.usage.costUsd;
     if (a.capped) p.capped++;
     if (unmeteredStop(a)) p.unmetered = (p.unmetered ?? 0) + 1;
+    if (a.capped && a.closing === 'answered') p.closed = (p.closed ?? 0) + 1;
     if (a.leaked?.length) p.leaked++;
     if (a.error) p.errors++;
   }
@@ -1321,6 +1325,8 @@ export function renderReport(d: ReportData): string {
         Object.entries(pq).sort().map(([s, p]) => [s, p.n, fmtMs(p.latencyP50), p.toolCalls.toFixed(1), fmtNum(p.weightedTokens), p.costUsd.toFixed(4), p.capped, p.leaked, p.errors])), '');
       const stopped = Object.entries(pq).filter(([, p]) => p.unmetered).sort();
       if (stopped.length) lines.push(`Stopped at the command cap before any usage was reported, an empty answer each: ${stopped.map(([s, p]) => `${s} ${p.unmetered} of ${p.n}`).join(', ')}. Their tokens are unknown and are left out of the means above; their correctness is 0, so a comparison of correctness between these systems also compares how often each was stopped.`, '');
+      const closed = Object.entries(pq).filter(([, p]) => p.closed).sort();
+      if (closed.length) lines.push(`Stopped at the command cap and answered in the closing turn (told to answer from what it had read, with no tools; docs/design/36 §5): ${closed.map(([s, p]) => `${s} ${p.closed} of ${p.n}`).join(', ')}. They count as capped; that turn's tokens are in the means above.`, '');
       const pts = Object.entries(pq).filter(([s]) => u?.[s]?.correctness);
       if (pts.length >= 2) {
         lines.push(chartBlock({ type: 'scatter', title: `${pack}: correctness vs cost per query`, x: pts.map(([s]) => s), series: [

@@ -94,7 +94,7 @@ export function usageFromCursorResult(event: unknown): CallUsage | null {
 }
 
 export interface CodexEvents {
-  /** Every turn's usage added up (a one-shot exec runs one). */
+  /** Every turn's usage added up (a one-shot exec runs one); a resumed thread's last report (see below). */
   usage: CallUsage | null;
   /** What a failed run said: an `error` event, or the `turn.failed` one. */
   error: string | null;
@@ -105,11 +105,22 @@ export interface CodexEvents {
  * `codex exec --json` prints one event per line: `thread.started`, the
  * turn's items, and `turn.completed` with its usage — or `turn.failed` /
  * `error` with the reason (a usage limit, an expired login).
+ *
+ * The usage a `turn.completed` reports is the thread's running total. In one
+ * exec that is its one turn; a `codex exec resume` of a thread starts from the
+ * total its saved session recorded (verified on codex-cli 0.171.0: a session
+ * stopped at 29,112 input tokens, resumed for one call of 17,918, reported
+ * 47,030). So a stdout that holds a thread and then its resume (an agent's
+ * closing turn, src/eval/agent.ts) counts that thread by its last report, not
+ * by the sum; distinct threads still add up.
  */
 export function readCodexEvents(stdout: string): CodexEvents {
-  const total: CallUsage = { inputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const zero = (): CallUsage => ({ inputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 });
+  const threads = new Map<string, { usage: CallUsage; resumed: boolean }>();
   let error: string | null = null;
   let threadId: string | null = null;
+  let current = { usage: zero(), resumed: false };
+  threads.set('', current);
   for (const line of stdout.split('\n')) {
     if (!line.startsWith('{')) continue;
     let event: Record<string, unknown>;
@@ -118,14 +129,24 @@ export function readCodexEvents(stdout: string): CodexEvents {
     } catch {
       continue;
     }
-    if (event.type === 'thread.started' && typeof event.thread_id === 'string') threadId = event.thread_id;
-    else if (event.type === 'turn.completed') {
+    if (event.type === 'thread.started' && typeof event.thread_id === 'string') {
+      threadId = event.thread_id;
+      const seen = threads.get(event.thread_id);
+      if (seen) seen.resumed = true;
+      else threads.set(event.thread_id, { usage: zero(), resumed: false });
+      current = threads.get(event.thread_id)!;
+    } else if (event.type === 'turn.completed') {
       const u = obj(event.usage);
-      total.inputTokens += num(u.input_tokens);
-      total.cachedInputTokens += num(u.cached_input_tokens);
-      total.cacheWriteTokens += num(u.cache_write_input_tokens);
-      total.outputTokens += num(u.output_tokens);
-      total.reasoningTokens += num(u.reasoning_output_tokens);
+      const turn: CallUsage = {
+        inputTokens: num(u.input_tokens),
+        cachedInputTokens: num(u.cached_input_tokens),
+        cacheWriteTokens: num(u.cache_write_input_tokens),
+        outputTokens: num(u.output_tokens),
+        reasoningTokens: num(u.reasoning_output_tokens),
+      };
+      // a resumed thread's report is its running total: it replaces what the thread had, never adds to it
+      if (current.resumed) current.usage = turn;
+      else for (const k of Object.keys(turn) as (keyof CallUsage)[]) current.usage[k] = (current.usage[k] ?? 0) + (turn[k] ?? 0);
     } else if (event.type === 'turn.failed') {
       const message = obj(event.error).message;
       if (typeof message === 'string' && message.trim()) error = message.trim();
@@ -134,6 +155,8 @@ export function readCodexEvents(stdout: string): CodexEvents {
       error ??= event.message.trim();
     }
   }
+  const total = zero();
+  for (const t of threads.values()) for (const k of Object.keys(total) as (keyof CallUsage)[]) total[k] = (total[k] ?? 0) + (t.usage[k] ?? 0);
   return { usage: counted(total), error, threadId };
 }
 

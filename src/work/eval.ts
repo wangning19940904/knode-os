@@ -81,6 +81,11 @@ export interface EvalSessionSpec {
   maxSteps: number;
   timeoutMs: number;
   prompt: string;
+  /**
+   * What the session is resumed with when it reaches `maxSteps` (src/eval/agent.ts CLOSING_TURN); absent or
+   * null, a worker stops it with what it had. A spec from a run before the closing turn has none.
+   */
+  closing?: string | null;
   archive: { sha256: string; bytes: number } | null;
   /** The run's MCP bridge on this machine (never sent to a worker) and the tools it may call. */
   mcp: { url: string; secret: string; tools: string[] } | null;
@@ -95,6 +100,8 @@ export interface EvalSessionAnswer {
   stderr: string;
   lastMessage: string | null;
   capped: boolean;
+  /** How a capped session's closing turn went on the worker; absent from a worker that has none (src/eval/agent.ts ClosingOutcome). */
+  closing?: 'answered' | 'no-answer' | 'used-a-tool' | 'not-run';
   /** The worker's folder and home, for the leak audit. */
   cwd: string;
   home: string;
@@ -238,6 +245,8 @@ export interface EvalSourceOptions {
 const DEFAULT_LEASE_MS = 120_000;
 const RETRY_MS = 5_000;
 const DEADLINE_GRACE_MS = 5 * 60_000;
+/** A worker's bound on a session's closing turn (worker/knode-worker.mjs EVAL_CLOSING_MS), and a minute more. */
+const CLOSING_GRACE_MS = 6 * 60_000;
 const MAX_STDOUT_BYTES = 32 * 1024 * 1024;
 const ONLINE_MS = 2 * 60_000;
 /** Failures of one piece, on any machines, after which it is stuck whatever is online. */
@@ -510,7 +519,8 @@ export class EvalSource implements WorkSource {
       id: crypto.randomUUID(),
       token: p.spec.kind === 'eval-session' && p.spec.mcp ? `kes_${crypto.randomBytes(24).toString('base64url')}` : null,
       pending: p, who, issuedAt: now, expiresAt: now + this.leaseMs,
-      deadline: now + p.spec.timeoutMs + DEADLINE_GRACE_MS,
+      // a session with a closing turn may take that turn's time beyond its own
+      deadline: now + p.spec.timeoutMs + DEADLINE_GRACE_MS + (p.spec.kind === 'eval-session' && p.spec.closing ? CLOSING_GRACE_MS : 0),
       output: [], outputBytes: 0,
     };
     this.leases.set(lease.id, lease);
@@ -526,6 +536,7 @@ export class EvalSource implements WorkSource {
     }
     const task: EvalSessionWorkTask = {
       ...base, kind: 'eval-session', sandbox: p.spec.sandbox, maxSteps: p.spec.maxSteps, timeoutMs: p.spec.timeoutMs, prompt: p.spec.prompt,
+      ...(p.spec.closing ? { closing: p.spec.closing } : {}),
       archive: p.spec.archive ? { ...p.spec.archive } : null,
       mcp: p.spec.mcp && lease.token ? { token: lease.token, tools: [...p.spec.mcp.tools] } : null,
     };
@@ -589,7 +600,7 @@ export class EvalSource implements WorkSource {
     this.keep(lease, s.output);
     const answer: EvalSessionAnswer = {
       exitCode: s.exitCode, stdout: lease.output.join(''), stderr: s.stderr, lastMessage: s.lastMessage,
-      capped: s.capped === true, cwd: s.cwd ?? '', home: s.home ?? '',
+      capped: s.capped === true, ...(s.capped === true && s.closing ? { closing: s.closing } : {}), cwd: s.cwd ?? '', home: s.home ?? '',
     };
     const failure = evalSessionFailure(answer);
     if (failure) {

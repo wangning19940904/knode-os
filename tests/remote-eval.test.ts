@@ -9,11 +9,11 @@ import { fileURLToPath } from 'node:url';
 import { serve } from '@hono/node-server';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
-import { runAgent } from '../src/eval/agent.js';
+import { CLOSING_TURN, runAgent } from '../src/eval/agent.js';
 import { Meter } from '../src/eval/meter.js';
 import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { withRemote } from '../src/eval/placement.js';
-import { PackScope, packMayLeave, RemoteEval, WaitLimitError } from '../src/eval/remote.js';
+import { agentResultOf, PackScope, packMayLeave, RemoteEval, WaitLimitError } from '../src/eval/remote.js';
 import { runEval, scoreRun } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
 import { writeReport } from '../src/eval/report.js';
@@ -574,3 +574,48 @@ describe('a run that waits for workers (docs/design/32 §3)', () => {
   }, 120_000);
 });
 
+describe('a session that reaches its cap on a worker (docs/design/36 §5, the closing turn)', () => {
+  const offer = async (spec: Record<string, unknown>) => (await (await fetch(`${base}/eval/v1/offer`, {
+    method: 'POST', headers: { authorization: `Bearer ${producerToken}`, 'content-type': 'application/json' }, body: JSON.stringify({ spec }),
+  })).text()).trim();
+  const spec = (key: string, extra: Record<string, unknown> = {}) => ({
+    kind: 'eval-session', run: 'closing', key, label: key, agent: { family: 'codex', model: 'gpt-test', effort: 'low', speed: null },
+    sandbox: 'read-only', maxSteps: 2, timeoutMs: 60_000, prompt: 'who is 林晓 STEPS=6', archive: null, mcp: null, ...extra,
+  });
+  const calls = (file: string) => fs.readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { args: string[]; stdin: string });
+
+  it('is interrupted, resumed with the run\'s closing turn through serve, and answers with both turns\' tokens', async () => {
+    for (const w of workers) await stopWorker(w);
+    const callLog = path.join(tmp, 'closing-calls.jsonl');
+    startWorker('wc', { FAKE_CODEX_LOG: callLog }, 'codex:1');
+    const outcome = JSON.parse(await offer(spec('closing-0001', { closing: CLOSING_TURN })));
+    expect(outcome).toMatchObject({ outcome: 'answered', worker: 'laptop/wc/eval-codex#1' });
+    expect(outcome.session).toMatchObject({ capped: true, closing: 'answered' });
+    const r = agentResultOf(outcome.session, { cwd: path.join(tmp, 'here'), prompt: 'p', sandbox: 'read-only', maxSteps: 2 }, { worker: outcome.worker, backend: outcome.backend, usage: outcome.usage, ms: 1 });
+    expect(r).toMatchObject({ capped: true, closing: 'answered', toolCalls: 3 });
+    expect(r.text).toMatch(/^closing turn of [0-9a-f-]{36}: You have reached your command budget/);
+    // serve read the thread's last report (the closing turn's running total), not a sum
+    expect(r.usage).toMatchObject({ inputTokens: 3000, outputTokens: 90 });
+    const [main, closing, del] = calls(callLog).filter((c) => c.args[0] !== '-p' && !c.args.includes('debug'));
+    expect(main.args).not.toContain('--ephemeral');
+    expect(closing.args.slice(0, 2)).toEqual(['exec', 'resume']);
+    expect(closing.stdin).toBe(CLOSING_TURN);
+    expect(closing.args).toContain('shell_tool');
+    expect(closing.args.some((a) => a.startsWith('mcp_servers.'))).toBe(false);
+    expect(del.args.slice(0, 2)).toEqual(['delete', '--force']);
+    expect(del.args[2]).toBe(closing.args.at(-2));
+  }, 60_000);
+
+  it('from a run before the closing turn is stopped there as it always was', async () => {
+    const callLog = path.join(tmp, 'closing-calls.jsonl');
+    fs.rmSync(callLog, { force: true });
+    const outcome = JSON.parse(await offer(spec('closing-0002')));
+    expect(outcome.session.capped).toBe(true);
+    expect(outcome.session.closing).toBeUndefined();
+    const r = agentResultOf(outcome.session, { cwd: path.join(tmp, 'here'), prompt: 'p', sandbox: 'read-only', maxSteps: 2, closing: null }, { worker: outcome.worker, backend: outcome.backend, usage: outcome.usage, ms: 1 });
+    expect(r).toMatchObject({ capped: true, text: '', usage: null });
+    const runs = calls(callLog);
+    expect(runs).toHaveLength(1);
+    expect(runs[0].args).toContain('--ephemeral');
+  }, 60_000);
+});

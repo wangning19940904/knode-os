@@ -5,6 +5,12 @@
 //                           and with CALL_MCP in the prompt real calls to the knode MCP server it was given
 //   claude -p …             the judge: every item agreed with, as the eval suite's scriptedJudge
 // FAKE_EVAL_SLOW_MS holds a session that long; FAKE_EVAL_TOKEN_FILE receives a session's MCP URL and token.
+// STEPS=<n> in a session's prompt runs n more commands, a moment apart, so a step cap's interrupt (SIGINT: no
+// turn.completed, exit 1, as codex-cli 0.171.0 does) lands among them. `codex exec resume <id> -` is a capped
+// session's closing turn: it answers from the closing prompt, reporting the thread's running total, or with
+// FAKE_CLOSING_TOOL=1 starts a command and waits to be stopped; `codex delete --force <id>` removes nothing.
+// FAKE_CODEX_LOG receives one JSON line per invocation: its arguments and what came on stdin.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -23,6 +29,9 @@ process.stdin.on('end', () => void main().catch((err) => {
 }));
 
 const USAGE = { input_tokens: 1200, cached_input_tokens: 800, output_tokens: 60, reasoning_output_tokens: 10 };
+/** What a resumed thread reports at its closing turn: the session's tokens before the stop and the turn's, together. */
+const CLOSING_TOTAL = { input_tokens: 3000, cached_input_tokens: 1000, output_tokens: 90, reasoning_output_tokens: 12 };
+const logCall = () => process.env.FAKE_CODEX_LOG && fs.appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify({ args, stdin: prompt }) + '\n');
 
 function oneShot() {
   if (prompt.includes('knowledge-graph extraction engine')) {
@@ -43,7 +52,10 @@ function oneShot() {
 }
 
 async function session(cwd, out) {
-  emit({ type: 'thread.started', thread_id: 'fake-thread' });
+  const ephemeral = args.includes('--ephemeral');
+  emit({ type: 'thread.started', thread_id: ephemeral ? 'fake-thread' : crypto.randomUUID() });
+  // Codex takes SIGINT as an interrupt: the turn is aborted, nothing more is said, and it exits 1
+  process.on('SIGINT', () => process.exit(1));
   const slow = Number(process.env.FAKE_EVAL_SLOW_MS ?? 0);
   const url = /mcp_servers\.knode\.url="?([^"]+)"?/.exec(args.find((a) => a.startsWith('mcp_servers.knode.url=')) ?? '')?.[1];
   const token = process.env.KNODE_EVAL_MCP_TOKEN;
@@ -121,7 +133,10 @@ async function session(cwd, out) {
     if (prompt.includes('PEEK_HOME')) emit({ type: 'item.started', item: { type: 'command_execution', command: 'cat ~/notes/secret.md' } });
   }
   const steps = Number(/STEPS=(\d+)/.exec(prompt)?.[1] ?? 0);
-  for (let i = 0; i < steps; i++) emit({ type: 'item.started', item: { type: 'command_execution', command: `ls ${i}` } });
+  for (let i = 0; i < steps; i++) {
+    emit({ type: 'item.started', item: { type: 'command_execution', command: `ls ${i}` } });
+    await sleep(40);
+  }
   if (slow) await sleep(slow);
   emit({ type: 'item.completed', item: { type: 'agent_message', text: answer } });
   emit({ type: 'turn.completed', usage: USAGE });
@@ -136,7 +151,28 @@ function judge() {
   process.stdout.write(JSON.stringify({ type: 'result', is_error: false, result: JSON.stringify({ verdicts }), usage: { input_tokens: 50, output_tokens: 10 } }) + '\n');
 }
 
+/** A capped session's closing turn: the thread resumed, one answer from the closing prompt (or a tool it may not use). */
+async function closingTurn(out) {
+  const thread = args[args.length - 2];
+  emit({ type: 'thread.started', thread_id: thread });
+  emit({ type: 'turn.started' });
+  if (process.env.FAKE_CLOSING_TOOL) {
+    process.on('SIGINT', () => process.exit(1));
+    emit({ type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text: 'I will read one more file.' } });
+    emit({ type: 'item.started', item: { id: 'item_1', type: 'command_execution', command: 'cat more.md', status: 'in_progress' } });
+    await sleep(20_000);
+    return;
+  }
+  const answer = `closing turn of ${thread}: ${prompt.trim().slice(0, 40)}\nFinal answer: 高级数据工程师`;
+  emit({ type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text: answer } });
+  emit({ type: 'turn.completed', usage: CLOSING_TOTAL });
+  if (out) fs.writeFileSync(out, answer);
+}
+
 async function main() {
+  logCall();
+  if (args[0] === 'delete') return void process.stdout.write(`Deleted session ${args[args.length - 1]}.\n`);
+  if (args[0] === 'exec' && args[1] === 'resume') return closingTurn(arg('--output-last-message'));
   if (args[0] === '-p') return judge();
   if (args[0] !== 'exec') throw new Error(`fake-eval-cli: unexpected ${args.join(' ')}`);
   const out = arg('--output-last-message');

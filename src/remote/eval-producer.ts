@@ -128,7 +128,9 @@ export function evalSpecOf(body: Record<string, unknown>): EvalSpec {
     if (secret.length < 16) throw new BadSpec('spec.mcp.secret required');
     mcp = { url, secret, tools };
   }
-  return { kind: 'eval-session', run, key, eligible, pool, label, agent, sandbox: 'read-only', maxSteps, timeoutMs, prompt: s.prompt, archive, mcp };
+  // the closing turn's wording, the same for every arm (src/eval/agent.ts CLOSING_TURN); a run from before sends none
+  const closing = typeof s.closing === 'string' && s.closing.trim() ? text(s.closing, 2000) : null;
+  return { kind: 'eval-session', run, key, eligible, pool, label, agent, sandbox: 'read-only', maxSteps, timeoutMs, prompt: s.prompt, ...(closing ? { closing } : {}), archive, mcp };
 }
 
 /** A run's pieces in both sources. */

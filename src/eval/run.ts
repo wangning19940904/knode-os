@@ -1278,7 +1278,7 @@ async function answerAll(
         ...(a.commands ? { commands: boundedTrace(a.commands) } : {}),
         // what each command returned, beside it (docs/design/33 D7); absent when the session's events carried none
         ...(a.commands && a.outputs?.some((o) => o) ? { outputs: boundedOutputs(a.outputs.slice(0, a.commands.length)) } : {}),
-        ...(a.capped ? { capped: true } : {}), ...(a.leaked?.length ? { leaked: a.leaked } : {}), ...(a.error ? { error: a.error } : {}),
+        ...(a.capped ? { capped: true } : {}), ...(a.capped && a.closing ? { closing: a.closing } : {}), ...(a.leaked?.length ? { leaked: a.leaked } : {}), ...(a.error ? { error: a.error } : {}),
         ...(a.error && /^cancelled:/.test(a.error) ? { cancelled: true } : {}),
         usage: meter.usage((e) => e.system === s.id && e.task === t.id, mark), ms: Date.now() - t0,
         ...placed(),

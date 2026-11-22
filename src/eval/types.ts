@@ -294,6 +294,13 @@ export interface Answer {
   outputs?: ({ text: string; chars: number; failed?: boolean } | null)[];
   /** An agent stopped at its step cap. */
   capped?: boolean;
+  /**
+   * How a capped agent's closing turn went (docs/design/36 §5): `answered`,
+   * the text is the answer it gave when told to stop; `no-answer` or
+   * `used-a-tool`, it gave none; `not-run`, it was stopped with nothing, as
+   * every capped agent was before 2026-11-22 (a worker from before still does).
+   */
+  closing?: 'answered' | 'no-answer' | 'used-a-tool' | 'not-run';
   /** An agent touched a path outside its corpus copy: the answer is void. */
   leaked?: string[];
   error?: string;

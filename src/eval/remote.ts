@@ -16,8 +16,8 @@ import { folderStamp, packFolder } from '../work/eval-archive.js';
 import { EVAL_FAMILIES, EvalSource, machineOf } from '../work/eval.js';
 import type { EvalCallSpec, EvalEligible, EvalFamily, EvalOutcome, EvalRunStatus, EvalSessionAnswer, EvalSessionSpec, EvalSlotSeen, EvalSourceOptions, EvalSpec } from '../work/eval.js';
 import type { EvalKind } from '../work/kinds.js';
-import type { AgentRunOptions, AgentRunResult } from './agent.js';
-import { AgentTrace } from './agent.js';
+import type { AgentRunOptions, AgentRunResult, ClosingOutcome } from './agent.js';
+import { AgentTrace, closingOf } from './agent.js';
 import type { LoadedPack } from './pack.js';
 import { currentPieceTag, notePlacement } from './placement.js';
 import type { PieceTag } from './placement.js';
@@ -1292,6 +1292,8 @@ export async function publishAgent(scope: PackScope, opts: AgentRunOptions, here
     maxSteps: opts.maxSteps ?? 25,
     timeoutMs: opts.timeoutMs ?? 15 * 60_000,
     prompt: eligible === 'any' ? opts.prompt : '',
+    // a worker resumes a capped session with it; one from before stops the session there, which agentResultOf reads as before
+    ...(eligible === 'any' && closingOf(opts) ? { closing: closingOf(opts) } : {}),
     archive,
     mcp,
   }, here, undefined, [opts.prompt, opts.sandbox, opts.maxSteps ?? 25, opts.label ?? null]);
@@ -1304,14 +1306,23 @@ export async function publishAgent(scope: PackScope, opts: AgentRunOptions, here
   return { ...agentResultOf(o.session, opts, { worker: o.worker, backend: o.backend, usage: o.usage, ms: Date.now() - t0 }), ...(o.pool ? { pool: o.pool } : {}) };
 }
 
-/** A worker's session parsed as `runAgentOnce` parses its own: the trace, the step cap, the leak audit (with the worker's folder and home). */
+/**
+ * A worker's session parsed as `runAgentOnce` parses its own: the trace, the
+ * step cap, the leak audit (with the worker's folder and home), the closing
+ * turn. A worker from before the closing turn kills a capped session and
+ * sends no turn after it: that reads as it always did, capped with what the
+ * stop left and no usage (`closing: 'not-run'`).
+ */
 export function agentResultOf(s: EvalSessionAnswer, opts: AgentRunOptions, at: { worker: string; backend: string; usage: CallUsage | null; ms: number }): AgentRunResult {
   // the worker's folder stands for this one: its paths are read as the local copy's, everything else as the worker's home
   const rewrite = s.cwd ? (cmd: string) => cmd.split(s.cwd).join(opts.cwd) : (cmd: string) => cmd;
   const trace = new AgentTrace({ cwd: opts.cwd, maxSteps: opts.maxSteps ?? 25, allowRoots: opts.allowRoots, home: s.home || os.homedir(), rewrite });
   for (const line of s.stdout.split('\n')) trace.line(line);
   const capped = trace.capped || s.capped;
-  const text = (s.lastMessage ?? '').trim();
+  // the closing turn is in the stream (the thread resumed); whatever it started voids its answer, whatever the worker said
+  const closing: ClosingOutcome | undefined = !capped || !closingOf(opts) ? undefined
+    : !trace.closing ? 'not-run' : trace.closingTools ? 'used-a-tool' : s.closing === 'answered' && (s.lastMessage ?? '').trim() ? 'answered' : 'no-answer';
+  const text = capped && closing && closing !== 'answered' && closing !== 'not-run' ? '' : (s.lastMessage ?? '').trim();
   // a worker's session that ended on a signal (no exit code: -1; or 128 + the signal) with nothing to show: cancelled, asked again on resume
   const killed = !capped && !text && (s.exitCode === -1 || s.exitCode === 130 || s.exitCode === 137 || s.exitCode === 143);
   const error = killed ? `cancelled: the session on ${at.worker} was killed (exit ${s.exitCode})`
@@ -1323,6 +1334,7 @@ export function agentResultOf(s: EvalSessionAnswer, opts: AgentRunOptions, at: {
     outputs: trace.outputs,
     toolCalls: trace.steps,
     capped,
+    ...(closing ? { closing } : {}),
     leaked: [...new Set(trace.leaked)],
     filesTouched: [...trace.touched],
     ms: at.ms,
