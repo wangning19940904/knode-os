@@ -13,9 +13,9 @@ import { listRecipes, recipe } from './packs/index.js';
 import { measurePack, writeMeasure } from './packs/measure.js';
 import { extendPack } from './packs/extend.js';
 import './packs/recipes.js';
-import { buildScaleData, headroomEvidence, renderScale, writeReport } from './report.js';
-import { headroomAllocation, type AgentAllocation } from './allocation.js';
-import { parseLocal, runEval, scoreRun } from './run.js';
+import { buildScaleData, headroomRecords, isAgentSystem, renderScale, writeReport } from './report.js';
+import { agentAllocationFor, describeAllocation, headroomAllocation, questionClasses, type AgentAllocation } from './allocation.js';
+import { parseLocal, planAgentSample, runEval, scoreRun } from './run.js';
 import { Meter, sumEvents } from './meter.js';
 import { RunStore } from './runstore.js';
 import { DEFAULT_SYSTEMS, expandSystems, SYSTEM_TRACKS, SYSTEMS } from './systems/index.js';
@@ -142,7 +142,7 @@ function typeNumbers(flag: string, spec: string, whole: boolean): Record<string,
  * `--agent-floor`. None: round-robin, as before (or, on a resume, what the
  * run recorded).
  */
-export function agentAllocationOption(opts: { agentWeights?: string; agentCounts?: string; agentHeadroomFrom?: string; agentFloor?: string }): AgentAllocation | undefined {
+export function agentAllocationOption(opts: { agentWeights?: string; agentCounts?: string; agentHeadroomFrom?: string; agentFloor?: string; agentSuspects?: string; agentHeadroomTypes?: string; agentHeadroomStale?: string }): AgentAllocation | undefined {
   const given = [opts.agentWeights && '--agent-weights', opts.agentCounts && '--agent-counts', opts.agentHeadroomFrom && '--agent-headroom-from'].filter(Boolean);
   if (given.length > 1) throw new Error(`${given.join(' and ')}: give one allocation`);
   let floor: number | undefined;
@@ -151,15 +151,57 @@ export function agentAllocationOption(opts: { agentWeights?: string; agentCounts
     if (!Number.isInteger(floor) || floor < 0) throw new Error('--agent-floor: a whole number of questions, 0 or more');
     if (!opts.agentWeights && !opts.agentHeadroomFrom) throw new Error('--agent-floor: with --agent-weights or --agent-headroom-from');
   }
+  if ((opts.agentSuspects !== undefined || opts.agentHeadroomTypes !== undefined || opts.agentHeadroomStale !== undefined) && !opts.agentHeadroomFrom) throw new Error('--agent-suspects, --agent-headroom-types and --agent-headroom-stale: with --agent-headroom-from');
+  let suspects: number | undefined;
+  if (opts.agentSuspects !== undefined) {
+    suspects = Number(opts.agentSuspects);
+    if (!Number.isInteger(suspects) || suspects < 0) throw new Error('--agent-suspects: a whole number of questions a pack, 0 or more');
+  }
+  const types = opts.agentHeadroomTypes;
+  if (types !== undefined && types !== 'spread' && types !== 'even') throw new Error('--agent-headroom-types: spread or even');
   if (opts.agentWeights) return { mode: 'weights', weights: typeNumbers('--agent-weights', opts.agentWeights, false), ...(floor !== undefined ? { floor } : {}) };
   if (opts.agentCounts) return { mode: 'counts', counts: typeNumbers('--agent-counts', opts.agentCounts, true) };
   if (opts.agentHeadroomFrom) {
     const from = csv(opts.agentHeadroomFrom)!.map((p) => path.resolve(p));
-    const evidence = headroomEvidence(from);
+    const { types: evidence, questions } = headroomRecords(from);
     if (!Object.keys(evidence).length) throw new Error(`--agent-headroom-from: no questions scored for two or more agent arms in ${from.join(', ')}`);
-    return headroomAllocation(evidence, { floor, from });
+    // questions reworded since the records answered them: what the records saw is of another question
+    const stale = staleTaskIds(opts.agentHeadroomStale);
+    for (const qs of Object.values(questions)) for (const id of stale) delete qs[id];
+    return headroomAllocation(evidence, { floor, from, questions, suspects, types, ...(stale.length ? { stale } : {}) });
   }
   return undefined;
+}
+
+/**
+ * `eval run --agent-sample-only`: each pack's agent sample as the run would
+ * draw it (the allocation given, or a resumed run's recorded one), with no
+ * build and no model call. The corpus is taken whole: `--fraction` other than
+ * 1 drops tasks when it is staged, and is refused here.
+ */
+function printAgentSamples(opts: Record<string, string | undefined>): void {
+  if (opts.fraction !== undefined && Number(opts.fraction) !== 1) throw new Error('--agent-sample-only: at --fraction 1 only (a fraction drops the tasks whose documents it leaves out)');
+  const before = opts.runDir ? new RunStore(path.resolve(opts.runDir)).meta() : null;
+  const allocation = agentAllocationFor(agentAllocationOption(opts) ?? null, before);
+  const suites = new Set((csv(opts.suites) as Suite[] | undefined) ?? [...SUITES]);
+  console.log(`agent sample: ${opts.agentLimit ?? 30} a pack by ${describeAllocation(allocation)}`);
+  for (const dir of csv(opts.pack)!.map(resolvePack)) {
+    const pack = loadPack(dir);
+    const docs = new Set(pack.docs.map((d) => d.path));
+    const tasks = pack.tasks.filter((t) => t.afterUpdate || t.evidence.every((e) => docs.has(e.doc)));
+    const plan = planAgentSample(pack, tasks, { suites, types: csv(opts.types), strata: csv(opts.strata), limit: opts.limit ? Number(opts.limit) : undefined, agentLimit: Number(opts.agentLimit ?? 30), seed: opts.seed ?? '0', allocation });
+    const lines = plan.lines.length ? plan.lines : [`[${pack.manifest.id}] agents answer ${plan.agentTasks.length} of ${plan.allTasks.length}: ${Object.entries(plan.byType).map(([t, c]) => `${t} ${c.taken}/${c.available}`).join(', ')}`];
+    for (const line of lines) console.log(`  ${line}`);
+  }
+}
+
+/** `--agent-headroom-stale`: task ids, comma-separated, or a file of them (one a line, `#` comments; any other words on a line are ignored). */
+function staleTaskIds(spec: string | undefined): string[] {
+  if (!spec) return [];
+  if (fs.existsSync(spec) && fs.statSync(spec).isFile()) {
+    return [...new Set(fs.readFileSync(spec, 'utf8').split('\n').map((l) => l.replace(/#.*/, '').trim().split(/[\s,]+/)[0]).filter(Boolean))].sort();
+  }
+  return [...new Set(csv(spec) ?? [])].sort();
 }
 
 /** `--agent-update-limit`: update tasks a pack for agents (none given: all of them). */
@@ -262,7 +304,7 @@ export function registerEvalCommands(program: Command): void {
     .description('check packs for what makes a benchmark measure its own artifacts (docs/design/33 §4): one-class words, ambiguous subjects, file-name answers, family minimums, duplicate questions, hop shortcuts')
     .option('--examples <n>', 'findings shown per rule', '5')
     .option('--json <file>', 'write every finding as JSON')
-    .option('--answers <runDirs>', "also check each pack's unanswerable questions against the answers of these run directories (comma-separated): one that two or more systems answered, citing the same document, is suspect — read the passage before trusting the gold")
+    .option('--answers <runDirs>', "also check each pack against the answers of these run directories (comma-separated): an unanswerable question two or more systems answered, citing the same document, and a question every agent arm (two or more) got wrong, are suspect — read the passage before trusting the gold")
     .action((dirs: string[], opts) => {
       const packs = dirs.map((d) => loadPack(resolvePack(d)));
       const results = packs.map((p) => lintPack(p));
@@ -279,12 +321,25 @@ export function registerEvalCommands(program: Command): void {
           return found.map((f) => ({ pack: p.manifest.id, run: path.resolve(dir), ...f }));
         });
       });
+      // the third: questions every agent arm of a run got wrong — wrong gold or not answerable, until a person reads them;
+      // `--agent-headroom-from` leaves the same questions out of an agent sample
+      const noneRight = (csv(opts.answers) ?? []).flatMap((dir: string) => {
+        const scores = new RunStore(path.resolve(dir)).allScores().filter((x) => x.metric === 'correctness' && x.taskId !== undefined && isAgentSystem(x.system));
+        return packs.flatMap((p) => {
+          const ids = new Set([p.manifest.id, path.basename(p.dir)]);
+          const classes = questionClasses(scores.filter((x) => ids.has(x.pack)).map((x) => ({ arm: x.system, pack: p.manifest.id, taskId: x.taskId!, taskType: x.taskType, value: x.value })))[p.manifest.id] ?? {};
+          const tasks = new Map(p.tasks.map((t) => [t.id, t]));
+          return Object.entries(classes).filter(([id, c]) => c.cls === 'wrong' && tasks.has(id)).map(([id, c]) => ({ pack: p.manifest.id, run: path.resolve(dir), task: id, type: c.type, question: tasks.get(id)!.question }));
+        });
+      });
       if (opts.answers) {
         console.log(answered.length ? `\nabstain-answered (${answered.length}): unanswerable questions a run's systems answered from one document` : '\nabstain-answered: none');
         for (const f of answered) console.log(`  ${f.pack} ${f.task}: ${f.message}\n    ${f.question}`);
+        console.log(noneRight.length ? `\nnone-right (${noneRight.length}): questions every agent arm of a run answered and got wrong — read the gold against its passage before sampling them again` : '\nnone-right: none');
+        for (const f of noneRight) console.log(`  ${f.pack} ${f.task} (${f.type}): ${f.question.slice(0, 160)}`);
       }
-      if (opts.json) fs.writeFileSync(opts.json, JSON.stringify(opts.answers ? { results, abstainAnswered: answered } : results, null, 1) + '\n');
-      if (results.some((r) => r.findings.length) || answered.length) process.exitCode = 1;
+      if (opts.json) fs.writeFileSync(opts.json, JSON.stringify(opts.answers ? { results, abstainAnswered: answered, noneRight } : results, null, 1) + '\n');
+      if (results.some((r) => r.findings.length) || answered.length || noneRight.length) process.exitCode = 1;
     });
 
   pack
@@ -361,7 +416,11 @@ export function registerEvalCommands(program: Command): void {
     .option('--agent-limit <n>', 'tasks per pack for agent systems', '30')
     .option('--agent-weights <type=w,…>', 'spread the agent tasks over task types by these weights instead of evenly, e.g. aggregate=4,timeline=3,*=1 (* = the types not named, default 1; 0 leaves a type out)')
     .option('--agent-counts <type=n,…>', 'exactly this many agent tasks of each type (at most what the pack has), e.g. aggregate=12,timeline=12,*=1 (* = the types not named, default 0); --agent-limit does not apply')
-    .option('--agent-headroom-from <records>', "derive the agent weights per pack from earlier records: run directories, report.json, scores.jsonl or a campaign.json, comma-separated — each type weighted by how far apart the agent arms' scores came on its questions (mean highest − lowest), ceiling families kept to the floor; score those records with the current list matching first (eval score), since two judge passes disagreeing on a list reads as spread between the arms")
+    .option('--agent-headroom-from <records>', "sample the agent questions by what earlier records saw: run directories, report.json, scores.jsonl or a campaign.json, comma-separated. Where the records scored the questions themselves, questions the agent arms (or one arm's repeats) scored differently come first, then questions never seen, then those every arm agreed on; questions every arm got wrong are left out and listed for audit (--agent-suspects). Never-seen questions are spread over types by how far apart the arms' scores came on the type (mean highest − lowest), ceiling families kept to the floor. Give records scored with the current grading and gold (a re-scored copy, not also its original), since a grading artifact reads as a contest and wrong gold as a suspect")
+    .option('--agent-suspects <n>', 'with --agent-headroom-from: all-wrong questions a pack\'s sample may take, after every other question (default 0)')
+    .option('--agent-headroom-types <how>', 'with --agent-headroom-from: spread never-seen questions over types by the records\' spread (spread, the default) or evenly (even: plain stratified, the per-question tiers kept)')
+    .option('--agent-headroom-stale <ids>', 'with --agent-headroom-from: questions reworded since the records answered them (task ids, comma-separated, or a file of them one a line): what the records saw of them is dropped, and they are sampled as never seen')
+    .option('--agent-sample-only', 'print each pack\'s agent sample — per type what the records saw of the questions it takes, the suspects it leaves out, and how many are expected to be contested — and stop: nothing is built and no model is called')
     .option('--agent-floor <n>', 'with --agent-weights or --agent-headroom-from: agent tasks every type gets before the weights share the rest (default 0 with weights, 1 with headroom)')
     .option('--agent-budget <n>', 'commands every answering agent is told it has and is held to (n and two more), 1 to 20 (default 20): a low budget tests whether what an arm has beside grep lets it answer in fewer steps; one budget a run directory')
     .option('--agent-update-limit <n>', 'at most n update tasks per pack for agent systems, seeded (default: all of them)')
@@ -395,6 +454,10 @@ export function registerEvalCommands(program: Command): void {
         const n = Number(opts.agentBudget);
         if (!Number.isInteger(n) || n < 1 || n > 20) throw new Error('--agent-budget: a whole number of commands, 1 to 20');
         process.env.KNODE_EVAL_AGENT_BUDGET = String(n);
+      }
+      if (opts.agentSampleOnly) {
+        printAgentSamples(opts);
+        return;
       }
       if (opts.lint !== false) {
         const gate = lintBeforeRun(csv(opts.pack)!.map(resolvePack).map((d) => loadPack(d)));

@@ -176,6 +176,77 @@ As recorded, the three knode arms were 0.04 to 0.06 above grep on `real-loong-fi
 Still open: `real-loong-finance` on its 118-question sample is now at 0.85 for every arm with 13 questions none gets right (5 comparisons, 2 trends, 2 lookups and 4 groupings not yet read against the filings), so it has little room left to separate agents; headroom allocation still draws from where every arm failed; the MuDABench corpus heads a calendar-year filer's report with the wrong year.
 
 
+### Sampling by question (2026-11-22)
+
+Headroom allocation read only per-type means of the earlier records, so it sent the sample to a type whose questions the arms had split on, and then drew that type's questions at random. On `real-loong-finance` that type was aggregation, where most of the gold was wrong. `--agent-headroom-from` now reads each question's scores, where the records have them (`scores.jsonl`, the run directories of a `campaign.json`; a `report.json` has only types). Code: `src/eval/allocation.ts` (`questionClassOf`, `SAMPLE_TIERS`, `sampleReportOf`) and `selectTasks` in `src/eval/run.ts`.
+
+**The rule.** Each question gets a class from every agent arm's answers in the records, repeats included:
+
+- *contested*: two arms scored it differently, or one arm's repeats did;
+- *all right*, or *the same partial score* from every arm;
+- *all wrong*: every answer of two or more arms scored 0. These are suspect.
+
+The sample is drawn in tiers, each by the type quotas over what the tiers before it left of `--agent-limit`, and a type's floor counts what an earlier tier gave it:
+
+1. contested questions;
+2. questions the records never saw, spread over types by the records' spread (as before) or evenly (`--agent-headroom-types even`, plain stratified);
+3. agreed questions, only when nothing else is left;
+4. all-wrong questions, only up to `--agent-suspects n` (default 0).
+
+The order inside a tier is the seeded order `selectTasks` always used, so a seed gives one sample. With no allocation flag the sample is round-robin over types, as before. `--agent-headroom-stale <ids|file>` drops what the records saw of questions reworded since (MuDABench's 14 "which three companies" questions were answered under the old wording), and they are sampled as never seen. A run of one pack is now known by its directory's name even where a copied run records the pack's path (`rescored-20261122/*/run.json` does; before this, its evidence fell back to the pooled weights).
+
+**Suspects are left out and listed, not capped.** A suspect costs a live question's sessions and cannot move a paired difference. Reading it against its passage costs no model call. With the same arms they stay dead (below), and a repaired question comes back: as seen, once its records are re-scored against the new gold, or as never seen, if it was reworded. `--agent-suspects` exists for a run whose arms are new to the records, the one case where a question every old arm missed can still be won.
+
+**Before any model is called.**
+
+- `eval run` prints each pack's sample by class, per type, with the suspects it left out and how many questions are expected to be contested: those seen contested, plus each never-seen question at its type's contested share in the records, shrunk as the weights are. It warns when fewer than half are expected to be contested, and says how lopsided a contest must be to show: with C contested of n, one arm must win (1 + 2.8/√C)/2 of them, about 2.8·√C/n on the sample's mean, counting whole questions.
+- `eval run … --agent-sample-only` prints the same and stops.
+- `run.json` (`agentSample.questions`) and the report record it.
+- `eval pack lint --answers <runs>` lists the same all-wrong questions (`none-right`) beside `abstain-answered`.
+
+Both commands, because they answer different questions. The sample report belongs to a sample (limit, seed, allocation) and is printed where the sample is drawn. The suspect list is a fact about a pack's gold against a run's answers, and goes where the other gold checks are.
+
+**Measured on the recorded data, no model called** (`questionClasses` over each run's agent arms; "dead" = all wrong in this sense: every answer of all five arms, repeats included, scored 0, which counts 41 questions on `real-loong-finance` where the Q1 reading's "none right" counted 32 aggregation questions). The recorded allocation reproduces protocol 36's 120 and 107 questions exactly.
+
+How a class carries from the campaign (4 arms) to protocol 36 (5 arms, same gold), on the 56 questions both asked:
+
+| class in the campaign | questions | same class in protocol 36 | became contested |
+| --- | --- | --- | --- |
+| contested | 11 | 9 | — |
+| all right | 27 | 25 | 2 |
+| all wrong | 17 | 14 | 3 |
+| never seen (the rest of protocol 36's samples) | 171 | — | 23 (13%); 82 all right, 65 dead |
+
+What the rule would have drawn for protocol 36 from `campaign.json`:
+
+| pack | sample | dead in it (original gold / repaired) | dead avoided | report before the run | contested in fact |
+| --- | --- | --- | --- | --- | --- |
+| `real-loong-finance`, spread | 120: aggregation 59, comparison 27, numeric 21, temporal 11, single-hop 2; 99 in protocol 36's sample | 38 of 41 / 10 of 12 | 3 (the campaign's 5 suspects; the other 2 were contested in protocol 36) | about 34 expected contested; warning | — |
+| `real-loong-finance`, even | 120, 24 or so a type; 51 not answered in protocol 36 | 19 of 41 / 9 of 12, among the 69 answered | unknown for the other 51 | about 24; warning | — |
+| protocol 36's own sample, as the report would have read it | 120 | 41 / 12 | — | about 30 expected contested; warning | 15 (original gold), 8 (repaired) |
+| `real-mudabench` | 95 of 107: the 12 suspects left out | 28 of 39 / 24 of 32 | 11 (of the 12 left out, 11 were dead in protocol 36, 3 of them since removed as unanswerable; 1 was contested) | about 18 expected contested; warning | 21 of those 95 |
+
+From the campaign's records the rule could avoid only what the campaign had seen: 30 questions a pack, and 94 of protocol 36's 120 `real-loong-finance` questions had never been asked. Its type weights still put 59 questions on aggregation, because the campaign saw 2 of its 6 aggregation questions contested, partly through the set grading fixed since. What it adds there is the warning, before any spend. The warning was right, and if anything too hopeful on `real-loong-finance`: the report would have expected about 30 contested, and protocol 36 found 15 under the original gold and 8 under the repaired. On `real-mudabench` it expected 18 and found 21 among the 95.
+
+The campaign's single calls answered every question, but they do not find dead gold. All 41 dead questions were missed by both `knode-ask` and `rag-hybrid`, and so were 47 that the agents got right or split on. They are not used.
+
+The next run, on `packs-next` with the re-scored records (`rescored-20261122/q1-b20`):
+
+| pack | old rule (type weights only) | new rule, spread | new rule, even |
+| --- | --- | --- | --- |
+| `real-loong-finance`, 120 of 620 | 91 never seen, 20 all right, 1 partial, 6 contested, 2 dead | 8 contested + 112 never seen (temporal 73, single-hop 30, aggregation 11, comparison 4, numeric 2); 12 dead listed; about 43 expected contested | 8 contested + 112 never seen (27, 24, 23, 23, 23); 12 dead listed; about 23 expected |
+| `real-mudabench`, limit 107 of 100 | all 100: 46 all right, 32 dead, 22 contested | 68: 22 contested, 46 all right; 32 dead listed | the same |
+| `real-mudabench`, the 14 reworded marked stale | — | 82: 22 contested, 14 never seen, 46 all right; 18 dead listed; about 25 expected | the same |
+
+**Argued, not measured.**
+
+- *Selecting by disagreement keeps a paired test valid.* The rule picks questions by whether the arms disagreed, not by which arm won, so under the null it is symmetric in the arms. But the estimate is a difference on contested questions, not a pack mean. A tiered sample's scores are not comparable with an unweighted run's.
+- *The expected-contested count is an upper bound where the records are thin or pooled across packs.* On `real-loong-finance` it was 2 to 4 times too high.
+- *Spread weights follow thin evidence.* Spread put 73 of 100 temporal questions in the next sample on the strength of 10 seen, 5 of them contested. With one run of records, even is the safer choice.
+- *Agreed questions earn their place only for arms new to the records.* They fill the limit last; a lower `--agent-limit` leaves them out.
+
+On these two packs, the repaired gold leaves little room for these agents. One arm must win about 79% of the contested questions on the next `real-loong-finance` sample, and 80% on `real-mudabench`, for a difference to show. The rule cannot make room that the pack does not have, but it says so before anything is spent.
+
 ## 6. The stop on 2026-11-21, and what it changed
 
 Three stages stopped early while the driver went on: `q1-b20` on both packs (after the grep, RAG and single-call arms; before the knode arms) and `q1-b3/real-mudabench` (before its first answer). `publishAgent` packed the corpus folder for every question, at once: 107 synchronous reads of a 140 MB folder, each copy kept in memory, so the run stalled, its requests to `serve` timed out half-sent (408, and one bare 400), and the harness took the timeout for a refusal and stopped the pack. The campaign had met the same and patched it at load time in its private hook; nothing of that was in the source.

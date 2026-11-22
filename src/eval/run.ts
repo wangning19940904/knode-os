@@ -16,7 +16,7 @@ import { calibrateEndpoint, checkEndpoint, endpointUnder, preferEndpoint } from 
 import { citationsIn, taskPrompt } from './prompts.js';
 import { EmbeddingBudget, QuotaGuard } from './quota.js';
 import { fileLines, recordKey, RunMeta, RunStore } from './runstore.js';
-import { agentAllocationFor, describeAllocation, sampleByType, sharesFor, typeQuotas, type AgentAllocation, type TypeShares } from './allocation.js';
+import { agentAllocationFor, describeAllocation, formatSampleReport, sampleByType, sampleReportOf, sharesFor, SAMPLE_TIERS, typeQuotas, type AgentAllocation, type TypeShares } from './allocation.js';
 import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
 import { scoreLists } from './score/lists.js';
@@ -299,6 +299,37 @@ function knodeVersion(): string {
 export function selectTasks(tasks: Task[], suites: Set<string>, limit: number | undefined, seed: string | number, shares?: TypeShares | null): Task[] {
   const pool = tasks.filter((t) => suites.has(t.suite));
   if (!shares && (!limit || pool.length <= limit)) return pool;
+  if (shares?.classes) return tieredTasks(pool, limit ?? pool.length, seed, shares);
+  return stratified(pool, limit, seed, shares);
+}
+
+/**
+ * The sample when the records saw the pack's questions (`SAMPLE_TIERS`):
+ * each tier in turn — contested, never seen, all right, the same partial
+ * score, and all wrong only up to `shares.suspects` — sampled as
+ * `stratified` samples, by the type quotas over what is left of the limit,
+ * a type's floor counting what earlier tiers gave it. The same seed gives
+ * the same sample.
+ */
+function tieredTasks(pool: Task[], limit: number, seed: string | number, shares: TypeShares): Task[] {
+  const out: Task[] = [];
+  const have = new Map<string, number>();
+  for (const tier of SAMPLE_TIERS) {
+    const left = limit - out.length;
+    if (left <= 0) break;
+    const cap = tier === 'wrong' ? Math.min(left, Math.max(0, Math.trunc(shares.suspects ?? 0))) : left;
+    const members = pool.filter((t) => (shares.classes![t.id] ?? 'unseen') === tier);
+    if (!cap || !members.length) continue;
+    for (const t of stratified(members, cap, seed, shares, have)) {
+      out.push(t);
+      have.set(t.type, (have.get(t.type) ?? 0) + 1);
+    }
+  }
+  return out;
+}
+
+/** `selectTasks` without the tiers: seeded order by type, round-robin or by the shares' quotas (`have`: what earlier tiers took). */
+function stratified(pool: Task[], limit: number | undefined, seed: string | number, shares?: TypeShares | null, have?: ReadonlyMap<string, number>): Task[] {
   const byType = new Map<string, Task[]>();
   for (const t of [...pool].sort((a, b) => seededKey(seed, a.id).localeCompare(seededKey(seed, b.id)))) {
     (byType.get(t.type) ?? byType.set(t.type, []).get(t.type)!).push(t);
@@ -309,7 +340,7 @@ export function selectTasks(tasks: Task[], suites: Set<string>, limit: number | 
     byType.set(type, interleaveStrata(list));
   }
   // an allocation fixes how many each type gives; the order stays the round-robin's
-  const quota = shares ? typeQuotas(new Map([...byType].map(([t, l]) => [t, l.length])), limit ?? pool.length, shares) : null;
+  const quota = shares ? typeQuotas(new Map([...byType].map(([t, l]) => [t, l.length])), limit ?? pool.length, shares, have) : null;
   const lists = [...byType].map(([type, l]) => (quota ? l.slice(0, quota.get(type) ?? 0) : l));
   const cap = quota ? [...quota.values()].reduce((a, b) => a + b, 0) : limit!;
   const out: Task[] = [];
@@ -324,6 +355,33 @@ export function selectTasks(tasks: Task[], suites: Set<string>, limit: number | 
     if (!added) break;
   }
   return out;
+}
+
+/**
+ * A pack's agent sample, worked out before anything is built or answered:
+ * the tasks of the run (`--types`, `--strata`, `--limit`), those agents
+ * answer (round-robin over types, or by the allocation), per type what was
+ * taken, and — when the allocation's records saw the pack's questions — the
+ * sample report (`sampleReportOf`). The lines are what `eval run` prints
+ * before its first model call, and all `eval run --agent-sample-only` does.
+ */
+export function planAgentSample(
+  pack: LoadedPack,
+  tasks: Task[],
+  o: { suites: Set<string>; types?: string[]; strata?: string[]; limit?: number; agentLimit: number; seed: string | number; allocation: AgentAllocation | null },
+) {
+  const typed = (o.types?.length ? tasks.filter((t) => o.types!.includes(t.type)) : tasks).filter((t) => !o.strata?.length || o.strata.includes(String(t.meta?.stratum ?? '')));
+  const allTasks = selectTasks(typed.filter((t) => !t.afterUpdate), o.suites, o.limit, o.seed);
+  const shares = o.allocation ? sharesFor(o.allocation, path.basename(pack.dir), pack.manifest.id) : null;
+  const agentTasks = selectTasks(allTasks, o.suites, o.agentLimit, o.seed, shares);
+  const byType = sampleByType(allTasks, agentTasks, shares);
+  const report = shares ? sampleReportOf(allTasks, agentTasks, shares) : null;
+  const lines = report
+    ? formatSampleReport(pack.manifest.id, byType, report)
+    : o.allocation
+      ? [`[${pack.manifest.id}] agents answer ${agentTasks.length} of ${allTasks.length}: ${Object.entries(byType).map(([t, c]) => `${t} ${c.taken}/${c.available}`).join(', ')}`]
+      : [];
+  return { typed, allTasks, agentTasks, shares, byType, report, lines };
 }
 
 /**
@@ -698,19 +756,18 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       for (const s of systems) (groups.get(s.group) ?? groups.set(s.group, []).get(s.group)!).push(s);
 
       const failed = new Set<string>();
-      const typed = (opts.types?.length ? staged.tasks.filter((t) => opts.types!.includes(t.type)) : staged.tasks)
-        .filter((t) => !opts.strata?.length || opts.strata.includes(String(t.meta?.stratum ?? '')));
-      const allTasks = selectTasks(typed.filter((t) => !t.afterUpdate), suites, opts.limit, seed);
+      // the agent sample: round-robin over types, or by the run's allocation (and what its records saw of each question)
+      const plan = planAgentSample(pack, staged.tasks, { suites, types: opts.types, strata: opts.strata, limit: opts.limit, agentLimit, seed, allocation });
+      const { typed, allTasks, agentTasks } = plan;
       const updateTasks = suites.has('update') ? typed.filter((t) => t.afterUpdate) : [];
-      // the agent sample: round-robin over types, or by the run's allocation
-      const shares = allocation ? sharesFor(allocation, path.basename(pack.dir), pack.manifest.id) : null;
-      const agentTasks = selectTasks(allTasks, suites, agentLimit, seed, shares);
       // the update tasks agents answer: all, or a seeded sample stratified by type (`--agent-update-limit`)
       const agentUpdates = agentUpdateLimit === null ? null : new Set(selectTasks(updateTasks, suites, agentUpdateLimit, seed).map((t) => t.id));
-      meta.agentSample!.byPack[pack.manifest.id] = sampleByType(allTasks, agentTasks, shares);
+      meta.agentSample!.byPack[pack.manifest.id] = plan.byType;
+      if (plan.report) (meta.agentSample!.questions ??= {})[pack.manifest.id] = plan.report;
       if (updateTasks.length) meta.agentSample!.updates[pack.manifest.id] = { available: updateTasks.length, taken: agentUpdates?.size ?? updateTasks.length };
       store.writeMeta(meta);
-      if (allocation) progress(`[${pack.manifest.id}] agents answer ${agentTasks.length} of ${allTasks.length}: ${Object.entries(meta.agentSample!.byPack[pack.manifest.id]).map(([t, c]) => `${t} ${c.taken}/${c.available}`).join(', ')}`);
+      for (const line of plan.lines) progress(line);
+      if (plan.report?.suspects.length) store.log('agent sample suspects', { pack: pack.manifest.id, tasks: plan.report.suspects });
       // the repeat sample: drawn from the tasks every repeated system answers (an agent answers its own subset), so pairs compare
       const repeated = systems.filter((s) => s.answers && repeatsOf(s) > 1);
       const repeatPool = repeated.some(isAgent) ? agentTasks : allTasks;
