@@ -72,14 +72,25 @@ interface DepState {
 }
 
 /** SQL for `matchesPrefixes` over `col`: one `starts_with` per prefix (a scoped sync names a few), each bound in `params`. */
-function underPrefixes(col: string, prefixes: string[], params: unknown[]): string {
+// A prefix that names a file (a watcher event, mostly) is matched by equality alone, which the indexes serve
+// (deps_input_idx for an input, deps_pkey for a page); only a folder needs starts_with, a filter on the cites range.
+function underPrefixes(col: string, prefixes: string[], params: unknown[], dataDir: string): string {
   params.push(prefixes);
   const exact = `${col} = ANY($${params.length}::text[])`;
-  const below = prefixes.map((p) => {
+  const below = prefixes.filter((p) => isFolderPrefix(dataDir, p)).map((p) => {
     params.push(`${p}/`);
     return `starts_with(${col}, $${params.length})`;
   });
   return `(${[exact, ...below].join(' OR ')})`;
+}
+
+/** A folder on disk, or a path whose last part has no extension (a folder already removed): anything else is a file. */
+function isFolderPrefix(dataDir: string, prefix: string): boolean {
+  try {
+    return fs.statSync(safePath(dataDir, prefix)).isDirectory();
+  } catch {
+    return !/\.[A-Za-z0-9]{1,8}$/.test(prefix);
+  }
 }
 
 /**
@@ -114,7 +125,7 @@ export async function citationChanges(store: Store, dataDir: string, opts: Citat
     conds.push(`dp.artifact_id = ANY($${params.length}::text[])`);
   }
   if (opts.prefixes) {
-    conds.push(`(${underPrefixes('dp.input_id', opts.prefixes, params)} OR ${underPrefixes('dp.artifact_id', opts.prefixes, params)})`);
+    conds.push(`(${underPrefixes('dp.input_id', opts.prefixes, params, dataDir)} OR ${underPrefixes('dp.artifact_id', opts.prefixes, params, dataDir)})`);
   }
   const where = conds.length ? ` AND ${conds.join(' AND ')}` : '';
   const touched = new Set(

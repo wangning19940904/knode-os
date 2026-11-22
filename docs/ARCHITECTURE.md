@@ -257,7 +257,8 @@ and the time the text last changed. The page's scope writes these rows, so `rebu
 and a sync produce the same rows. Repository cards are left out, and the
 commits of the cited repositories are kept in the scope's `meta.citedCommits`.
 Such a page is not a view: `propagate` and `reconcileViews` never mark,
-re-render or archive it. After each sync, `fileCitationRefreshes`
+re-render or archive it. After a full sync, and after a scoped one that
+applied or removed something, `fileCitationRefreshes`
 (`src/research/cited-refresh.ts`) compares the recorded hashes with the index
 and gives each agent page whose cited files changed or went one `refresh`
 suggestion, the id the entity signal uses. Its reason counts the files and
