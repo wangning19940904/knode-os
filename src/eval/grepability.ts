@@ -30,6 +30,8 @@ const ID = /\b[A-Z][A-Z0-9]*-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/g;
 
 /** The family of a task: design 33's for v3 packs (`meta.family`), the nearest one for older packs' types. */
 export function familyFor(t: Task): string {
+  // a localization pack's rows are its strata (docs/design/37 §2)
+  if (t.type === 'localization') return `localization:${String(t.meta?.stratum ?? 'plain')}`;
   const f = typeof t.meta?.family === 'string' ? t.meta.family : '';
   const v3 = ['aggregate', 'current-state', 'alias', 'hop', 'timeline', 'lookalike', 'update', 'control-exact', 'control-paraphrase', 'control-xl'];
   if (v3.includes(f)) return f;
@@ -61,11 +63,14 @@ export function grepability(pack: LoadedPack, share = 0.05): GrepResult {
   const N = pack.docs.length;
   const limit = Math.max(1, Math.floor(N * share));
   const aliasStrings = [...new Set(pack.aliases.flatMap((a) => a.aliases).filter((s) => s.length >= 2))].sort((a, b) => b.length - a.length);
+  // the request itself: a localization task's commit message without the frame every task shares
+  const askOf = (t: Task) => (typeof t.meta?.message === 'string' ? t.meta.message : t.question);
   const termsOf = (t: Task): string[] => {
     const l = lang(t);
-    const words = [...lexicalTokens(l, t.question)].filter((x) => l === 'en' || !ZH_FUNCTION.test(x));
-    const names = aliasStrings.filter((s) => t.question.includes(s));
-    const ids = t.question.match(ID) ?? [];
+    const q = askOf(t);
+    const words = [...lexicalTokens(l, q)].filter((x) => l === 'en' || !ZH_FUNCTION.test(x));
+    const names = aliasStrings.filter((s) => q.includes(s));
+    const ids = q.match(ID) ?? [];
     return [...new Set([...words, ...names, ...ids])];
   };
   const tasks = pack.tasks;
@@ -103,7 +108,7 @@ export function grepability(pack: LoadedPack, share = 0.05): GrepResult {
     row.n++;
     if (gold.length && gold.every((d) => narrow.some((x) => holds(d, x, l)))) row.all++;
     if (first && narrow.some((x) => holds(first, x, l))) row.first++;
-    const top = new Set(bm25.search(t.question, 10).map((h) => h.item));
+    const top = new Set(bm25.search(askOf(t), 10).map((h) => h.item));
     if (gold.length && gold.every((d) => top.has(d))) row.tAll++;
     if (first && top.has(first)) row.tFirst++;
   }

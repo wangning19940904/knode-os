@@ -357,6 +357,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--judge-chain <chain>', 'budgeted chain for the judge, e.g. anthropic-api:100,codex-cli')
     .option('--limit <n>', 'tasks per pack (stratified by type)')
     .option('--types <list>', `only these task types, comma-separated (e.g. aggregate,timeline,contradiction,profile,deep-hop,update)`)
+    .option('--strata <list>', "only tasks of these strata (`meta.stratum`), comma-separated (e.g. plain: a code localization pack's requests that name no file and no identifier)")
     .option('--agent-limit <n>', 'tasks per pack for agent systems', '30')
     .option('--agent-weights <type=w,…>', 'spread the agent tasks over task types by these weights instead of evenly, e.g. aggregate=4,timeline=3,*=1 (* = the types not named, default 1; 0 leaves a type out)')
     .option('--agent-counts <type=n,…>', 'exactly this many agent tasks of each type (at most what the pack has), e.g. aggregate=12,timeline=12,*=1 (* = the types not named, default 0); --agent-limit does not apply')
@@ -446,6 +447,7 @@ export function registerEvalCommands(program: Command): void {
           if (unknown.length) throw new Error(`unknown task types: ${unknown.join(', ')} (known: ${TASK_TYPES.join(', ')})`);
           return types as TaskType[] | undefined;
         })(),
+        strata: csv(opts.strata),
         agentLimit: Number(opts.agentLimit),
         agentAllocation: agentAllocationOption(opts),
         agentUpdateLimit: agentUpdateLimitOption(opts),

@@ -1,3 +1,4 @@
+import { registerCodeLocalizationRecipe } from './code-localization.js';
 import { registerFinanceRecipes } from './finance.js';
 import { registerLawRecipes } from './law.js';
 import { registerLiteratureRecipes } from './literature.js';
@@ -24,3 +25,4 @@ registerFinanceRecipes();
 registerPublicRecipes();
 registerReportRecipes();
 registerRealDocRecipes();
+registerCodeLocalizationRecipe();

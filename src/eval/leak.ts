@@ -75,8 +75,46 @@ export function leakedFiles(ws: string, packDir: string): Leak[] {
   return leaks;
 }
 
-/** Throw when the workspace holds a gold, holdout or task file of the pack: the build or batch fails. */
-export function assertNoLeak(ws: string, packDir: string, when: string): void {
+/** The frontmatter `date` of a Markdown file, from its first 4 KB; null without one. */
+function frontmatterDate(abs: string): string | null {
+  const fd = fs.openSync(abs, 'r');
+  try {
+    const buf = Buffer.alloc(4096);
+    const head = buf.subarray(0, fs.readSync(fd, buf, 0, buf.length, 0)).toString('utf8');
+    const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(head);
+    const m = fm && /^date:\s*["']?([0-9][0-9T:.+\-Z ]*?)["']?\s*$/m.exec(fm[1]);
+    return m ? m[1] : null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Source documents of a workspace dated after `cutoff` (docs/design/37 §2): Markdown under `raw/` whose
+ * frontmatter `date` is later. A code localization pack's corpus is a repository at its base commit, so
+ * anything later — a newer card, release notes, a changelog — would tell an agent what changed next.
+ */
+export function datedAfter(ws: string, cutoff: string): { file: string; date: string }[] {
+  const limit = Date.parse(cutoff);
+  if (!Number.isFinite(limit)) return [];
+  const out: { file: string; date: string }[] = [];
+  for (const f of walk(path.join(ws, 'raw'))) {
+    if (!f.rel.endsWith('.md')) continue;
+    const d = frontmatterDate(f.abs);
+    if (d && Date.parse(d) > limit) out.push({ file: `raw/${f.rel}`, date: d });
+  }
+  return out;
+}
+
+/**
+ * Throw when the workspace holds a gold, holdout or task file of the pack, or (with `cutoff`) a source
+ * document dated after the pack's cutoff: the build or batch fails.
+ */
+export function assertNoLeak(ws: string, packDir: string, when: string, cutoff?: string): void {
+  if (cutoff) {
+    const late = datedAfter(ws, cutoff);
+    if (late.length) throw new Error(`documents dated after the pack's cutoff ${cutoff} are in the workspace ${when} (docs/design/37 §2): ${late.slice(0, 5).map((l) => `${l.file} (${l.date})`).join(', ')}${late.length > 5 ? ', …' : ''}`);
+  }
   const leaks = leakedFiles(ws, packDir);
   if (!leaks.length) return;
   const shown = leaks.slice(0, 5).map((l) => `${l.file} (= ${l.matches})`).join(', ');

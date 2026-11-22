@@ -217,7 +217,7 @@ export function lintPack(pack: LoadedPack): LintResult {
       const linked = corpus.paths.some((p) => p.split('/').some((s) => forms.includes(s) || forms.includes(s.replace(/\.[a-z]+$/, ''))) && [...toks].some((tok) => p.includes(tok)));
       if (linked) add('file-names', `its answer "${forms.find((f) => segments.has(f))}" is a path segment beside a word of the question`, t.id);
     }
-    if (t.scoring === 'set' && t.items?.length && t.items.every((it) => [it.label, ...it.aliases].some((x) => segments.has(x)))) add('file-names', 'every gold item is a path segment', t.id);
+    if (t.scoring === 'set' && t.type !== 'localization' && t.items?.length && t.items.every((it) => [it.label, ...it.aliases].some((x) => segments.has(x)))) add('file-names', 'every gold item is a path segment', t.id);
     if (t.scoring === 'count' && t.answer) {
       const toks = [...tokensOf.get(t.id)!];
       // the folder's own name, not a parent's: "周报" in a question names every weekly folder at once

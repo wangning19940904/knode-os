@@ -36,7 +36,8 @@ const LIST_RULES = (task: Task) => {
     structured: 'one item per group the question asks for (a team, a quarter, a person, a week), each label naming the group and its exact figure — every group, nothing else',
     connection: 'one item per other thing that is the same, by its ID or name — every one the documents support',
     lookalike: 'one item per thing asked for, by its ID or name — only those of the entity the question names',
-  }[task.type as 'aggregate' | 'timeline' | 'contradiction' | 'profile' | 'structured' | 'connection' | 'lookalike'] ?? 'one item per thing asked for';
+    localization: 'one item per existing file the change modifies, its label the file\'s path relative to the repository root (src/app.ts, not codebase/<repo>/src/app.ts) — every file that has to change, and no others',
+  }[task.type as 'aggregate' | 'timeline' | 'contradiction' | 'profile' | 'structured' | 'connection' | 'lookalike' | 'localization'] ?? 'one item per thing asked for';
   const shape = task.list?.ordered
     ? '{"items":[{"label":"<item>","date":"YYYY-MM-DD","confidence":<0-1>,"evidence":["<path>", …]}, …]}'
     : '{"items":[{"label":"<item>","confidence":<0-1>,"evidence":["<path>", …]}, …]}';

@@ -37,6 +37,8 @@ export const TASK_TYPES = [
   'paraphrase',
   // design 33 §3: an entity asked by a name the corpus states once and then drops (an old name, a nickname, a code)
   'alias',
+  // design 37 §2: a change request (a commit message); the answer is the files the change touches
+  'localization',
 ] as const;
 export type TaskType = (typeof TASK_TYPES)[number];
 
@@ -66,7 +68,7 @@ export const SEPARATION_TASK_TYPES: readonly TaskType[] = ['stale', 'lookalike',
  */
 export const SCORINGS = ['judge', 'exact', 'count', 'keypoints', 'set', 'label', 'choice', 'abstain', 'value'] as const;
 
-export const DOMAINS = ['research', 'medicine', 'law', 'finance', 'literature', 'personal', 'synthetic', 'public', 'fixture'] as const;
+export const DOMAINS = ['research', 'medicine', 'law', 'finance', 'literature', 'personal', 'synthetic', 'public', 'code', 'fixture'] as const;
 
 export const SourceRecordSchema = z.object({
   url: z.string(),
@@ -95,6 +97,12 @@ export const PackManifestSchema = z.object({
    * (`meta.family`) and per stratum (`meta.stratum`, the hops' lengths).
    */
   lint: z.object({ families: z.record(z.string(), z.number()).default({}), strata: z.record(z.string(), z.number()).default({}) }).optional(),
+  /**
+   * Nothing dated after this (ISO 8601) may enter a build (docs/design/37 §2, the leak rule): a code
+   * localization pack's base commit date. `validatePack` refuses a corpus document dated later, and the
+   * leak check a workspace document whose frontmatter `date` is later.
+   */
+  cutoff: z.string().optional(),
 });
 export type PackManifest = z.infer<typeof PackManifestSchema>;
 
