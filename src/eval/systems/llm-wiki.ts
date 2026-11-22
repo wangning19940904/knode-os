@@ -104,6 +104,8 @@ async function buildWiki(env: SystemEnv, perSession: number): Promise<{ notes: R
       model: env.models.model,
       effort: env.models.buildEffort,
       maxSteps: 80,
+      // a builder has nothing to answer: at its cap it stops with what it wrote
+      closing: null,
       timeoutMs: 30 * 60_000,
       prompt: INGEST_PROMPT(files),
     });
@@ -161,7 +163,7 @@ export function llmWiki(): SystemUnderTest {
           prompt: `${AGENT_BRIEF('The current directory is a wiki compiled from the documents: start from index.md. The source documents themselves are not here; pages cite them as raw/<path> — cite those paths.')}\n\n${prompt}`,
         });
         recordAgent(env.meter, { system: 'agent-wiki', stage: 'agent', task: task.id }, env.models.model, r);
-        return { text: r.text, citations: citationsIn(r.text, new Set(env.staged.docs.map((d) => d.path))), toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
+        return { text: r.text, citations: citationsIn(r.text, new Set(env.staged.docs.map((d) => d.path))), toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, closing: r.closing, leaked: r.leaked, error: r.error };
       } finally {
         copy.cleanup();
       }
@@ -194,7 +196,7 @@ export function llmWiki(): SystemUnderTest {
         fs.cpSync(wikiDir(env), path.join(root, 'wiki'), { recursive: true });
         fs.writeFileSync(path.join(root, 'AGENTS.md'), WIKI_SCHEMA + '\n');
         await env.quota.wait();
-        const r = await runAgent({ cwd: root, sandbox: 'workspace-write', model: env.models.model, effort: env.models.buildEffort, maxSteps: 80, timeoutMs: 30 * 60_000, prompt: INGEST_PROMPT(files) });
+        const r = await runAgent({ cwd: root, sandbox: 'workspace-write', model: env.models.model, effort: env.models.buildEffort, maxSteps: 80, closing: null, timeoutMs: 30 * 60_000, prompt: INGEST_PROMPT(files) });
         recordAgent(env.meter, { system: 'llm-wiki', stage: 'update' }, env.models.model, r);
         // a cancelled session leaves the wiki as it was, and the update for a resume
         if (r.cancelled) throw new Error(r.error ?? 'cancelled: the update session');
@@ -251,7 +253,7 @@ export function llmWikiSources(): SystemUnderTest {
         recordAgent(env.meter, { system: 'agent-wiki-sources', stage: 'agent', task: task.id }, env.models.model, r);
         const docs = new Set(env.staged.docs.map((d) => d.path));
         const opened = r.filesTouched.filter((f) => f.startsWith('raw/')).map((f) => f.slice('raw/'.length)).filter((f) => docs.has(f));
-        return { text: r.text, citations: citationsIn(r.text, docs), retrieved: [...new Set(opened)], toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
+        return { text: r.text, citations: citationsIn(r.text, docs), retrieved: [...new Set(opened)], toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, closing: r.closing, leaked: r.leaked, error: r.error };
       } finally {
         copy.cleanup();
       }

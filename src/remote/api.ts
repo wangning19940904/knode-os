@@ -397,6 +397,8 @@ export function mountRemoteApi(app: Hono<any>, deps: RemoteApiDeps): void {
           lastMessage: typeof v.lastMessage === 'string' ? text(v.lastMessage, 2 * 1024 * 1024) : null,
           // an evaluation session's: stopped at its step cap, and where it ran (for the leak audit)
           ...(v.capped === true ? { capped: true } : {}),
+          // and how its closing turn went (a worker from before the closing turn sends none)
+          ...(v.capped === true && ['answered', 'no-answer', 'used-a-tool', 'not-run'].includes(String(v.closing)) ? { closing: v.closing as 'answered' | 'no-answer' | 'used-a-tool' | 'not-run' } : {}),
           ...(typeof v.cwd === 'string' ? { cwd: text(v.cwd, 1024) } : {}),
           ...(typeof v.home === 'string' ? { home: text(v.home, 1024) } : {}),
         };

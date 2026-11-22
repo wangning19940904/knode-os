@@ -56,6 +56,8 @@ function mcpCalls() {
 
 process.stdin.on('end', async () => {
   const emit = (e) => process.stdout.write(JSON.stringify(e) + '\n');
+  // a saved session removed when it is over (src/eval/agent.ts): nothing to remove here
+  if (args[0] === 'delete') return void process.stdout.write(`Deleted session ${args[args.length - 1]}.\n`);
   emit({ type: 'thread.started', thread_id: 'fake-thread' });
   // FAKE_CODEX_SESSION_MS: a session takes this long, as an agent thinking would; FAKE_CODEX_SESSION_LOG gets its start and end
   const sessionLog = process.env.FAKE_CODEX_SESSION_LOG;

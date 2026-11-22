@@ -201,7 +201,7 @@ export function agentRag(): SystemUnderTest {
         recordAgent(env.meter, { system: 'agent-rag', stage: 'agent', task: task.id }, env.models.model, r);
         const docs = new Set(env.staged.docs.map((d) => d.path));
         const retrieved = [...new Set([...r.filesTouched, ...searchedDocuments(r.outputs, docs)])];
-        return { text: r.text, retrieved, toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
+        return { text: r.text, retrieved, toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, closing: r.closing, leaked: r.leaked, error: r.error };
       } finally {
         copy.cleanup();
       }

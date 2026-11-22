@@ -89,7 +89,7 @@ export function agentGrep(): SystemUnderTest {
           prompt: `${armBrief(repo ? GREP_HAS_REPOSITORY(repo) : GREP_HAS)}\n\n${prompt}`,
         });
         recordAgent(env.meter, { system: 'agent-grep', stage: 'agent', task: task.id }, env.models.model, r);
-        return { text: r.text, retrieved: repo ? r.filesTouched.map((f) => `codebase/${repo}/${f}`) : r.filesTouched, toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
+        return { text: r.text, retrieved: repo ? r.filesTouched.map((f) => `codebase/${repo}/${f}`) : r.filesTouched, toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, closing: r.closing, leaked: r.leaked, error: r.error };
       } finally {
         copy.cleanup();
       }

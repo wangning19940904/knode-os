@@ -1194,10 +1194,11 @@ function runSessionProcess(cmd, argv, stdin, cwd, env, timeout, onStdout) {
   });
   return {
     done,
-    kill() {
+    /** SIGTERM by default; an eval session at its cap gets SIGINT, Codex's interrupt, which keeps its tokens so far. */
+    kill(signal = 'SIGTERM') {
       try {
-        child?.kill('SIGTERM');
-        setTimeout(() => child?.kill('SIGKILL'), 5_000).unref?.();
+        child?.kill(signal);
+        setTimeout(() => child?.kill('SIGKILL'), signal === 'SIGINT' ? 10_000 : 5_000).unref?.();
       } catch {
         // gone already
       }
@@ -1388,7 +1389,13 @@ function checkEvalSession(task, family) {
     if (!tools.length || tools.length > 64 || !tools.every((t) => /^[a-z][a-z0-9_]{0,63}$/.test(t))) return fail('its tool list is not one');
     mcp = { token: task.mcp.token, tools, url: `${base}/eval-sessions/${encodeURIComponent(task.id)}/mcp` };
   }
-  return { session: { ...a, id: task.id, maxSteps, prompt: task.prompt, archive, mcp } };
+  // the turn a capped session is resumed with for its answer (src/eval/agent.ts CLOSING_TURN); absent: a run from before
+  let closing = null;
+  if (task.closing != null) {
+    if (typeof task.closing !== 'string' || !task.closing.trim() || task.closing.length > 2000) return fail('its closing turn is not one');
+    closing = task.closing;
+  }
+  return { session: { ...a, id: task.id, maxSteps, prompt: task.prompt, closing, archive, mcp } };
 }
 
 /* An archive (a copy of src/work/eval-archive.ts): gzip over `KPA1\n`, then per file a JSON line {p, n} and its bytes. */
@@ -1518,7 +1525,9 @@ async function runEvalCall(call, family, report) {
 /** The `codex exec` of an eval session, built from its checked fields (src/eval/agent.ts agentArgs). */
 function evalSessionCommand(sess, cwd, out, pinned) {
   const argv = [
-    'exec', '--ignore-user-config', '--ephemeral', '-c', 'features.plugins=false', '-c', 'features.apps=false', '-c', 'analytics.enabled=false',
+    // a session with a closing turn is saved, since only a saved one resumes; nothing learns from it, and it is deleted
+    'exec', '--ignore-user-config', ...(sess.closing ? ['-c', 'memories.generate_memories=false'] : ['--ephemeral']),
+    '-c', 'features.plugins=false', '-c', 'features.apps=false', '-c', 'analytics.enabled=false',
     ...(pinned ? ['-c', `model_catalog_json=${JSON.stringify(pinned)}`] : []),
     '-c', 'web_search="disabled"', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', cwd,
     '--output-last-message', out, '--json', '--model', sess.agent.model,
@@ -1535,6 +1544,28 @@ function evalSessionCommand(sess, cwd, out, pinned) {
   }
   argv.push('-');
   return { bin: EVAL_FAMILIES.codex(), argv, env: sess.mcp ? { KNODE_EVAL_MCP_TOKEN: sess.mcp.token } : {} };
+}
+
+/** A Codex thread id as it may go back on a command line (src/eval/agent.ts THREAD_ID_RE). */
+const THREAD_ID_RE = /^[0-9A-Za-z][0-9A-Za-z_-]{7,127}$/;
+/** The closing turn is one model call; this bounds a hung one (src/eval/agent.ts CLOSING_TIMEOUT_MS). */
+const EVAL_CLOSING_MS = 5 * 60_000;
+
+/**
+ * The closing turn of a capped eval session (src/eval/agent.ts closingArgs): the thread resumed with no shell and no
+ * MCP server, the closing prompt on stdin.
+ */
+function evalClosingCommand(sess, threadId, out, pinned) {
+  const argv = [
+    'exec', 'resume', '--ignore-user-config', '-c', 'memories.generate_memories=false',
+    '-c', 'features.plugins=false', '-c', 'features.apps=false', '-c', 'analytics.enabled=false',
+    ...(pinned ? ['-c', `model_catalog_json=${JSON.stringify(pinned)}`] : []),
+    '-c', 'web_search="disabled"', '-c', 'sandbox_mode="read-only"', '--disable', 'shell_tool', '--skip-git-repo-check',
+    '--output-last-message', out, '--json', '--model', sess.agent.model,
+    ...(sess.agent.effort ? ['-c', `model_reasoning_effort="${sess.agent.effort}"`] : []),
+    threadId, '-',
+  ];
+  return { bin: EVAL_FAMILIES.codex(), argv, env: {} };
 }
 
 /** An eval slot: lease the run's calls (and, on codex, its sessions), run each, hand back the raw result. */
@@ -1628,6 +1659,10 @@ async function evalSlot(slot, n) {
       let steps = 0;
       let capped = false;
       let lineBuf = '';
+      // the session's thread, and whether its closing turn (the thread resumed) started anything but a message
+      let thread = null;
+      let inClosing = false;
+      let closingTool = false;
       const onLine = (line) => {
         if (!line.startsWith('{')) return;
         let ev;
@@ -1636,11 +1671,24 @@ async function evalSlot(slot, n) {
         } catch {
           return;
         }
+        if (ev.type === 'thread.started' && typeof ev.thread_id === 'string') {
+          thread ??= ev.thread_id;
+          return;
+        }
         if (ev.type !== 'item.started' || !ev.item) return;
+        if (inClosing) {
+          // the closing turn has nothing to run: whatever it starts ends it with no answer
+          if (ev.item.type !== 'agent_message' && ev.item.type !== 'reasoning' && !closingTool) {
+            closingTool = true;
+            proc?.kill('SIGINT');
+          }
+          return;
+        }
         if (ev.item.type === 'command_execution' || ev.item.type === 'mcp_tool_call') steps++;
         if (steps > sess.maxSteps && !capped) {
           capped = true;
-          proc?.kill();
+          // with a closing turn, an interrupt (the turn's tokens are kept with the saved session); without, the old stop
+          proc?.kill(sess.closing ? 'SIGINT' : 'SIGTERM');
         }
       };
       let renewing = Promise.resolve();
@@ -1666,6 +1714,7 @@ async function evalSlot(slot, n) {
       const renewTimer = setInterval(() => void renewOnce(), SESSION_RENEW_MS);
       let result = null;
       let setupError = null;
+      let closingOutcome = null;
       try {
         if (sess.archive) {
           const gzip = await evalArchive(sess.archive.sha256);
@@ -1697,13 +1746,45 @@ async function evalSlot(slot, n) {
           pendingOut += cutEvalEvent(lineBuf);
           lineBuf = '';
         }
-        if (!pinned) await refreshCatalog(catalog);
         result.lastMessage = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : null;
+        if (capped && sess.closing) {
+          // the closing turn: the same thread resumed for its answer, its lines sent back after the session's
+          closingOutcome = 'not-run';
+          result.lastMessage = null;
+          if (thread && THREAD_ID_RE.test(thread) && !lost && !stopping) {
+            inClosing = true;
+            const closingOut = path.join(dir, 'closing.txt');
+            const c = evalClosingCommand(sess, thread, closingOut, pinned);
+            proc = runSessionProcess(c.bin, c.argv, sess.closing, cwd, c.env, EVAL_CLOSING_MS, (text) => {
+              lineBuf += text;
+              let nl;
+              while ((nl = lineBuf.indexOf('\n')) >= 0) {
+                const line = lineBuf.slice(0, nl);
+                onLine(line);
+                pendingOut += cutEvalEvent(line) + '\n';
+                lineBuf = lineBuf.slice(nl + 1);
+              }
+            });
+            const closed = await proc.done;
+            if (lineBuf) {
+              onLine(lineBuf);
+              pendingOut += cutEvalEvent(lineBuf);
+              lineBuf = '';
+            }
+            const said = fs.existsSync(closingOut) ? fs.readFileSync(closingOut, 'utf8') : '';
+            closingOutcome = closingTool ? 'used-a-tool' : said.trim() ? 'answered' : 'no-answer';
+            if (closingOutcome === 'answered') result.lastMessage = said;
+            if (closed.code !== 0 && closingOutcome !== 'answered') log(`${identity.worker}: ${label}: its closing turn ended with ${closed.code}: ${closed.stderr.trim().split('\n').pop() ?? ''}`.slice(0, 400));
+          }
+        }
+        if (!pinned) await refreshCatalog(catalog);
       } catch (err) {
         setupError = err instanceof Error ? err.message : String(err);
       } finally {
         clearInterval(renewTimer);
         fs.rmSync(dir, { recursive: true, force: true });
+        // a saved session leaves nothing in this machine's Codex home
+        if (sess.closing && thread && THREAD_ID_RE.test(thread)) await run(EVAL_FAMILIES.codex(), ['delete', '--force', thread], '', os.tmpdir(), 30_000).catch(() => {});
       }
       await renewing;
       if (lost || stopping) {
@@ -1716,7 +1797,7 @@ async function evalSlot(slot, n) {
         ? { ok: false, error: setupError ?? result.stderr.trim().split('\n').pop(), kind: setupError ? classify(setupError) === 'transient' ? 'transient' : 'fatal' : 'fatal', model: `codex:${sess.agent.model}` }
         : {
           ok: true, text: '', model: `codex:${sess.agent.model}`,
-          session: { exitCode: result.code, output: pendingOut, stderr: result.stderr.slice(-STDERR_KEEP), lastMessage: result.lastMessage, capped, cwd, home: os.homedir() },
+          session: { exitCode: result.code, output: pendingOut, stderr: result.stderr.slice(-STDERR_KEEP), lastMessage: result.lastMessage, capped, ...(closingOutcome ? { closing: closingOutcome } : {}), cwd, home: os.homedir() },
         };
     }
     if (stopping && !outcome.ok) break;

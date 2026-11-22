@@ -3,7 +3,7 @@ import type { EvalRootPlacement } from '../root.js';
 import type { EmbeddingProvider } from '../../ingest/embeddings.js';
 import { ChatMessage, LlmClient } from '../../llm/client.js';
 import type { CallUsage } from '../../llm/usage.js';
-import type { AgentRunResult } from '../agent.js';
+import type { AgentRunResult, ClosingOutcome } from '../agent.js';
 import { formatTag, Meter, MeterTag } from '../meter.js';
 import type { LoadedPack, StagedCorpus } from '../pack.js';
 import type { QuotaGuard } from '../quota.js';
@@ -57,6 +57,8 @@ export interface SystemAnswer {
   /** What each of `commands` returned: its head and full length (src/eval/trace.ts); bounded with them. */
   outputs?: (ToolOutput | null)[];
   capped?: boolean;
+  /** How a capped agent's closing turn went (src/eval/agent.ts). */
+  closing?: ClosingOutcome;
   leaked?: string[];
   error?: string;
 }

@@ -139,6 +139,8 @@ export interface EvalSessionWorkTask extends TaskBase {
   maxSteps: number;
   timeoutMs: number;
   prompt: string;
+  /** What the session is resumed with when it reaches `maxSteps`; absent, it is stopped there (a run from before). */
+  closing?: string;
   archive: { sha256: string; bytes: number } | null;
   mcp: { token: string; tools: string[] } | null;
 }

@@ -157,7 +157,7 @@ As recorded, the three knode arms were 0.04 to 0.06 above grep on `real-loong-fi
 
 ### Fixed, and the run read again (2026-11-22)
 
-- **Grading** (de7b6c1): a field-matched entry that names several gold items of one class counts as that many; a class may be named short ("— high" for "high liabilities") when the label holds that one short name and no other outside the company's name; "this group is empty" is not an item; a grouping question now says how to write its items. A stopped session's tokens are null, not 0, and the report says how many were stopped. It is still not asked for its answer: that needs the workers' code, and its stop is recorded as its own outcome instead.
+- **Grading** (de7b6c1): a field-matched entry that names several gold items of one class counts as that many; a class may be named short ("— high" for "high liabilities") when the label holds that one short name and no other outside the company's name; "this group is empty" is not an item; a grouping question now says how to write its items. A stopped session's tokens are null, not 0, and the report says how many were stopped. It is still not asked for its answer: that needs the workers' code, and its stop is recorded as its own outcome instead. (It is now: "The closing turn" below.)
 - **Gold.** Every company the five arms placed against the gold (84, in 29 questions) was read again in its filing by auditors that saw neither the gold nor the answers, each reading with its line and unit, each quoted line checked at its line number. 69 contradict the gold and agree with the arms, 14 confirm it (one question, whose gold lacked a fifteenth company the question lists), 1 is ambiguous. `~/knode-eval/packs-next/real-loong-finance` (version 2): 62 companies moved in 27 questions, one added, 4 questions removed. `~/knode-eval/packs-next/real-mudabench` (version 2): of the 21 suspect questions, 7 were audited and none can be answered as the gold has it from the corpus supplied (a calendar-year filer's report is filed under the following year; two reports lost their Chinese text; "inventory intensity" and "other business revenue" are not reported figures) and are removed; 14 questions that ask "which companies achieved the highest …" with a gold of three now ask for three; 4 large ones are unchecked and left. `packs-next/REPAIRS.md` lists every change with its line.
 - **The same answers under both** (`rescored-20261122/` in the run folder; no model called, the judge's verdicts from the run's cache; no score fell):
 
@@ -174,6 +174,26 @@ As recorded, the three knode arms were 0.04 to 0.06 above grep on `real-loong-fi
 112 of the 118 `real-loong-finance` questions now get the same score from all five arms, and aggregation is 0.93 for every arm where it was recorded as 0.31 to 0.43. The named comparisons do not change their answer: tokens per correct answer, full against grep, 1.28× pooled (1.19 to 1.37); at budget 3, full − grep −0.034 (−0.083 to +0.014), tools-only − grep −0.208 (−0.264 to −0.154; stopped on 101 of 214 against grep's 15). The wiki arm's pooled +0.034 (+0.002 to +0.067) is all `real-mudabench`, where the 14 reworded questions were answered under the old wording (every arm 0 on them) and a repeat of the same arm changes 3 to 6 of 30 answers: the one thing here worth a second look, not a result. Ask on `real-loong-finance` is 0.304 over 620 against the agents' 0.85 on their sample, and 0.08 on aggregation.
 
 Still open: `real-loong-finance` on its 118-question sample is now at 0.85 for every arm with 13 questions none gets right (5 comparisons, 2 trends, 2 lookups and 4 groupings not yet read against the filings), so it has little room left to separate agents; headroom allocation still draws from where every arm failed; the MuDABench corpus heads a calendar-year filer's report with the wrong year.
+
+### The closing turn (2026-11-22)
+
+An agent that reaches its cap is now asked for its answer, the same way for every arm, so a low budget measures what an arm can learn in its commands rather than whether it stops when told. When the session starts its `maxSteps + 1`th command or tool call (the budget's sixth at budget 3), it is interrupted with SIGINT instead of being killed. Codex treats SIGINT as an interrupt: it aborts the turn, records "aborted by user" for the call in flight, saves the turn's tokens so far and exits. The runner then resumes the same thread once with `codex exec resume <id>`, `--disable shell_tool` and no MCP server, and sends `CLOSING_TURN` (`src/eval/agent.ts`) on stdin: *You have reached your command budget. Run no more commands and call no more tools: answer the question now, from what you have already read, in the form the task asked for. If what you have read is not enough to be sure, give your best answer and say what is missing.* Codex still offers that turn a few tools of its own (sub-agents, patches, images). If the turn starts any item other than a message, it is interrupted and records no answer (`closing: used-a-tool`).
+
+The answer stays `capped`. `closing` on the record says how the turn went: `answered`, `no-answer`, `used-a-tool`, or `not-run`, which is the old stop with nothing. The report counts the capped answers given in the closing turn. A resumed turn's `turn.completed` reports the thread's running total, so usage is read as that thread's last report, not as a sum (`readCodexEvents`). With that, the stopped session's tokens and the closing turn's are on record; only the response that was cut off at the interrupt is not, since Codex never received its usage. A resume needs a saved session, so answering sessions run without `--ephemeral` and with `memories.generate_memories=false`, and `codex delete --force` removes the thread when the session ends. The llm-wiki builder keeps the old stop (`closing: null`).
+
+Checked against codex-cli 0.171.0 on a six-file fixture at budget 2, on the login:
+- On the local path, the run was interrupted at its third command and answered in its closing turn from the one file it had read, with 47,162 input tokens on record (about 29k before the stop and about 18k in the closing turn).
+- The worker's own argv gave the same result.
+- With the shell disabled, the closing turn could not read a file when asked to.
+- No session was left in `~/.codex`.
+- The call in flight at the interrupt may still finish running: its output reaches the trace, but the model's history records it as aborted.
+
+None of this was run on the remote pool. The new behaviour needs all three of the following; with any one missing, the session is stopped as before, and it is read and scored as it was after de7b6c1:
+- the run's build (`src/eval`);
+- `serve` (`src/remote/eval-producer.ts`, `src/work/eval.ts`, `src/remote/api.ts`), which carries the spec's `closing` to the worker and the worker's `closing` back;
+- each worker's `worker/knode-worker.mjs`, which acts only on a task that carries `closing`.
+
+A run's own slots (`--local`) run the session in the run's process and need only the run.
 
 
 ## 6. The stop on 2026-11-21, and what it changed
