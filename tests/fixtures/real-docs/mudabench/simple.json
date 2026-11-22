@@ -206,5 +206,134 @@
   ],
   "source_answer": [],
   "final_answer": "x"
+ },
+ {
+  "question_id": "q_0000000000000005",
+  "question": "Based on US stock market, What are the stock symbols of the top three companies with the highest net profit in 2021 in your knowledge base?",
+  "metadata": [
+   {
+    "symbol": "AAA",
+    "year": 2021,
+    "id": "00000000-0000-0000-0000-000000000101",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   },
+   {
+    "symbol": "BBB",
+    "year": 2021,
+    "id": "00000000-0000-0000-0000-000000000103",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   },
+   {
+    "symbol": "CCC",
+    "year": 2021,
+    "id": "00000000-0000-0000-0000-000000000105",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   },
+   {
+    "symbol": "DDD",
+    "year": 2021,
+    "id": "00000000-0000-0000-0000-000000000107",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   },
+   {
+    "symbol": "TGX",
+    "year": 2021,
+    "id": "00000000-0000-0000-0000-000000000109",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   }
+  ],
+  "source_answer": [],
+  "final_answer": "Based on 2021 net profit data: [AAA], [TGX], [BBB]"
+ },
+ {
+  "question_id": "q_0000000000000006",
+  "question": "Based on US stock market, What are the stock symbols (tickers) of the top three companies ranked by total assets in 2022?",
+  "metadata": [
+   {
+    "symbol": "AAA",
+    "year": 2022,
+    "id": "00000000-0000-0000-0000-000000000102",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   },
+   {
+    "symbol": "BBB",
+    "year": 2022,
+    "id": "00000000-0000-0000-0000-000000000104",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   },
+   {
+    "symbol": "CCC",
+    "year": 2022,
+    "id": "00000000-0000-0000-0000-000000000106",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   },
+   {
+    "symbol": "DDD",
+    "year": 2022,
+    "id": "00000000-0000-0000-0000-000000000108",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   },
+   {
+    "symbol": "TGX",
+    "year": 2022,
+    "id": "00000000-0000-0000-0000-000000000110",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   }
+  ],
+  "source_answer": [],
+  "final_answer": "Based on 2022 data: [AAA], [BBB], [CCC]"
+ },
+ {
+  "question_id": "q_0000000000000007",
+  "question": "Based on US stock market, What are the stock symbols (tickers) of the top three companies ranked by operating revenue in 2022?",
+  "metadata": [
+   {
+    "symbol": "AAA",
+    "year": 2022,
+    "id": "00000000-0000-0000-0000-000000000102",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   },
+   {
+    "symbol": "BBB",
+    "year": 2022,
+    "id": "00000000-0000-0000-0000-000000000104",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   },
+   {
+    "symbol": "CCC",
+    "year": 2022,
+    "id": "00000000-0000-0000-0000-000000000106",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   },
+   {
+    "symbol": "DDD",
+    "year": 2022,
+    "id": "00000000-0000-0000-0000-000000000108",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   },
+   {
+    "symbol": "TGX",
+    "year": 2022,
+    "id": "00000000-0000-0000-0000-000000000110",
+    "doctype": "US Stock Annual Report",
+    "value_x": 1
+   }
+  ],
+  "source_answer": [],
+  "final_answer": "Based on 2022 data: [TGX], [AAA], [BBB]"
  }
 ]

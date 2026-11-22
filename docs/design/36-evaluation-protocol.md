@@ -205,6 +205,24 @@ As recorded, the three knode arms were 0.04 to 0.06 above grep on `real-loong-fi
 
 Still open: `real-loong-finance` on its 118-question sample is now at 0.85 for every arm with 13 questions none gets right (5 comparisons, 2 trends, 2 lookups and 4 groupings not yet read against the filings), so it has little room left to separate agents; headroom allocation still draws from where every arm failed; the MuDABench corpus heads a calendar-year filer's report with the wrong year.
 
+### The second pass (2026-11-22)
+
+Read the same way, blind auditors and every quoted line checked (626 quotes, none wrong); every change is in `packs-next/REPAIRS.md`.
+
+- **MuDABench report years.** MuDABench files a US report under the year it was filed, while its per-report values are the named year's own. That is right for the 190 reports whose fiscal year ends January to October and wrong for the corpus's three calendar-year filers (UAA "2021" and TG "2021" are the 10-Ks for 2020, TG "2022" the 10-K for 2021): 3 of 397. None of the 204 Chinese reports is misdated (231 of the dataset's 233 amounts are in the report it names; the other two are in a scan). 13 questions used the three. The recipe now dates a US report by its cover and heads it with that year; a question about a year reads that year's report, drops a company the corpus has no report for when the gold does not name it, and is left out when it does (`redateRows`). Version 3 of the copy: TG's 2021 re-pointed in 4 questions, TG out of the scope of 4.
+- **The 13 `real-loong-finance` questions none got right**: 8 gold changed, each to what all five arms answered (units again, a sign, and two trends whose gold numbered each year by the report filed in it); 4 removed as underdetermined (a royalty trust's expense reserve as a liability, a "total current liabilities" two of three filers do not report, "the cash flow" of a trust with no cash-flow statement); 1 right, lost to the scorer. **The four large MuDABench questions**: 2 removed (a weighted score that does not say whether cost growth counts for or against; one also needs a scanned report), 2 with the gold right and reworded (a record date "of 2022" means the 2022 distribution's; an auditor "changed in 2022–2023" means the 2023 report names another firm). Two duplicates of questions removed in version 2 removed too. **`upd-metric-D1T3-01` to `-04`**: the gold is right and so were the agents ("1,837,000" for 1837k); the value scorer did not read a number at its scale and now does (`src/eval/score/values.ts`).
+- **Read again** (`rescored-20261122-v3/`, no model; the six Loong questions whose judged gold changed have no verdict in the cache and are left unscored until a judge reads them; the five arms' answers there agree with the new gold, one of them leaving a year out):
+
+| | grep | wiki + sources | full | tools only | RAG agent |
+| --- | --- | --- | --- | --- | --- |
+| `real-loong-finance`, budget 20 (108 scored) | 0.958 | 0.949 | 0.954 | 0.958 | 0.935 |
+| `real-mudabench`, budget 20 (96) | 0.578 | 0.656 | 0.594 | 0.596 | 0.583 |
+| `real-loong-finance`, budget 3 (108) | 0.921 | — | 0.870 | 0.827 | — |
+| `real-mudabench`, budget 3 (96) | 0.464 | — | 0.417 | 0.095 | — |
+| `synthetic-reports-en-v3`, update (61) | 1.000 | 0.984 | 0.984 | — | — |
+
+No `real-loong-finance` question is now missed by every arm, and 99 of the 107 that all five answered get the same score from each: as a sample to separate agents it is spent. `real-mudabench` keeps 28 of 94 that no arm gets right; the wiki arm's +0.078 (+0.010 to +0.151) over grep stands, as before not a result on its own.
+
 ### The closing turn (2026-11-22)
 
 An agent that reaches its cap is now asked for its answer, the same way for every arm, so a low budget measures what an arm can learn in its commands rather than whether it stops when told. When the session starts its `maxSteps + 1`th command or tool call (the budget's sixth at budget 3), it is interrupted with SIGINT instead of being killed. Codex treats SIGINT as an interrupt: it aborts the turn, records "aborted by user" for the call in flight, saves the turn's tokens so far and exits. The runner then resumes the same thread once with `codex exec resume <id>`, `--disable shell_tool` and no MCP server, and sends `CLOSING_TURN` (`src/eval/agent.ts`) on stdin: *You have reached your command budget. Run no more commands and call no more tools: answer the question now, from what you have already read, in the form the task asked for. If what you have read is not enough to be sure, give your best answer and say what is missing.* Codex still offers that turn a few tools of its own (sub-agents, patches, images). If the turn starts any item other than a message, it is interrupted and records no answer (`closing: used-a-tool`).

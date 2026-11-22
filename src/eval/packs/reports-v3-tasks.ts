@@ -742,7 +742,8 @@ function updateTasks(c: V3TaskCtx): Draft[] {
     for (const t of s.teams) {
       const v = metricReported(s, t.id, w);
       const prev = metricReported(s, t.id, w - 1);
-      base(`metric-${t.id}`, zh ? `${t.name}最新一周周报里的${t.metric.name}是多少？` : `What ${t.metric.name} does ${t.name}'s latest weekly report give?`, String(v), [fmtMetric(lang, t, v)], h.weekly(t.id, w), prev !== v ? [String(prev)] : []);
+      // the stale value with its unit too ("1839k"), so an answer at full size ("1,839,000") reads as stale
+      base(`metric-${t.id}`, zh ? `${t.name}最新一周周报里的${t.metric.name}是多少？` : `What ${t.metric.name} does ${t.name}'s latest weekly report give?`, String(v), [fmtMetric(lang, t, v)], h.weekly(t.id, w), prev !== v ? [String(prev)] : [], prev !== v ? { staleText: [fmtMetric(lang, t, prev)] } : {});
       const head = rosterOf(s.people, t.id, w).length;
       const before = rosterOf(s.people, t.id, w - 1).length;
       base(`head-${t.id}`, zh ? `${t.name}现在在岗多少人？` : `How many people are on ${t.name} now?`, String(head), [zh ? `${head}人` : `${head} people`], h.weekly(t.id, w), before !== head ? [String(before)] : []);

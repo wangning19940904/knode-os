@@ -20,19 +20,47 @@ export function declines(text: string): boolean {
 /** A number as an answer writes it: thousands separators allowed, and a 万 / 亿 right after it. */
 const NUMBER = /-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?/g;
 const MAGNITUDE: Record<string, number> = { 万: 1e4, 亿: 1e8 };
+/**
+ * English scales after a number: "1837k", "$9.932 million", "1.2bn". A
+ * one-letter scale must end the word ("5 kg" is not 5,000).
+ */
+const EN_MAGNITUDE: Record<string, number> = { k: 1e3, thousand: 1e3, m: 1e6, mn: 1e6, million: 1e6, b: 1e9, bn: 1e9, billion: 1e9, trillion: 1e12 };
+const ZH_SCALE = /^\s*([万亿])/;
+const LETTER_SCALE = /^\s?(k|K|M|B)(?![A-Za-z])/;
+const WORD_SCALE = /^\s*(thousand|million|billion|trillion|mn|bn)(?![A-Za-z])/i;
+
+/** The scale written right after a number, and how long it is ("" and 1 when none). */
+function scaleAt(rest: string): { scale: number; length: number } {
+  const zh = rest.match(ZH_SCALE);
+  if (zh) return { scale: MAGNITUDE[zh[1]], length: zh[0].length };
+  const en = rest.match(LETTER_SCALE) ?? rest.match(WORD_SCALE);
+  return en ? { scale: EN_MAGNITUDE[en[1].toLowerCase()], length: en[0].length } : { scale: 1, length: 0 };
+}
+const scaleAfter = (rest: string) => scaleAt(rest).scale;
 
 /**
- * The numbers a text states, each as written ("134.7" of "134.7万") and, after
- * a 万 or 亿, at its full size (1,347,000).
+ * The numbers a text states, each as written ("134.7" of "134.7万") and,
+ * after a scale (万, 亿, k, million, bn …), at its full size (1,347,000).
  */
 export function numbersIn(text: string): { value: number; scaled: number }[] {
   const t = text.normalize('NFKC');
   return [...t.matchAll(NUMBER)].map((m) => {
     const value = Number(m[0].replace(/,/g, ''));
-    const unit = t.slice(m.index! + m[0].length).match(/^\s*([万亿])/)?.[1];
-    return { value, scaled: unit ? value * MAGNITUDE[unit] : value };
+    return { value, scaled: value * scaleAfter(t.slice(m.index! + m[0].length)) };
   });
 }
+
+/** A gold written with its scale ("1837k", "$9.9 million"): its full size, else null. */
+function scaledGold(v: string): number | null {
+  const t = foldThousands(v.normalize('NFKC')).trim().replace(/^[$¥€£]/, '');
+  const m = t.match(/^(-?\d+(?:\.\d+)?)(.*)$/);
+  if (!m || !m[2].trim()) return null;
+  const { scale, length } = scaleAt(m[2]);
+  // the scale and nothing after it: "1837k", not "1837k users in week 19"
+  return scale !== 1 && !m[2].slice(length).trim() ? Number(m[1]) * scale : null;
+}
+
+const same = (a: number, b: number) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(b));
 
 /** The magnitudes (万, 亿) a text works in: a reading in one of them may be given at full size, and the other way round. */
 export function magnitudesIn(text: string): number[] {
@@ -58,8 +86,13 @@ export function magnitudesIn(text: string): number[] {
  */
 export function namesValue(text: string, values: string[], tolerance?: number, magnitudes: number[] = []): boolean {
   if (values.some((v) => v && containsTerm(text, v))) return true;
-  if (tolerance === undefined || !(tolerance > 0)) return false;
   const nums = numbersIn(text);
+  // a gold with its scale ("1837k") is named by the same figure at another scale ("1,837,000", "1.837 million"), exactly
+  if (values.some((v) => {
+    const g = v ? scaledGold(v) : null;
+    return g !== null && nums.some((n) => same(n.scaled, g));
+  })) return true;
+  if (tolerance === undefined || !(tolerance > 0)) return false;
   return values.some((v) => {
     const plain = foldThousands(v).trim();
     if (!/^-?\d+(?:\.\d+)?$/.test(plain)) return false;
