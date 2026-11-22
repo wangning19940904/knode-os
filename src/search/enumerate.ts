@@ -1,6 +1,7 @@
 import { Store } from '../store/db.js';
 import { Params, toDateString } from '../store/temporal.js';
 import { sourcesOf } from '../store/claims.js';
+import { foldTimeline } from '../graph/claim-timeline.js';
 import { QuestionFact } from './facts.js';
 
 /**
@@ -75,6 +76,12 @@ export interface EnumerateQuery {
   order?: 'timeline' | 'recent';
   /** Claims listed at most (the counts cover every match). */
   limit?: number;
+  /**
+   * With `order: 'timeline'`: fold restatements (graph/claim-timeline.ts) before the limit, so the
+   * listed claims are the subject's changes rather than its weekly restatements; each folded
+   * claim carries `repeats`. The counts still cover every match.
+   */
+  fold?: boolean;
 }
 
 export interface EnumeratedClaim extends QuestionFact {
@@ -86,6 +93,8 @@ export interface EnumeratedClaim extends QuestionFact {
   attribute?: string | null;
   value?: string | null;
   unit?: string | null;
+  /** With `fold`: the claim stands for this many restatements (itself included), first dated `date`, on these dates. */
+  repeats?: { count: number; dates: string[] };
 }
 
 export interface Enumeration {
@@ -149,7 +158,7 @@ async function matchSql(store: Store, q: EnumerateQuery): Promise<{ sql: string;
   if (q.range?.to) where.push(`${effective} <= ${p.add(q.range.to)}::timestamptz`);
   const col = (role: TypedRole, cast = 'text') => (typed[role] ? `cl.${typed[role]}::${cast}` : `NULL::${cast}`);
   const sql = `m AS MATERIALIZED (
-      SELECT cl.id, se.name AS subject, oe.name AS object, cl.type, cl.statement, cl.status, cl.kind,
+      SELECT cl.id, cl.subject_id, cl.object_id, se.name AS subject, oe.name AS object, cl.type, cl.statement, cl.status, cl.kind,
              cl.valid_from, cl.valid_to, cl.event_at, s.key AS path, cl.evidence_count, cl.chunk_id,
              cl.superseded_by, ${effective} AS eff, ch.document_id,
              ${col('attribute')} AS attribute, COALESCE(${col('valueNum')}, ${col('valueText')}) AS value, ${col('unit')} AS unit
@@ -165,6 +174,7 @@ async function matchSql(store: Store, q: EnumerateQuery): Promise<{ sql: string;
 }
 
 interface Row {
+  subject_id: string; object_id: string | null;
   id: string; subject: string; object: string | null; type: string; statement: string; status: string; kind: string;
   valid_from: string | Date | null; valid_to: string | Date | null; event_at: string | Date | null; path: string | null;
   evidence_count: number; chunk_id: string | null; superseded_by: string | null; eff: string | Date | null;
@@ -177,8 +187,9 @@ export async function enumerateClaims(store: Store, q: EnumerateQuery): Promise<
   if (!m) return empty;
   const limit = Math.min(Math.max(q.limit ?? 150, 1), 1000);
   const order = q.order === 'recent' ? 'eff DESC NULLS LAST, id' : 'eff ASC NULLS LAST, id';
-  const [rows, counts] = await Promise.all([
-    store.query<Row>(`WITH ${m.sql} SELECT * FROM m ORDER BY ${order} LIMIT ${limit}`, m.p.list),
+  const fold = q.fold === true && q.order !== 'recent';
+  const [scanned, counts] = await Promise.all([
+    store.query<Row>(`WITH ${m.sql} SELECT * FROM m ORDER BY ${order} LIMIT ${fold ? SCAN_CAP : limit}`, m.p.list),
     store.query<{ dim: string; label: string | null; n: number }>(
       `WITH ${m.sql}
        SELECT 'month' AS dim, to_char(eff, 'YYYY-MM') AS label, count(*)::int AS n FROM m WHERE eff IS NOT NULL GROUP BY 2
@@ -189,20 +200,27 @@ export async function enumerateClaims(store: Store, q: EnumerateQuery): Promise<
       m.p.list,
     ),
   ]);
-  const total = counts.find((c) => c.dim === 'total')?.n ?? rows.length;
+  const total = counts.find((c) => c.dim === 'total')?.n ?? scanned.length;
   const group = (dim: string, byCount: boolean): [string, number][] => counts
     .filter((c) => c.dim === dim && c.label !== null)
     .map((c) => [c.label!, c.n] as [string, number])
     .sort((a, b) => (byCount ? b[1] - a[1] || a[0].localeCompare(b[0]) : a[0].localeCompare(b[0])))
     .slice(0, GROUPS);
-  const sources = await sourcesOf(store, rows.map((r) => r.id));
+  const entries = fold
+    ? foldTimeline(scanned.map((r) => ({ ...r, value_num: null, value_text: r.value === null ? null : String(r.value), on: toDateString(r.eff) })), { series: false })
+        .slice(0, limit)
+        .map((e) => ({ row: e.head, members: e.members }))
+    : scanned.map((r) => ({ row: r, members: [r] }));
+  const sources = await sourcesOf(store, entries.flatMap((e) => e.members.map((r) => r.id)));
+  const sourcesFor = (members: Row[]) => [...new Set(members.flatMap((r) => sources.get(r.id) ?? (r.path ? [r.path] : [])))].sort();
   return {
-    claims: rows.map((r) => ({
+    claims: entries.map(({ row: r, members }) => ({
       id: r.id, subject: r.subject, object: r.object, type: r.type, statement: r.statement, status: r.status, kind: r.kind,
       startDate: toDateString(r.valid_from), endDate: toDateString(r.valid_to), eventDate: toDateString(r.event_at),
       path: r.path, evidenceCount: r.evidence_count, chunkId: r.chunk_id,
-      date: toDateString(r.eff), superseded: Boolean(r.superseded_by), sources: sources.get(r.id) ?? (r.path ? [r.path] : []),
+      date: toDateString(r.eff), superseded: Boolean(r.superseded_by), sources: sourcesFor(members),
       ...(m.typed.attribute || m.typed.valueNum || m.typed.valueText ? { attribute: r.attribute, value: r.value === null ? null : String(r.value), unit: r.unit } : {}),
+      ...(members.length > 1 ? { repeats: { count: members.length, dates: [...new Set(members.map((x) => toDateString(x.eff)).filter((d): d is string => !!d))] } } : {}),
     })),
     matched: Math.min(total, SCAN_CAP),
     capped: total > SCAN_CAP,

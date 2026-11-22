@@ -10,6 +10,7 @@ import { search, SearchMode } from './search.js';
 import { EnumeratedClaim, Enumeration, enumerateClaims, typesInQuestion } from './enumerate.js';
 import { ComputedSet, computeClaimSet, SET_BUDGET_MS } from './claimset.js';
 import { secondRound } from './second.js';
+import { PASSAGE_MAX, widenPassages } from './passages.js';
 import { isChainQuestion, QuestionKind, QuestionRoute, questionRange, routeQuestion } from './route.js';
 import { stepsAsFacts, walkRelations } from './walk.js';
 
@@ -50,15 +51,20 @@ export interface AskRoute {
   computedSkipped?: { why: string; budgetMs: number; ms: number };
   /** When the first round was thin: what the second found, and why it ran (docs/design/34 §2). */
   second?: { chunks: number; facts: number; from: string[]; uncoveredNamed: string[]; missingTerms: string[]; statements: number; ms: number };
+  /** The documents behind the first passages read further before the answer (search/passages.ts): how many, and the characters added. */
+  widened?: { documents: number; chars: number };
 }
 
-const ASK_SYSTEM = `You answer questions from a personal knowledge base. You are given retrieved context chunks, each tagged [n] — one marked "excerpt" holds only the lines of its document that name what the question asks about — and optionally a "Known facts" list: claims extracted from the whole knowledge base, each tagged [n] too, with its date and the document it comes from. The facts reach documents the chunks do not; a question that asks for every case, a list or a history is answered from both.
+const ASK_SYSTEM = `You answer questions from a personal knowledge base. You are given retrieved context chunks, each tagged [n] — one marked "excerpt" holds only the lines of its document that name what the question asks about, one marked "widened" holds more of its document than the search returned (the parts are in document order; "[…]" marks a gap) — and optionally a "Known facts" list: claims extracted from the whole knowledge base, each tagged [n] too, with its date and the document it comes from. The facts reach documents the chunks do not; a question that asks for every case, a list or a history is answered from both.
 
 Rules:
-- Answer in the question's language, concise but complete.
+- Answer in the question's language, concise but complete. Lead with the answer, then the caveats.
 - Cite evidence inline as [n] after the claims it supports. Only cite chunks and facts you actually used.
 - Known facts marked [suspected] or [disputed] are unverified — if you use one, explicitly flag the uncertainty in your answer. One marked [opinion], [prediction] or [rumor] is a view, a forecast or hearsay from the sources, not an established fact: say so when you use it.
-- If the context is insufficient or contradictory, say so explicitly.
+- Answer from what the context states and from what follows from it in a step: compute a figure the question asks for from the figures given (a sum, difference, ratio, margin, average, growth rate, unit conversion, count, or the time between two dates) and show the calculation in one line; to compare, state each side's value with its source, then the comparison. A table may name a figure differently from the question (capital expenditures as "purchases of property and equipment"; 资本开支 as 购建固定资产…支付的现金): use the row that is that figure and say which row it is. A question that needs such a step is answerable: take the step, do not decline it.
+- Answer every part of the question the context supports. Say "not in the knowledge base" only of a part for which no chunk or fact states the answer or what it can be computed from; one missing part does not make the rest unanswerable.
+- Never guess: a value that is neither stated nor computable from the context is missing, whatever you know otherwise — do not fill it from memory or from another company's, period's or document's figure, and do not present an estimate as the value.
+- If the context is contradictory, say so and give each side with its source.
 - End with a JSON line: {"citations":[n,...],"gaps":["what the knowledge base is missing to answer better", ...]} (gaps may be empty).`;
 
 /** The rule an enumerated answer adds: the facts are the whole match, and the counts are over it. */
@@ -110,7 +116,7 @@ export function claimTag(c: { status: string; kind?: string | null }): string {
 }
 
 /** A fact as the prompt may list it: a claim, an enumerated claim, or a relation walked. */
-type PromptFact = ClaimItem & { chunkId?: string | null; superseded?: boolean; sources?: string[]; date?: string | null };
+type PromptFact = ClaimItem & { chunkId?: string | null; superseded?: boolean; sources?: string[]; date?: string | null; repeats?: { count: number; dates: string[] } };
 
 /** The facts as the prompt lists them: numbered on from the chunks, each with its tag, date and source. */
 function renderFacts(facts: PromptFact[], firstRef: number, heading = 'Known facts'): string {
@@ -119,7 +125,9 @@ function renderFacts(facts: PromptFact[], firstRef: number, heading = 'Known fac
     const period = f.startDate || f.endDate ? ` (${f.startDate ?? '?'} ~ ${f.endDate ?? ''})` : '';
     const when = f.eventDate ? ` (${f.eventDate})` : f.date && !period ? ` (${f.date})` : period;
     const more = f.sources && f.sources.length > 1 ? ` (+${f.sources.length - 1} more source${f.sources.length > 2 ? 's' : ''})` : '';
-    return `[${firstRef + i}] [${claimTag(f)}${f.type === 'set' ? '; set' : ''}${f.superseded ? '; replaced later' : ''}] ${f.statement}${when}${f.path ? ` — ${f.path}${more}` : ''}`;
+    // a folded timeline entry: the same value restated later, said once with how long it was restated
+    const again = f.repeats && f.repeats.count > 1 ? ` (restated ${f.repeats.count - 1}×${f.repeats.dates.length > 1 ? `, last ${f.repeats.dates[f.repeats.dates.length - 1]}` : ''})` : '';
+    return `[${firstRef + i}] [${claimTag(f)}${f.type === 'set' ? '; set' : ''}${f.superseded ? '; replaced later' : ''}] ${f.statement}${when}${again}${f.path ? ` — ${f.path}${more}` : ''}`;
   });
   return `\n\n# ${heading}\n${lines.join('\n')}`;
 }
@@ -192,6 +200,8 @@ export async function ask(
     computed?: boolean;
     /** The day relative periods ("去年", "三季度", "last 3 months") are read from (YYYY-MM-DD); default today. An evaluation of a past corpus sets its own. */
     now?: string;
+    /** false: show the chunks as the search cut them, without reading further into their documents (search/passages.ts). */
+    widen?: boolean;
   } = {},
 ): Promise<AskResult> {
   const router = { ...defaultAskRouterConfig(), ...config.retrieval.router };
@@ -232,7 +242,7 @@ interface RouteEnv {
   embedder: EmbeddingProvider;
   llm: LlmClient;
   question: string;
-  opts: { k?: number; mode?: SearchMode; facts?: number; excerpts?: number; track?: boolean; second?: boolean; computed?: boolean; now?: string };
+  opts: { k?: number; mode?: SearchMode; facts?: number; excerpts?: number; track?: boolean; second?: boolean; computed?: boolean; now?: string; widen?: boolean };
   queryVector: number[] | undefined;
   router: ReturnType<typeof defaultAskRouterConfig>;
   routed: QuestionRoute;
@@ -284,7 +294,9 @@ async function enumeratedAnswer(env: RouteEnv): Promise<AskResult | null> {
   if (named.length === 0 && types.length === 0) return null;
   const timeline = routed.kind === 'timeline';
   const limit = Math.max(1, router.enumerateLimit);
-  const query = { entities: named, types, range: routed.range, includeSuperseded: timeline, order: 'timeline' as const, limit };
+  // a timeline lists the subject's changes: a value restated in later reports is one fact with its dates, not a
+  // fact per report, so the limit holds the history rather than its first weeks (graph/claim-timeline.ts)
+  const query = { entities: named, types, range: routed.range, includeSuperseded: timeline, order: 'timeline' as const, limit, fold: timeline };
   let enumeration = await enumerateClaims(store, query);
   let usedTypes = types;
   // a type the question seems to name, but no claim of it about these entities: every type
@@ -445,6 +457,14 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
       routed = { ...routed, second: { chunks: more.chunks.length, facts: more.facts.length, ...more.reason, statements: more.statements, ms: more.ms } };
     }
   }
+  // the documents behind the first passages, read further: the row after a table's cut, the chunk naming what is asked
+  if (env.opts.widen !== false) {
+    const wide = await widenPassages(env.store, question, contexts).catch(() => null);
+    if (wide && wide.documents > 0) {
+      contexts = wide.contexts;
+      routed = { ...routed, widened: { documents: wide.documents, chars: wide.chars } };
+    }
+  }
   // the computed set's rows lead the facts; what else was ranked follows, without repeating them
   const setRows = computed ? computedFacts(computed) : [];
   const inSet = new Set(setRows.map((f) => f.id));
@@ -477,12 +497,12 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
   }
 
   const contextBlock = contexts
-    .map((c, i) => `[${i + 1}] (${c.path}${c.excerpt ? ', excerpt' : ''})\n${c.content.slice(0, ASK_CONTEXT_CHARS)}`)
+    .map((c, i) => `[${i + 1}] (${c.path}${c.excerpt ? ', excerpt' : c.widened ? ', widened' : ''})\n${c.content.slice(0, c.widened ? PASSAGE_MAX + 1 : ASK_CONTEXT_CHARS)}`)
     .join('\n\n');
   const raw = await llm.complete([
     { role: 'system', content: system },
     { role: 'user', content: `# Context\n${contextBlock}${renderFacts(facts, contexts.length + 1, heading)}${extra}\n\n# Question\n${question}` },
-  ], { maxTokens: route.enumerated || computed ? 3000 : 1500 });
+  ], { maxTokens: route.enumerated || computed ? 3000 : 2000 });
 
   let answer = raw.trim();
   let gaps: string[] = [];

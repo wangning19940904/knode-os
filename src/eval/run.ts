@@ -16,6 +16,7 @@ import { calibrateEndpoint, checkEndpoint, endpointUnder, preferEndpoint } from 
 import { citationsIn, taskPrompt } from './prompts.js';
 import { EmbeddingBudget, QuotaGuard } from './quota.js';
 import { fileLines, recordKey, RunMeta, RunStore } from './runstore.js';
+import { agentAllocationFor, describeAllocation, sampleByType, sharesFor, typeQuotas, type AgentAllocation, type TypeShares } from './allocation.js';
 import { scoreEmergence } from './score/emergence.js';
 import { scoreGeneration } from './score/generation.js';
 import { scoreLists } from './score/lists.js';
@@ -27,6 +28,7 @@ import type { EvalFamily } from '../work/eval.js';
 import type { Placed } from './meter.js';
 import { closeAdapters } from './systems/external.js';
 import { askOptionsFromEnv, closeKnodeStates } from './systems/knode.js';
+import { AGENT_BUDGET, agentBudget } from './systems/agents.js';
 import { describeDatabase, EVAL_POOL_MAX, evalDatabase, orphanedEvalSchemas, sameDatabase } from './database.js';
 import { EvalRootPlacement, evalRootDir, evalRunId, initEvalRoot, liveDatabase, newEvalManifest, placeEvalWorkspace, readEvalManifest, readWorkspacePointer, WORKSPACE_POINTER, writeEvalManifest, writeWorkspacePointer } from './root.js';
 import { SCHEMA_VERSION } from '../store/migrations.js';
@@ -119,6 +121,14 @@ export interface RunOptions {
   /** Only tasks of these types (a focused run: the corpus-level types, deep hops, updates). */
   types?: TaskType[];
   agentLimit?: number;
+  /**
+   * How the agent sample is spread over task types (weights, counts, or
+   * weights derived from a previous run's records). Absent: round-robin over
+   * types, as before; a resume keeps the allocation the run recorded.
+   */
+  agentAllocation?: AgentAllocation | null;
+  /** At most this many update tasks per pack for agent systems (stratified by type, seeded); absent: all of them. */
+  agentUpdateLimit?: number;
   fraction?: number;
   seed?: string | number;
   /**
@@ -183,6 +193,8 @@ export interface RunOptions {
    * pass; 0: off). Recorded in the run's `judge-audit.jsonl`.
    */
   judgeAudit?: number;
+  /** Lists the judge matches in one call (default 1: a list's verdict depends on that list alone; more saves judge calls). */
+  judgeListBatch?: number;
   /** Answer each task this many times, for run-to-run variance (default 1: today's keys). */
   repeat?: number;
   /** The systems answered `repeat` times (default: every system that answers). */
@@ -242,9 +254,20 @@ function refusingEmbedder(identity: EmbeddingProvider): EmbeddingProvider {
   };
 }
 
+/**
+ * The commit this build is of: a `COMMIT` file beside the build's `dist` (a frozen build made for a run outside
+ * any checkout names its commit there), else the checkout the code runs from.
+ */
 function gitSha(): string | null {
+  const here = path.dirname(fileURLToPath(import.meta.url));
   try {
-    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: path.dirname(fileURLToPath(import.meta.url)), encoding: 'utf8' }).trim();
+    const frozen = fs.readFileSync(path.resolve(here, '..', '..', 'COMMIT'), 'utf8').trim();
+    if (/^[0-9a-f]{7,40}$/.test(frozen)) return frozen;
+  } catch {
+    // no such file: a checkout
+  }
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: here, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   } catch {
     return null;
   }
@@ -267,10 +290,13 @@ function knodeVersion(): string {
  * stratum, the strata interleaved by how far through each one a task is. Without that a limited run sampled a
  * different mix from an unlimited one — of the 10× reports pack's 69 deep hops (20 h5, 29 h4, 20 h5r) the 18
  * a run took at a limit of 300 were 8 h5 and 10 h5r and no h4, h4 having no primary, against 2 / 3 / 2 at 1×.
+ *
+ * With `shares` (an agent sample's allocation) each type gives the number `typeQuotas` sets — the first ones
+ * of its list, in the same order — instead of an even share; without, every caller samples as before.
  */
-export function selectTasks(tasks: Task[], suites: Set<string>, limit: number | undefined, seed: string | number): Task[] {
+export function selectTasks(tasks: Task[], suites: Set<string>, limit: number | undefined, seed: string | number, shares?: TypeShares | null): Task[] {
   const pool = tasks.filter((t) => suites.has(t.suite));
-  if (!limit || pool.length <= limit) return pool;
+  if (!shares && (!limit || pool.length <= limit)) return pool;
   const byType = new Map<string, Task[]>();
   for (const t of [...pool].sort((a, b) => seededKey(seed, a.id).localeCompare(seededKey(seed, b.id)))) {
     (byType.get(t.type) ?? byType.set(t.type, []).get(t.type)!).push(t);
@@ -280,12 +306,15 @@ export function selectTasks(tasks: Task[], suites: Set<string>, limit: number | 
     list.sort((a, b) => Number(Boolean(b.primary)) - Number(Boolean(a.primary)));
     byType.set(type, interleaveStrata(list));
   }
+  // an allocation fixes how many each type gives; the order stays the round-robin's
+  const quota = shares ? typeQuotas(new Map([...byType].map(([t, l]) => [t, l.length])), limit ?? pool.length, shares) : null;
+  const lists = [...byType].map(([type, l]) => (quota ? l.slice(0, quota.get(type) ?? 0) : l));
+  const cap = quota ? [...quota.values()].reduce((a, b) => a + b, 0) : limit!;
   const out: Task[] = [];
-  const lists = [...byType.values()];
-  for (let i = 0; out.length < limit; i++) {
+  for (let i = 0; out.length < cap; i++) {
     let added = false;
     for (const l of lists) {
-      if (l[i] && out.length < limit) {
+      if (l[i] && out.length < cap) {
         out.push(l[i]);
         added = true;
       }
@@ -505,6 +534,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     const judge = new Judge({
       client: judgeClient, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl'),
       width: judgeWidth(remote, judgeFamily(opts.judgeProvider ?? 'claude-cli'), judgeEligible, judgeCap(opts, placement)),
+      listBatchSize: opts.judgeListBatch,
     });
     const models = { model: opts.model ?? '', buildEffort: opts.buildEffort ?? 'low', answerEffort: opts.answerEffort ?? 'medium' };
     judge.audit(judgeAuditFor(opts.judgeAudit, seed, store));
@@ -514,6 +544,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       const n = reuseBuilds(store, path.resolve(opts.reuseBuildsFrom), opts.packs, `${embedder.model} (${embedder.dimensions})`, fraction, seed, groups, rootPlace);
       progress(`reusing ${n.builds} builds and ${n.vectors} embedding vectors from ${opts.reuseBuildsFrom}${opts.rebuild?.length ? `; building ${opts.rebuild.join(', ')} afresh` : ''}`);
       if (n.updated.length) progress(`building again, since ${opts.reuseBuildsFrom} updated them after building: ${n.updated.join(', ')}`);
+      // the copied vectors are what the embedding endpoint is checked against below: the state was opened before them
+      if (n.vectors) state.vectors.reload();
       store.log('builds reused', { from: opts.reuseBuildsFrom, ...n });
     }
 
@@ -530,6 +562,17 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     // a private pack's calls go to a shim that publishes them for this machine's slots only
     const localShim = placedHere !== placed ? await startShim({ ...shimOptions, backend: placedHere }) : shim;
     opened.localShim = localShim;
+
+    // the agent sample's allocation and update cap: what the command line gives, or on a resume what the run recorded
+    const before = store.meta();
+    const allocation = agentAllocationFor(opts.agentAllocation, before);
+    const recordedUpdates = before ? before.agentSample?.updateLimit ?? null : undefined;
+    if (recordedUpdates !== undefined && opts.agentUpdateLimit !== undefined && recordedUpdates !== opts.agentUpdateLimit) {
+      throw new Error(`run ${before!.id} gave its agents ${recordedUpdates === null ? 'every update task' : `at most ${recordedUpdates} update tasks a pack`}: resume it with that (or no --agent-update-limit), or start a new run`);
+    }
+    const agentUpdateLimit = opts.agentUpdateLimit ?? recordedUpdates ?? null;
+    const agentLimit = opts.agentLimit ?? 30;
+    if (allocation) progress(`agent sample: ${agentLimit} a pack by ${describeAllocation(allocation)}`);
 
     const meta: RunMeta = store.meta() ?? {
       id: path.basename(runDir),
@@ -551,6 +594,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       ...(opts.types?.length ? { types: opts.types } : {}),
     };
     meta.database ??= { kind: database.kind, at: describeDatabase(database) };
+    meta.agentSample = { limit: agentLimit, updateLimit: agentUpdateLimit, allocation, byPack: meta.agentSample?.byPack ?? {}, updates: meta.agentSample?.updates ?? {} };
     store.writeMeta(meta);
     opened.meta = meta;
 
@@ -574,6 +618,12 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     };
     delete meta.stuck;
     recordAskOptions(meta, opts.systems);
+    // one budget a run directory: an answer's key does not say what budget it was given
+    const commands = agentBudget();
+    const recordedCommands = before ? before.agentBudget ?? AGENT_BUDGET : commands;
+    if (recordedCommands !== commands) throw new Error(`run ${before!.id} gave its agents a budget of ${recordedCommands} commands: resume it with --agent-budget ${recordedCommands}, or start a new run for ${commands}`);
+    if (commands !== AGENT_BUDGET) meta.agentBudget = commands;
+    else delete meta.agentBudget;
     store.writeMeta(meta);
     const tasksByKey = new Map<string, Task>();
     const corpusDocs = new Map<string, Set<string>>();
@@ -648,8 +698,16 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       const typed = opts.types?.length ? staged.tasks.filter((t) => opts.types!.includes(t.type)) : staged.tasks;
       const allTasks = selectTasks(typed.filter((t) => !t.afterUpdate), suites, opts.limit, seed);
       const updateTasks = suites.has('update') ? typed.filter((t) => t.afterUpdate) : [];
+      // the agent sample: round-robin over types, or by the run's allocation
+      const shares = allocation ? sharesFor(allocation, path.basename(pack.dir), pack.manifest.id) : null;
+      const agentTasks = selectTasks(allTasks, suites, agentLimit, seed, shares);
+      // the update tasks agents answer: all, or a seeded sample stratified by type (`--agent-update-limit`)
+      const agentUpdates = agentUpdateLimit === null ? null : new Set(selectTasks(updateTasks, suites, agentUpdateLimit, seed).map((t) => t.id));
+      meta.agentSample!.byPack[pack.manifest.id] = sampleByType(allTasks, agentTasks, shares);
+      if (updateTasks.length) meta.agentSample!.updates[pack.manifest.id] = { available: updateTasks.length, taken: agentUpdates?.size ?? updateTasks.length };
+      store.writeMeta(meta);
+      if (allocation) progress(`[${pack.manifest.id}] agents answer ${agentTasks.length} of ${allTasks.length}: ${Object.entries(meta.agentSample!.byPack[pack.manifest.id]).map(([t, c]) => `${t} ${c.taken}/${c.available}`).join(', ')}`);
       // the repeat sample: drawn from the tasks every repeated system answers (an agent answers its own subset), so pairs compare
-      const agentTasks = selectTasks(allTasks, suites, opts.agentLimit ?? 30, seed);
       const repeated = systems.filter((s) => s.answers && repeatsOf(s) > 1);
       const repeatPool = repeated.some(isAgent) ? agentTasks : allTasks;
       const repeatSample = repeatSampleOf(repeatPool, opts.repeatSample, seed);
@@ -734,7 +792,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           }
           const batchSample = repeatSampleOf(tasks, opts.repeatSample, seed);
           for (const s of members) {
-            for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, repeatedTasks(tasks, r, batchSample), fraction, seed, concurrencyFor(s, leaves), progress, batch, r, stop.signal);
+            const own = isAgent(s) && agentUpdates ? tasks.filter((t) => agentUpdates.has(t.id)) : tasks;
+            for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, repeatedTasks(own, r, batchSample), fraction, seed, concurrencyFor(s, leaves), progress, batch, r, stop.signal);
           }
           for (const s of members) await s.release?.(env);
         }
@@ -949,7 +1008,7 @@ function where(p: Placed | null): { worker?: string; backend?: string } {
  * its records and the packs it names — with no model of its own running, so
  * only while the run itself is stopped.
  */
-export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; judgeAudit?: number; judgeConcurrency?: number; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
+export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; judgeAudit?: number; judgeListBatch?: number; judgeConcurrency?: number; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
   const store = new RunStore(runDir);
   const meta = store.meta();
   if (!meta) throw new Error(`not a run directory: ${runDir}`);
@@ -991,7 +1050,7 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
       family, model: opts.judgeModel ?? '', effort: agent?.effort ?? null,
       eligible, backend: agent ? `${agent.family}-cli:${agent.model}` : null,
     });
-    const judge = new Judge({ client, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl'), width: judgeWidth(remote, family, eligible, judgeCap(opts, placement)) });
+    const judge = new Judge({ client, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl'), width: judgeWidth(remote, family, eligible, judgeCap(opts, placement)), listBatchSize: opts.judgeListBatch });
     for (const pack of packs) {
       for (const t of pack.tasks) tasks.set(`${pack.manifest.id}|${t.id}`, t);
       const docs = new Set(pack.docs.map((d) => d.path));
@@ -1262,9 +1321,13 @@ function interleaveStrata(list: Task[]): Task[] {
 }
 
 export { emptyUsage };
+export { headroomAllocation, typeQuotas, type AgentAllocation, type AgentSample, type TypeEvidence, type TypeShares } from './allocation.js';
 
-/** Record in the run's metadata what knode-ask is asked beyond its defaults, as this start of the run reads it. */
+/**
+ * Record in the run's metadata what knode-ask is asked beyond its defaults, as this start of the run reads it —
+ * whenever a run asks knode-ask or a variant of it (`knode-ask-hops`), which read the same settings.
+ */
 export function recordAskOptions(meta: RunMeta, systems: string[], env: NodeJS.ProcessEnv = process.env): void {
-  if (systems.includes('knode-ask')) meta.askOptions = askOptionsFromEnv(env);
+  if (systems.some((id) => id === 'knode-ask' || id.startsWith('knode-ask-'))) meta.askOptions = askOptionsFromEnv(env);
   else delete meta.askOptions;
 }

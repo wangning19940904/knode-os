@@ -337,7 +337,8 @@ export function mountEvalProducer(app: Hono<any>, deps: EvalProducerDeps): void 
     return new Response(stream, { status: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
   });
 
-  api.on('HEAD', '/archives/:sha', (c) => {
+  // the check is a HEAD, and the router serves a HEAD by the GET route with its body dropped: registered as HEAD it never matched, and every check said 404
+  api.get('/archives/:sha', (c) => {
     const f = deps.work.archives.file(c.req.param('sha'));
     return c.body(null, f ? 200 : 404);
   });

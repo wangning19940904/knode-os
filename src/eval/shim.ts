@@ -190,15 +190,24 @@ export class VectorCache {
   private map = new Map<string, Float32Array>();
 
   constructor(private readonly file: string | null) {
-    if (file && fs.existsSync(file)) {
-      for (const line of fileLines(file)) {
-        if (!line.trim()) continue;
-        try {
-          const r = JSON.parse(line) as { k: string; v: string };
-          this.map.set(r.k, float32Of(r.v));
-        } catch {
-          /* torn line */
-        }
+    this.reload();
+  }
+
+  /**
+   * Read the file again: vectors another run's copy put there after this cache was opened (`reuseBuilds`
+   * copies them once the run's state exists). Without it a run that reuses builds checked its embedding
+   * endpoint against an empty cache on its first start and fell back to the workspace's embedder.
+   */
+  reload(): void {
+    const file = this.file;
+    if (!file || !fs.existsSync(file)) return;
+    for (const line of fileLines(file)) {
+      if (!line.trim()) continue;
+      try {
+        const r = JSON.parse(line) as { k: string; v: string };
+        this.map.set(r.k, float32Of(r.v));
+      } catch {
+        /* torn line */
       }
     }
   }

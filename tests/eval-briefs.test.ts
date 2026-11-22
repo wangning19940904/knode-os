@@ -19,9 +19,9 @@ const HAS = {
   // B: A, plus search over the rag index
   'agent-rag': 'The current directory holds the source documents. You also have one tool, `search` (on the MCP server knode): search(query, k) returns the k passages of the documents that best match the query by words and by meaning, each with its document\'s path, the passage (about 1,200 characters) and a score. A search call counts against the budget as a command does.',
   // C: A, plus the knode wiki (the sources moved to where the pages' links point)
-  'agent-knode-wiki-sources': 'The current directory holds a wiki compiled from the documents (wiki/, generated pages; sources/ holds one summary per document; start from its index.md) and the source documents themselves (raw/docs/). Use the wiki to find your way — which sources bear on the question and how they connect — and open the sources to check details or find what the wiki leaves out. Cite source documents by their paths under raw/docs/.',
+  'agent-knode-wiki-sources': 'The current directory holds a wiki compiled from the documents (wiki/, generated pages; wiki/sources/ holds one summary per document; start from wiki/index.md) and the source documents themselves (raw/docs/). Use the wiki to find your way — which sources bear on the question and how they connect — and open the sources to check details or find what the wiki leaves out. Cite source documents by their paths under raw/docs/.',
   // D: C, plus knode's retrieval tools
-  'agent-knode-full': 'The current directory holds a wiki compiled from the documents (wiki/, generated pages; sources/ holds one summary per document; start from its index.md) and the source documents themselves (raw/docs/). Use the wiki to find your way — which sources bear on the question and how they connect — and open the sources to check details or find what the wiki leaves out. Cite source documents by their paths under raw/docs/. You also have knode\'s retrieval tools (on the MCP server knode) over an index built from the same documents: knode_search, knode_graph_search, knode_claims, knode_query, knode_resolve, knode_survey. Their results name documents as raw/docs/<path> and pages as wiki/<page>, the paths of the current directory. A tool call counts against the budget as a command does.',
+  'agent-knode-full': 'The current directory holds a wiki compiled from the documents (wiki/, generated pages; wiki/sources/ holds one summary per document; start from wiki/index.md) and the source documents themselves (raw/docs/). Use the wiki to find your way — which sources bear on the question and how they connect — and open the sources to check details or find what the wiki leaves out. Cite source documents by their paths under raw/docs/. You also have knode\'s retrieval tools (on the MCP server knode) over an index built from the same documents: knode_search, knode_graph_search, knode_claims, knode_query, knode_resolve, knode_survey. Their results name documents as raw/docs/<path> and pages as wiki/<page>, the paths of the current directory. A tool call counts against the budget as a command does.',
 } as const;
 
 describe('the ladder\'s briefs', () => {
@@ -57,5 +57,27 @@ describe('the ladder\'s briefs', () => {
     for (const missing of ['knode_grep', 'knode_read', 'knode_ls']) expect(briefs['agent-knode-full'].text, missing).not.toContain(missing);
     const named = new Set([...briefs['agent-knode-full'].text.matchAll(/knode_[a-z_]+/g)].map((m) => m[0]));
     expect([...named].filter((t) => !KNODE_FULL_TOOLS.includes(t))).toEqual([]);
+  });
+});
+
+describe('the agents\' command budget', () => {
+  it('is 20 unless a run sets another, which the brief says and the session is held to', async () => {
+    const { AGENT_BRIEF, agentBudget, agentMaxSteps } = await import('../src/eval/systems/agents.js');
+    expect(agentBudget({})).toBe(20);
+    expect(agentMaxSteps({})).toBeUndefined();
+    expect(agentBudget({ KNODE_EVAL_AGENT_BUDGET: '3' })).toBe(3);
+    expect(agentMaxSteps({ KNODE_EVAL_AGENT_BUDGET: '3' })).toBe(5);
+    // not a budget: the default
+    for (const bad of ['0', '21', '2.5', 'x']) expect(agentBudget({ KNODE_EVAL_AGENT_BUDGET: bad })).toBe(20);
+    const before = process.env.KNODE_EVAL_AGENT_BUDGET;
+    try {
+      process.env.KNODE_EVAL_AGENT_BUDGET = '3';
+      expect(AGENT_BRIEF('X.')).toContain('a budget of about 3 commands');
+      delete process.env.KNODE_EVAL_AGENT_BUDGET;
+      expect(AGENT_BRIEF('X.')).toContain('a budget of about 20 commands');
+    } finally {
+      if (before === undefined) delete process.env.KNODE_EVAL_AGENT_BUDGET;
+      else process.env.KNODE_EVAL_AGENT_BUDGET = before;
+    }
   });
 });

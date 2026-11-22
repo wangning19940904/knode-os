@@ -28,6 +28,12 @@ export interface JudgeOptions {
   quota?: QuotaGuard;
   cacheFile?: string;
   batchSize?: number;
+  /**
+   * Lists a call matches at once (`matchList`, `matchItems`; default 1). One list a call makes a list's verdict
+   * depend on that list alone, at the price of a call per list where `batchSize` lists shared one: raise it when
+   * the judge's calls are what a run is short of.
+   */
+  listBatchSize?: number;
   /** A fixed width: at most this many calls at once (default 2). */
   concurrency?: number;
   /** The width as it is now, read again as calls end and while some wait: the slots online that take the judge's calls. Wins over `concurrency`. */
@@ -130,8 +136,27 @@ export function auditSample<I>(items: I[], share: number, min: number, seed: str
   return ranked.slice(0, Math.min(items.length, Math.max(under, min))).map((r) => r.item);
 }
 
-/** Pairs as a set: the same pairs in any order are the same verdict. */
-const pairSet = (v: { pairs?: unknown }) => JSON.stringify((Array.isArray(v?.pairs) ? v.pairs : []).map((p) => JSON.stringify(p)).sort());
+/**
+ * A list verdict's pairs as the one-to-one matching scoring makes of them (score/lists.ts canonicalPairs, kept
+ * here so the judge does not import the scorer): in range, by predicted then gold index, each entry once.
+ */
+export function canonicalListPairs(raw: unknown, predicted: number, gold: number): [number, number][] {
+  const list = (Array.isArray(raw) ? raw : []).filter((p): p is [number, number] => Array.isArray(p) && Number.isInteger(p[0]) && Number.isInteger(p[1]) && p[0] >= 0 && p[0] < predicted && p[1] >= 0 && p[1] < gold);
+  const usedP = new Set<number>();
+  const usedG = new Set<number>();
+  const out: [number, number][] = [];
+  for (const [p, g] of [...list].sort((x, y) => x[0] - y[0] || x[1] - y[1])) {
+    if (usedP.has(p) || usedG.has(g)) continue;
+    usedP.add(p);
+    usedG.add(g);
+    out.push([p, g]);
+  }
+  return out;
+}
+
+/** Items audited at most for a verdict's second part (`audited`'s `also`). */
+const AUDIT_ALSO_MAX = 40;
+
 /** A long text in an audit record, cut. */
 const cut = (v: unknown): unknown => (typeof v === 'string' ? (v.length > 800 ? `${v.slice(0, 800)}…` : v) : Array.isArray(v) ? v.slice(0, 20).map(cut) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, cut(x)])) : v);
 
@@ -148,11 +173,13 @@ function unparsable(err: unknown): boolean {
 export class Judge {
   private readonly cache = new Map<string, unknown>();
   private readonly batchSize: number;
+  private readonly listBatchSize: number;
   /** One gate for every call of this judge, whichever `batch()` asked for it. */
   private readonly gate: Gate;
 
   constructor(private readonly opts: JudgeOptions) {
     this.batchSize = opts.batchSize ?? 8;
+    this.listBatchSize = Math.max(1, Math.trunc(opts.listBatchSize ?? 1));
     this.gate = new Gate(opts.width ?? (() => opts.concurrency ?? 2), opts.widthCheckMs);
     if (opts.cacheFile && fs.existsSync(opts.cacheFile)) {
       for (const line of fs.readFileSync(opts.cacheFile, 'utf8').split('\n')) {
@@ -187,25 +214,40 @@ export class Judge {
    * of its own and under ids of its own, so no request repeats the first.
    */
   private async audited<I extends { id: string }, V>(
-    kind: string, system: string, items: I[], render: (item: I) => unknown, verdicts: Verdicts<V>, view: (v: V) => unknown,
+    kind: string, system: string, items: I[], render: (item: I) => unknown, verdicts: Verdicts<V>, view: (v: V, item: I) => unknown, size = this.batchSize,
+    also?: { kind: string; applies: (item: I) => boolean; view: (v: V, item: I) => unknown; max?: number },
   ): Promise<Verdicts<V>> {
     const a = this.auditing;
     if (!a) return verdicts;
     const judged = items.filter((i) => verdicts.has(i.id));
     const content = (i: I) => JSON.stringify([kind, system, render(i)]);
-    const sample = auditSample(judged, a.share, a.min ?? AUDIT_MIN_ITEMS, a.seed, content);
+    const regular = auditSample(judged, a.share, a.min ?? AUDIT_MIN_ITEMS, a.seed, content);
+    // a second part of the verdict that only some items have (a grade's key points): every such item is asked
+    // again, up to `max`, and its agreement recorded under a kind of its own — the regular sample would hold a
+    // handful of them, and the first kind's agreement stays that of the regular sample
+    const extra = also ? auditSample(judged.filter(also.applies), 1, 0, a.seed, content).slice(0, also.max ?? AUDIT_ALSO_MAX) : [];
+    const inRegular = new Set(regular.map((i) => i.id));
+    const sample = [...regular, ...extra.filter((i) => !inRegular.has(i.id))];
     if (!sample.length) return verdicts;
     const order = [...sample].sort((x, y) => fraction('audit-order', a.seed, content(x)) - fraction('audit-order', a.seed, content(y)));
-    const again = await this.batch<I, V>(`${kind}:audit`, system, order.map((i) => ({ ...i, id: `${i.id}~audit` })), render);
+    const again = await this.batch<I, V>(`${kind}:audit`, system, order.map((i) => ({ ...i, id: `${i.id}~audit` })), render, size);
     const at = new Date().toISOString();
     for (const item of sample) {
       const second = again.get(`${item.id}~audit`);
       if (second === undefined) continue;
       const first = verdicts.get(item.id)!;
-      a.record({
-        key: crypto.createHash('sha1').update(JSON.stringify(['judge-audit', content(item)])).digest('hex').slice(0, 20),
-        kind, id: item.id, item: cut(render(item)), first, second, agree: JSON.stringify(view(first)) === JSON.stringify(view(second)), at,
-      });
+      if (inRegular.has(item.id)) {
+        a.record({
+          key: crypto.createHash('sha1').update(JSON.stringify(['judge-audit', content(item)])).digest('hex').slice(0, 20),
+          kind, id: item.id, item: cut(render(item)), first, second, agree: JSON.stringify(view(first, item)) === JSON.stringify(view(second, item)), at,
+        });
+      }
+      if (also?.applies(item)) {
+        a.record({
+          key: crypto.createHash('sha1').update(JSON.stringify(['judge-audit', also.kind, content(item)])).digest('hex').slice(0, 20),
+          kind: also.kind, id: item.id, item: cut(render(item)), first, second, agree: JSON.stringify(also.view(first, item)) === JSON.stringify(also.view(second, item)), at,
+        });
+      }
     }
     return verdicts;
   }
@@ -220,7 +262,7 @@ export class Judge {
    * block, the model answers {"verdicts":[{"id":…, …}]}. Items already judged
    * come from the cache; an item the model left out comes back undefined.
    */
-  async batch<I extends { id: string }, V>(kind: string, system: string, items: I[], render: (item: I) => unknown): Promise<Verdicts<V>> {
+  async batch<I extends { id: string }, V>(kind: string, system: string, items: I[], render: (item: I) => unknown, size = this.batchSize): Promise<Verdicts<V>> {
     const out: Verdicts<V> = new Map();
     const keyOf = (item: I) => crypto.createHash('sha256').update(JSON.stringify([kind, system, render(item)])).digest('hex');
     const todo: I[] = [];
@@ -230,7 +272,7 @@ export class Judge {
       else todo.push(item);
     }
     const batches: I[][] = [];
-    for (let i = 0; i < todo.length; i += this.batchSize) batches.push(todo.slice(i, i + this.batchSize));
+    for (let i = 0; i < todo.length; i += size) batches.push(todo.slice(i, i + size));
     // a reply that does not parse (cut off at its token budget, prose around it) is asked again in halves, down to
     // one item, which is tried twice and then left unjudged: one bad reply must not stop a pack
     // the first call of this batch that failed: no call of it starts after that, and it is what the batch throws
@@ -301,8 +343,10 @@ export class Judge {
       return raw;
     };
     const raw = clamp(await this.batch<GradeItem, GradeVerdict>('grade', GRADE_SYSTEM, items, render));
-    // two grades agree on the score; the second is clamped as the first was
-    await this.audited('grade', GRADE_SYSTEM, items, render, raw, (v) => clampScore(v.score));
+    // two grades agree on the score; the second is clamped as the first was. A key-points answer is scored by the
+    // key points the grade names (score/usage.ts), so those are audited too, as the set of points each pass named
+    const points = (v: GradeVerdict, i: GradeItem) => [...new Set((Array.isArray(v.keypoints) ? v.keypoints.map(Number) : []).filter((k) => Number.isInteger(k) && k >= 0 && k < (i.keypoints?.length ?? 0)))].sort((x, y) => x - y);
+    await this.audited('grade', GRADE_SYSTEM, items, render, raw, (v) => clampScore(v.score), undefined, { kind: 'keypoints', applies: (i) => Boolean(i.keypoints?.length), view: points });
     return raw;
   }
 
@@ -320,21 +364,29 @@ export class Judge {
     return this.batch('decompose', DECOMPOSE_SYSTEM, items, (i) => ({ text: i.text.slice(0, 4000) }));
   }
 
+  /** Themes and needs (emergence probes): one list per call and compared as matchings, as `matchList` is. */
   async matchItems(items: { id: string; predicted: string[]; gold: string[] }[]): Promise<Verdicts<{ pairs: [number, number][] }>> {
     const render = (i: (typeof items)[number]) => ({
       predicted: i.predicted.map((p, n) => `${n}: ${p}`),
       gold: i.gold.map((g, n) => `${n}: ${g}`),
     });
-    return this.audited('match', MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('match', MATCH_SYSTEM, items, render), pairSet);
+    const view = (v: { pairs?: unknown }, i: (typeof items)[number]) => canonicalListPairs(v?.pairs, i.predicted.length, i.gold.length);
+    return this.audited('match', MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('match', MATCH_SYSTEM, items, render, this.listBatchSize), view, this.listBatchSize);
   }
 
-  /** Corpus-level lists (aggregate, timeline, contradiction, profile): a stricter match than themes — same name, number and date. */
+  /**
+   * Corpus-level lists (aggregate, timeline, contradiction, profile): a stricter match than themes — same name,
+   * number and date. One list per call: a list's verdict depends on that list alone, not on the answers it
+   * happened to share a batch with, so asking it again asks the same question. The audit compares the
+   * one-to-one matchings the two replies come to (`canonicalListPairs`), not the order they were written in.
+   */
   async matchList(items: { id: string; predicted: string[]; gold: string[] }[]): Promise<Verdicts<{ pairs: [number, number][] }>> {
     const render = (i: (typeof items)[number]) => ({
       predicted: i.predicted.map((p, n) => `${n}: ${p.slice(0, 400)}`),
       gold: i.gold.map((g, n) => `${n}: ${g.slice(0, 400)}`),
     });
-    return this.audited('list', LIST_MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('list', LIST_MATCH_SYSTEM, items, render), pairSet);
+    const view = (v: { pairs?: unknown }, i: (typeof items)[number]) => canonicalListPairs(v?.pairs, i.predicted.length, i.gold.length);
+    return this.audited('list', LIST_MATCH_SYSTEM, items, render, await this.batch<(typeof items)[number], { pairs: [number, number][] }>('list', LIST_MATCH_SYSTEM, items, render, this.listBatchSize), view, this.listBatchSize);
   }
 
   async linkCorrect(items: { id: string; head: string; relation: string; tail: string; sources: string[] }[]): Promise<Verdicts<{ correct: boolean }>> {

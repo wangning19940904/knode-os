@@ -71,7 +71,7 @@ const PROTOCOL = `# knode-os 研究协议（所有研究任务共用）
 3. 深挖，直到每个章节都有依据：
    - \`knode_search\`（mode=sag 做多跳检索）找相关段落；
    - \`knode_graph_search\` 看实体的关系网（可带 valid_at / valid_range 看某个时点的关系）；
-   - \`knode_claims\`（order=timeline 看时间线，include_superseded=true 看被替换的旧事实，subject 传实体名或别名）；
+   - \`knode_claims\`（order=timeline 看时间线：已含被替换的旧值，后续报告重复的同一说法折叠为一条并带 repeats，fold=false 逐条列出；subject 传实体名或别名）；
    - \`knode_read\` 读原文（\`raw/docs/...\`；PDF 读 \`.sidecar/<路径>/content.md\`；\`/entities/<id>.md\` 是实体的机器视图）；\`knode_grep\` 查精确字符串、代码、代号；
    - 代码问题读代码本身：先读仓库卡片 \`raw/docs/codebase/<仓库>.md\`（布局、依赖、代码地图），再 \`knode_grep\`（path="raw/codebase/<仓库>"）查符号、\`knode_search\`（kinds=["code"]）按语义找实现，\`knode_read\` 读文件；默认检索不含代码。
    - \`knode_disputes\` 看已记录的矛盾，\`knode_absences\` 看已知"查过但没有"的空档。
@@ -218,7 +218,7 @@ requires:
 
 ## 步骤
 
-1. \`knode_claims\`（subject={target}，order=timeline，include_superseded=true）拿到所有带日期的断言；\`knode_search\` 补充没有进入 claims 的事件。
+1. \`knode_claims\`（subject={target}，order=timeline）拿到按日期排列的变化（重复陈述已折叠，每条的 repeats 给出重述的日期；需要逐条时加 fold=false）；\`knode_search\` 补充没有进入 claims 的事件。
 2. **时间线**：每行 \`- YYYY-MM-DD · 事件 · （来源：…）\`，同一天多个事件分行；日期精度按资料（年 / 月 / 季 / 日）。
 3. 被后来事实替代的条目保留并标注 "（后被 … 替代）"。
 4. 把每个事件写进 frontmatter 的 claims（eventDate 必填）。

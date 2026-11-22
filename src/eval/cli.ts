@@ -7,13 +7,14 @@ import { exportAudit, importAudit } from './audit.js';
 import { installExternal } from './install.js';
 import { QuotaGuard, withRefusalRetry } from './quota.js';
 import { formatGrepability, grepability } from './grepability.js';
-import { formatLint, lintBeforeRun, lintPack } from './lint.js';
+import { abstainAnswered, formatLint, lintBeforeRun, lintPack } from './lint.js';
 import { loadPack, packsDir, validatePack } from './pack.js';
 import { listRecipes, recipe } from './packs/index.js';
 import { measurePack, writeMeasure } from './packs/measure.js';
 import { extendPack } from './packs/extend.js';
 import './packs/recipes.js';
-import { buildScaleData, renderScale, writeReport } from './report.js';
+import { buildScaleData, headroomEvidence, renderScale, writeReport } from './report.js';
+import { headroomAllocation, type AgentAllocation } from './allocation.js';
 import { parseLocal, runEval, scoreRun } from './run.js';
 import { Meter, sumEvents } from './meter.js';
 import { RunStore } from './runstore.js';
@@ -103,11 +104,69 @@ function repeatSampleOption(opts: { repeatSample?: string; repeat?: string }): n
   return n;
 }
 
+/** `--judge-list-batch`: lists the judge matches in one call (none given: 1). */
+function judgeListBatchOption(opts: { judgeListBatch?: string }): number | undefined {
+  if (opts.judgeListBatch === undefined) return undefined;
+  const n = Number(opts.judgeListBatch);
+  if (!Number.isInteger(n) || n < 1 || n > 16) throw new Error('--judge-list-batch: a whole number of lists a call, 1 to 16');
+  return n;
+}
+
 /** `--judge-audit`: the share of judge verdicts judged a second time (none given: 5%; 0: off). */
 function judgeAuditOption(opts: { judgeAudit?: string }): number | undefined {
   if (opts.judgeAudit === undefined) return undefined;
   const n = Number(opts.judgeAudit);
   if (!Number.isFinite(n) || n < 0 || n > 1) throw new Error('--judge-audit: a share between 0 and 1, e.g. 0.05 (0 turns the audit off)');
+  return n;
+}
+
+/** `--agent-weights` / `--agent-counts`: `type=n` pairs, `*` for every type not named. */
+function typeNumbers(flag: string, spec: string, whole: boolean): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const part of csv(spec) ?? []) {
+    const m = /^([^=\s]+)\s*=\s*(\S+)$/.exec(part);
+    if (!m) throw new Error(`${flag}: "${part}" is not type=number (e.g. aggregate=4,timeline=3,*=1)`);
+    const [, type, raw] = m;
+    if (type !== '*' && !(TASK_TYPES as readonly string[]).includes(type)) throw new Error(`${flag}: unknown task type ${type} (known: ${TASK_TYPES.join(', ')}, or * for the rest)`);
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0 || (whole && !Number.isInteger(n))) throw new Error(`${flag}: ${type}=${raw} is not ${whole ? 'a whole number' : 'a number'}, 0 or more`);
+    out[type] = n;
+  }
+  if (!Object.keys(out).length) throw new Error(`${flag}: name at least one type=number`);
+  return out;
+}
+
+/**
+ * The agent sample's allocation over task types: `--agent-weights`,
+ * `--agent-counts` or `--agent-headroom-from` (one of them), with
+ * `--agent-floor`. None: round-robin, as before (or, on a resume, what the
+ * run recorded).
+ */
+export function agentAllocationOption(opts: { agentWeights?: string; agentCounts?: string; agentHeadroomFrom?: string; agentFloor?: string }): AgentAllocation | undefined {
+  const given = [opts.agentWeights && '--agent-weights', opts.agentCounts && '--agent-counts', opts.agentHeadroomFrom && '--agent-headroom-from'].filter(Boolean);
+  if (given.length > 1) throw new Error(`${given.join(' and ')}: give one allocation`);
+  let floor: number | undefined;
+  if (opts.agentFloor !== undefined) {
+    floor = Number(opts.agentFloor);
+    if (!Number.isInteger(floor) || floor < 0) throw new Error('--agent-floor: a whole number of questions, 0 or more');
+    if (!opts.agentWeights && !opts.agentHeadroomFrom) throw new Error('--agent-floor: with --agent-weights or --agent-headroom-from');
+  }
+  if (opts.agentWeights) return { mode: 'weights', weights: typeNumbers('--agent-weights', opts.agentWeights, false), ...(floor !== undefined ? { floor } : {}) };
+  if (opts.agentCounts) return { mode: 'counts', counts: typeNumbers('--agent-counts', opts.agentCounts, true) };
+  if (opts.agentHeadroomFrom) {
+    const from = csv(opts.agentHeadroomFrom)!.map((p) => path.resolve(p));
+    const evidence = headroomEvidence(from);
+    if (!Object.keys(evidence).length) throw new Error(`--agent-headroom-from: no questions scored for two or more agent arms in ${from.join(', ')}`);
+    return headroomAllocation(evidence, { floor, from });
+  }
+  return undefined;
+}
+
+/** `--agent-update-limit`: update tasks a pack for agents (none given: all of them). */
+function agentUpdateLimitOption(opts: { agentUpdateLimit?: string }): number | undefined {
+  if (opts.agentUpdateLimit === undefined) return undefined;
+  const n = Number(opts.agentUpdateLimit);
+  if (!Number.isInteger(n) || n < 0) throw new Error('--agent-update-limit: a whole number of tasks, 0 or more');
   return n;
 }
 
@@ -203,11 +262,29 @@ export function registerEvalCommands(program: Command): void {
     .description('check packs for what makes a benchmark measure its own artifacts (docs/design/33 §4): one-class words, ambiguous subjects, file-name answers, family minimums, duplicate questions, hop shortcuts')
     .option('--examples <n>', 'findings shown per rule', '5')
     .option('--json <file>', 'write every finding as JSON')
+    .option('--answers <runDirs>', "also check each pack's unanswerable questions against the answers of these run directories (comma-separated): one that two or more systems answered, citing the same document, is suspect — read the passage before trusting the gold")
     .action((dirs: string[], opts) => {
-      const results = dirs.map((d) => lintPack(loadPack(resolvePack(d))));
+      const packs = dirs.map((d) => loadPack(resolvePack(d)));
+      const results = packs.map((p) => lintPack(p));
       for (const r of results) console.log(formatLint(r, Number(opts.examples)));
-      if (opts.json) fs.writeFileSync(opts.json, JSON.stringify(results, null, 1) + '\n');
-      if (results.some((r) => r.findings.length)) process.exitCode = 1;
+      // the second signal for abstain tasks: what a run's systems answered (rule abstain-answered, advisory)
+      const answered = (csv(opts.answers) ?? []).flatMap((dir: string) => {
+        const store = new RunStore(path.resolve(dir));
+        if (!store.meta()) throw new Error(`--answers: not a run directory: ${dir}`);
+        const answers = store.allAnswers();
+        const scores = store.allScores();
+        return packs.flatMap((p) => {
+          const ids = new Set([p.manifest.id, path.basename(p.dir)]);
+          const found = abstainAnswered(p, answers.filter((a) => ids.has(a.pack)), scores.filter((x) => ids.has(x.pack) && x.taskId !== undefined).map((x) => ({ system: x.system, taskId: x.taskId!, metric: x.metric, value: x.value })));
+          return found.map((f) => ({ pack: p.manifest.id, run: path.resolve(dir), ...f }));
+        });
+      });
+      if (opts.answers) {
+        console.log(answered.length ? `\nabstain-answered (${answered.length}): unanswerable questions a run's systems answered from one document` : '\nabstain-answered: none');
+        for (const f of answered) console.log(`  ${f.pack} ${f.task}: ${f.message}\n    ${f.question}`);
+      }
+      if (opts.json) fs.writeFileSync(opts.json, JSON.stringify(opts.answers ? { results, abstainAnswered: answered } : results, null, 1) + '\n');
+      if (results.some((r) => r.findings.length) || answered.length) process.exitCode = 1;
     });
 
   pack
@@ -281,6 +358,12 @@ export function registerEvalCommands(program: Command): void {
     .option('--limit <n>', 'tasks per pack (stratified by type)')
     .option('--types <list>', `only these task types, comma-separated (e.g. aggregate,timeline,contradiction,profile,deep-hop,update)`)
     .option('--agent-limit <n>', 'tasks per pack for agent systems', '30')
+    .option('--agent-weights <type=w,…>', 'spread the agent tasks over task types by these weights instead of evenly, e.g. aggregate=4,timeline=3,*=1 (* = the types not named, default 1; 0 leaves a type out)')
+    .option('--agent-counts <type=n,…>', 'exactly this many agent tasks of each type (at most what the pack has), e.g. aggregate=12,timeline=12,*=1 (* = the types not named, default 0); --agent-limit does not apply')
+    .option('--agent-headroom-from <records>', "derive the agent weights per pack from earlier records: run directories, report.json, scores.jsonl or a campaign.json, comma-separated — each type weighted by how far apart the agent arms' scores came on its questions (mean highest − lowest), ceiling families kept to the floor; score those records with the current list matching first (eval score), since two judge passes disagreeing on a list reads as spread between the arms")
+    .option('--agent-floor <n>', 'with --agent-weights or --agent-headroom-from: agent tasks every type gets before the weights share the rest (default 0 with weights, 1 with headroom)')
+    .option('--agent-budget <n>', 'commands every answering agent is told it has and is held to (n and two more), 1 to 20 (default 20): a low budget tests whether what an arm has beside grep lets it answer in fewer steps; one budget a run directory')
+    .option('--agent-update-limit <n>', 'at most n update tasks per pack for agent systems, seeded (default: all of them)')
     .option('--fraction <f>', 'share of the corpus to use; above 1, that many times its size with the pack\'s padding (scale curves)', '1')
     .option('--seed <seed>', 'sampling seed', '0')
     .option('--local <slots>', "slots in this run's process that take its work like a worker, e.g. codex:6,claude:1 (Codex: model calls and agent sessions; claude: the judge). Without --local and without a worker nothing runs: the run waits")
@@ -301,10 +384,17 @@ export function registerEvalCommands(program: Command): void {
     .option('--pool <name>', "every piece of the run requires this pool: only workers started with --pool <name> (default: their token's name) take it, and this run's --local slots, which join it")
     .option('--repeat <n>', 'answer each task n times, for run-to-run variance (repeat 1 keeps the usual record keys)', '1')
     .option('--repeat-systems <list>', 'with --repeat: only these systems (default: every system that answers)')
+    .option('--judge-list-batch <n>', 'lists the judge matches in one call (default 1: a list\'s verdict depends on that list alone, one call a list; 8 was the earlier behaviour and takes an eighth of the calls)')
     .option('--judge-audit <share>', 'judge this share of the verdicts a second time, in calls of their own with the items in another order, and list where the two disagree (default 0.05, at least 20 a pass; 0 = off)')
     .option('--repeat-sample <n>', 'with --repeat: repeat only a seeded sample of n tasks per pack, stratified by task type and the same for every repeated system (the first answer still covers every task)')
     .option('--no-lint', 'run even when `eval pack lint` finds something in a pack (it runs first otherwise, and a finding stops the run before anything is spent)')
     .action(async (opts) => {
+      // the agents' command budget, read where their briefs are written (systems/agents.ts)
+      if (opts.agentBudget !== undefined) {
+        const n = Number(opts.agentBudget);
+        if (!Number.isInteger(n) || n < 1 || n > 20) throw new Error('--agent-budget: a whole number of commands, 1 to 20');
+        process.env.KNODE_EVAL_AGENT_BUDGET = String(n);
+      }
       if (opts.lint !== false) {
         const gate = lintBeforeRun(csv(opts.pack)!.map(resolvePack).map((d) => loadPack(d)));
         if (!gate.ok) {
@@ -326,6 +416,7 @@ export function registerEvalCommands(program: Command): void {
         })(),
         repeatSample: repeatSampleOption(opts),
         judgeAudit: judgeAuditOption(opts),
+        judgeListBatch: judgeListBatchOption(opts),
         packs: csv(opts.pack)!.map(resolvePack),
         // a track is recorded as the systems it stands for, so a resumed run asks the same ones
         systems: expandSystems(csv(opts.systems) ?? DEFAULT_SYSTEMS),
@@ -356,6 +447,8 @@ export function registerEvalCommands(program: Command): void {
           return types as TaskType[] | undefined;
         })(),
         agentLimit: Number(opts.agentLimit),
+        agentAllocation: agentAllocationOption(opts),
+        agentUpdateLimit: agentUpdateLimitOption(opts),
         fraction: Number(opts.fraction),
         seed: opts.seed,
         packConcurrency: Number(opts.packConcurrency),
@@ -497,11 +590,12 @@ export function registerEvalCommands(program: Command): void {
     .option('--offer-seconds <s>', 'no longer applies: a call waits until a slot takes it (see --wait-minutes)')
     .option('--wait-minutes <n>', 'stop cleanly (non-zero) when a call has waited this long while no slot online takes it; 0 = no limit', '30')
     .option('--pool <name>', 'the judge\'s calls require this pool (workers started with --pool <name>, and --local slots)')
+    .option('--judge-list-batch <n>', 'lists the judge matches in one call (default 1: a list\'s verdict depends on that list alone, one call a list; 8 was the earlier behaviour and takes an eighth of the calls)')
     .option('--judge-audit <share>', 'judge this share of the verdicts a second time, in calls of their own with the items in another order, and list where the two disagree (default 0.05, at least 20 a pass; 0 = off)')
     .action(async (runDir: string, opts) => {
       let n: number;
       try {
-        n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, judgeConcurrency: judgeConcurrencyOption(opts), onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts), waitMinutes: waitMinutesOption(opts), pool: poolOption(opts), judgeAudit: judgeAuditOption(opts) });
+        n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, judgeConcurrency: judgeConcurrencyOption(opts), onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts), waitMinutes: waitMinutesOption(opts), pool: poolOption(opts), judgeAudit: judgeAuditOption(opts), judgeListBatch: judgeListBatchOption(opts) });
       } catch (err) {
         if (!(err instanceof RunStoppedError)) throw err;
         console.error(`\n${err.message}`);

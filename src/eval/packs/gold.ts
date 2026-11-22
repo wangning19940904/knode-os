@@ -2,6 +2,7 @@ import { mapLimit } from '../../bench/util.js';
 import type { LlmClient } from '../../llm/client.js';
 import { foldSpace, seededKey, shortHash as id } from '../pack.js';
 import { Bm25, chunkDocs } from '../retrieval.js';
+import { ABSENT_COVERAGE, absentCorpus, bestPassage } from './absent.js';
 import type { GoldFact, Task } from '../types.js';
 
 /**
@@ -11,8 +12,9 @@ import type { GoldFact, Task } from '../types.js';
  * a substring of its document; tasks are written from those facts, then each
  * is answered by the author reading only its evidence (the oracle check) and
  * dropped when that answer does not match — gold an oracle cannot recover is
- * noise. Unanswerable questions are kept only when the author, shown the
- * passages most likely to answer them, agrees the corpus does not.
+ * noise. Unanswerable questions are kept only when no passage of the corpus
+ * holds their distinctive terms together and the author, shown the passages
+ * most likely to answer them whole, agrees the corpus does not.
  */
 
 export interface DocText {
@@ -150,7 +152,7 @@ Answer with JSON: {"tasks":[{"fact":"<fact id>","question":"…","answer":"…"}
   if (opts.plan.global) {
     const sample = pick(facts, 60, seed, (f) => f.id);
     const r = await author.completeJson<{ tasks?: { question?: string; keypoints?: string[]; facts?: string[] }[] }>([
-      { role: 'system', content: `From these facts drawn across a document collection, write ${opts.plan.global} broad questions in ${lang} that need many documents to answer well (main themes, how views differ, what changed over time). For each give 4–6 keypoints a good answer contains, each backed by the listed facts, and the fact ids behind them.
+      { role: 'system', content: `From these facts drawn across a document collection, write ${opts.plan.global} broad questions in ${lang} that need many documents to answer well (main themes, how views differ, what changed over time). For each give 4–6 keypoints a good answer contains, at the level the question asks: each keypoint a theme, contrast or trend a summary answer would state (it may name an example in parentheses), backed by at least two of the listed facts from different documents — never a single document's detail (a method's parts, one figure) that a good summary could leave out. List the fact ids behind them.
 Answer with JSON: {"tasks":[{"question":"…","keypoints":["…"],"facts":["<fact id>"]}]}` },
       { role: 'user', content: JSON.stringify(sample.map((f) => ({ id: f.id, text: f.text }))) },
     ], { maxTokens: 3000 });
@@ -166,27 +168,68 @@ Answer with JSON: {"tasks":[{"question":"…","keypoints":["…"],"facts":["<fac
   const unique = drafts.filter((d) => (seenIds.has(d.id) ? false : (seenIds.add(d.id), true)));
   const kept = await oracleCheck(author, unique, docText, lang, opts.log);
 
-  // unanswerable: plausible questions the corpus does not answer, confirmed against the likeliest passages
-  if (opts.plan.unanswerable) {
-    const entities = [...byEntity.keys()].slice(0, 80);
-    const r = await author.completeJson<{ questions?: string[] }>([
-      { role: 'system', content: `Write ${opts.plan.unanswerable * 2} questions in ${lang} about the entities below that sound natural for this collection but that these facts do NOT answer (ask for a detail none of them gives — a figure, a date, a reason, a person). Stand-alone.
-Answer with JSON: {"questions":["…"]}` },
-      { role: 'user', content: JSON.stringify({ entities, facts: pick(facts, 40, seed, (f) => f.id).map((f) => f.text) }) },
-    ], { maxTokens: 2000 });
-    const index = new Bm25(chunkDocs(docs.map((d) => ({ path: d.path, text: d.text }))), (c) => c.text);
-    const qs = (r.questions ?? []).filter(Boolean);
-    const check = await author.completeJson<{ verdicts?: { i?: number; answerable?: boolean }[] }>([
-      { role: 'system', content: 'For each question, decide whether the passages answer it. Answer with JSON: {"verdicts":[{"i":<index>,"answerable":true|false}]}' },
-      { role: 'user', content: JSON.stringify(qs.map((q, i) => ({ i, question: q, passages: index.search(q, 5).map((h) => h.item.text.slice(0, 800)) }))) },
-    ], { maxTokens: 2000 });
-    const no = new Set((check.verdicts ?? []).filter((v) => v.answerable === false && typeof v.i === 'number').map((v) => v.i!));
-    qs.filter((_, i) => no.has(i)).slice(0, opts.plan.unanswerable).forEach((q) => {
-      kept.push({ id: `${prefix}-u-${id(q)}`, suite: 'usage', type: 'unanswerable', lang: opts.lang, question: q, scoring: 'abstain', evidence: [] });
-    });
-  }
+  // unanswerable: plausible questions the corpus does not answer, confirmed against the corpus itself
+  if (opts.plan.unanswerable) kept.push(...await draftUnanswerable(author, facts, docs, { lang, langCode: opts.lang, n: opts.plan.unanswerable, seed, prefix, entities: [...byEntity.keys()], log: opts.log }));
   opts.log?.(`tasks: ${drafts.length} drafted, ${kept.length} kept after the oracle check`);
   return kept;
+}
+
+/**
+ * Unanswerable questions (docs/design/23 §2), checked against the corpus and
+ * not against the facts drafted from it. The 2026-11 campaign found drafted
+ * "unanswerable" questions that a document answers word for word (SURMOUNT-CN
+ * randomised 210 participants; 间-二巯基琥珀酸 0.5g): the author was asked
+ * for details "these facts do NOT answer", the facts being a 40-fact sample
+ * of at most a few per document, so it asked about the rest of the documents
+ * — often what it knew of the subject already — and the check showed it the
+ * five BM25 chunks cut to their first 800 of 1,200 characters, all questions
+ * in one call. Now:
+ *
+ * - the author is told the facts are a sample, and to ask for what documents
+ *   of this kind would not record, not for what it knows of the subject;
+ * - a question whose distinctive terms co-occur in one passage of the corpus
+ *   (packs/absent.ts, the lint rule `abstain-in-corpus`) is dropped before
+ *   any check, without a model;
+ * - the rest are checked a few at a time against whole passages: the BM25
+ *   hits and the passage holding most of the question's terms, uncut.
+ * A question is kept only when the author says, explicitly, that none answers it.
+ */
+export async function draftUnanswerable(author: LlmClient, facts: GoldFact[], docs: DocText[], opts: { lang: string; langCode: string; n: number; seed: string | number; prefix: string; entities: string[]; log?: (m: string) => void }): Promise<Task[]> {
+  const r = await author.completeJson<{ questions?: string[] }>([
+    { role: 'system', content: `Write ${opts.n * 3} questions in ${opts.lang} about the entities below that sound natural for this collection but that its documents do NOT answer. The facts listed are only a sample of what the documents say: do not ask for a figure, date or name that documents of this kind normally report (a trial's enrolment or results, a dose a reference lists, a law's effective date), and never ask for something you know of the subject yourself. Ask instead for a detail such documents would not record (a private remark, a later event, a figure no source of this kind gives). Stand-alone.
+Answer with JSON: {"questions":["…"]}` },
+    { role: 'user', content: JSON.stringify({ entities: opts.entities.slice(0, 80), facts: pick(facts, 40, opts.seed, (f) => f.id).map((f) => f.text) }) },
+  ], { maxTokens: 2500 });
+  const drafted = [...new Set((r.questions ?? []).map((q) => String(q).trim()).filter(Boolean))];
+  const corpus = absentCorpus(docs, drafted);
+  const hits = new Map(drafted.map((q) => [q, bestPassage(q, corpus)]));
+  const candidates = drafted.filter((q) => (hits.get(q)?.coverage ?? 0) < ABSENT_COVERAGE);
+  const chunks = chunkDocs(docs.map((d) => ({ path: d.path, text: d.text })));
+  const index = new Bm25(chunks, (c) => c.text);
+  const byDoc = new Map<string, typeof chunks>();
+  for (const c of chunks) (byDoc.get(c.doc) ?? byDoc.set(c.doc, []).get(c.doc)!).push(c);
+  // the passages to show: BM25's best, and the chunks of the document that holds most of the question's terms
+  const passagesOf = (q: string) => {
+    const shown = index.search(q, 6).map((h) => h.item);
+    const near = hits.get(q)?.doc;
+    for (const c of near ? byDoc.get(near) ?? [] : []) if (shown.length < 9 && !shown.includes(c)) shown.push(c);
+    return shown.map((c) => `[${c.doc}] ${c.text}`);
+  };
+  const absent = new Set<string>();
+  for (let i = 0; i < candidates.length; i += 4) {
+    const group = candidates.slice(i, i + 4);
+    const check = await author.completeJson<{ verdicts?: { i?: number; answerable?: boolean }[] }>([
+      { role: 'system', content: 'For each question, read every passage and decide whether any of them answers it, fully or in part (a figure, a date, a name, a reason it asks for). Answer with JSON: {"verdicts":[{"i":<index>,"answerable":true|false}]}' },
+      { role: 'user', content: JSON.stringify(group.map((q, k) => ({ i: k, question: q, passages: passagesOf(q) }))) },
+    ], { maxTokens: 1500 }).catch((err) => {
+      opts.log?.(`unanswerable check failed: ${err instanceof Error ? err.message : String(err)}`);
+      return { verdicts: [] };
+    });
+    for (const v of check.verdicts ?? []) if (v.answerable === false && typeof v.i === 'number' && group[v.i]) absent.add(group[v.i]);
+  }
+  opts.log?.(`unanswerable: ${drafted.length} drafted, ${drafted.length - candidates.length} dropped for terms that co-occur in one passage, ${absent.size} confirmed absent`);
+  return drafted.filter((q) => absent.has(q)).slice(0, opts.n)
+    .map((q) => ({ id: `${opts.prefix}-u-${id(q)}`, suite: 'usage' as const, type: 'unanswerable' as const, lang: opts.langCode, question: q, scoring: 'abstain' as const, evidence: [] }));
 }
 
 /** Keep the drafts the author, reading only their evidence, answers the way the gold does. */
