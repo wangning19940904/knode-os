@@ -48,6 +48,7 @@ built, which later record replaced parts of it, and what in it is stale.
 | 33 | [The evaluation as a ladder: what search adds, what the wiki adds, what knode's tools add](33-evaluation-ladder.md) | Stages 1–3 built; stages 4 and 5 not done | §8 |
 | 34 | [Ask: sets and states computed from the claims, and a second round when the first is thin](34-ask-from-claims.md) | Built | §6.2 |
 | 35 | [Evaluation workspaces: a run's knowledge bases open in the app](35-evaluation-workspaces.md) | Stages 1 and 2 built and merged (396fe1e); stages 3 and 4 not built | §8 |
+| 37 | [Behaviour pages for code, kept true by diffs, and an evaluation that asks where a change lands](37-behaviour-pages-and-localization-eval.md) | Proposed (2026-11-22) — not built | — |
 
 ## Reading order for a newcomer
 
