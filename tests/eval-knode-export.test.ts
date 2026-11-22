@@ -191,12 +191,13 @@ describe("knode-ask's retrieval", () => {
       const a = await sys.answer!(task, taskPrompt(task), env);
       expect(backend.asked, id).toHaveLength(1);
       const prompt = backend.asked[0];
-      // read back from the prompt itself: the passages as it numbers them (`[n] (path)` or `[n] (path, excerpt)`, then
-      // the text), then the facts, each with the one source it shows
+      // read back from the prompt itself: the passages as it numbers them (`[n] (path)`, or with the source's date and
+      // what the passage is: `[n] (path, 2026-01-05, newest, widened)`, then the text), then the facts, each with the
+      // one source it shows
       const question = prompt.indexOf('\n\n# Question');
       const factsAt = prompt.indexOf('\n\n# Known facts');
       const context = prompt.slice(prompt.indexOf('# Context'), factsAt >= 0 ? factsAt : question);
-      const heads = [...context.matchAll(/^\[\d+\] \(([^),]+)(?:, excerpt)?\)$/gm)];
+      const heads = [...context.matchAll(/^\[\d+\] \(([^),]+)(?:, [^)\n]*)?\)$/gm)];
       const sent: string[] = [];
       const sources: string[] = [];
       heads.forEach((h, i) => {

@@ -323,6 +323,40 @@ export async function expandGroups(q: Queryable, ids: readonly string[]): Promis
   return [...out];
 }
 
+/** An entity with more aliases than this is a sector or a theme, not a setting a report names two ways: no twins are read for it. */
+export const TWIN_ALIASES_MAX = 16;
+
+/**
+ * The short-name twins of entities already resolved: a live entity of the same type, merged into nothing, that goes
+ * by one of their names or aliases (by exact lookup key) when no other entity does. A report that defines a setting
+ * once with its code and short name ("new daily push cap: 3 pushes (code GRW1-C1, short name the push quota)") and
+ * changes it later under the short name ("the push quota moves to 6 pushes") has the current value extracted onto
+ * an entity of its own, which the full name's aliases list and nothing merged (the rule `knode_claims` reaches
+ * twins by, src/store/claims.ts, on the alias keys: indexed, where alias lists on 164k entities are not).
+ */
+export async function shortNameTwins(q: Queryable, ids: readonly string[]): Promise<string[]> {
+  const list = [...new Set(ids)];
+  if (list.length === 0) return [];
+  const rows = await q.query<{ id: string }>(
+    `WITH own AS MATERIALIZED (
+       SELECT e.id, e.type, k.alias_key
+         FROM entities e JOIN entity_alias_keys k ON k.entity_id = e.id AND k.kind = 'exact'
+        WHERE e.id = ANY($1::text[]) AND e.tx_to IS NULL
+          AND jsonb_array_length(CASE WHEN jsonb_typeof(e.aliases) = 'array' THEN e.aliases ELSE '[]'::jsonb END) <= $2),
+     hit AS MATERIALIZED (
+       SELECT own.id AS owner, own.type AS owner_type, own.alias_key, t.id, t.type, t.canonical_id, t.tx_to
+         FROM own JOIN entity_alias_keys k ON k.alias_key = own.alias_key AND k.kind = 'exact' AND k.entity_id <> own.id
+         JOIN entities t ON t.id = k.entity_id)
+     SELECT DISTINCT h.id FROM hit h
+      WHERE h.tx_to IS NULL AND h.canonical_id IS NULL AND h.type = h.owner_type
+        AND NOT EXISTS (SELECT 1 FROM hit o WHERE o.owner = h.owner AND o.alias_key = h.alias_key AND o.id <> h.id
+                          AND o.tx_to IS NULL AND o.canonical_id IS DISTINCT FROM h.owner)`,
+    [list, TWIN_ALIASES_MAX],
+  );
+  const named = new Set(list);
+  return rows.map((r) => r.id).filter((id) => !named.has(id));
+}
+
 /** The live entity a name stands for. */
 export interface NamedEntity {
   id: string;

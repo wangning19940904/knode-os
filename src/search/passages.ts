@@ -257,6 +257,7 @@ export async function widenPassages(store: Store, question: string, contexts: Se
       score: contexts[at].score,
       signals: contexts[at].signals,
       widened: { seqs: pick.map((c) => c.seq), of: chunks.length },
+      ...(contexts[at].newest && !isSummary ? { newest: contexts[at].newest } : {}),
     };
     // a source chunk's passage takes its place when it holds it, and follows it otherwise; a summary's follows it
     if (isSummary || !held.has(contexts[at].chunkId)) after.set(at, passage);

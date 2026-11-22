@@ -1,8 +1,9 @@
 import { findLinks, tier0Known } from '../graph/concepts.js';
-import { expandGroups } from '../graph/resolve.js';
+import { expandGroups, shortNameTwins } from '../graph/resolve.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { Params, relationSourceSql, toDateString } from '../store/temporal.js';
 import { ClaimItem, SearchResult } from '../types.js';
+import { RECENCY_TERMS } from './newest.js';
 import { entityMatchSql, keywordTerms, termCount } from './search.js';
 
 /**
@@ -53,11 +54,17 @@ export interface FactOptions {
 const NAMED_MAX = 6;
 /** Claims read per route. A company in a finance workspace has thousands; the newest are the ones asked about. */
 const ROUTE_CAP = 300;
+/** A named entity with at most this many candidate claims is a specific thing the question asks about (`factsForQuestion`). */
+const SPECIFIC_MAX = 30;
 /** Claims taken from one source before every other source has had its turn. */
 const PER_SOURCE = 3;
 const RRF_K = 60;
 
-/** The live entities a text names, most often first, with the ones merged into them. */
+/**
+ * The live entities a text names, most often first, with the ones merged into them and their short-name twins
+ * (`shortNameTwins`): a setting changed under its short name has its current value there, and a question naming
+ * the setting by its full name was answered from the initial value its own entity holds.
+ */
 export async function namedEntities(store: Store, text: string, max = NAMED_MAX): Promise<string[]> {
   const { index } = await tier0Known(store);
   const counts = new Map<string, number>();
@@ -66,7 +73,9 @@ export async function namedEntities(store: Store, text: string, max = NAMED_MAX)
     if (id) counts.set(id, (counts.get(id) ?? 0) + 1);
   }
   const ids = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, max).map(([id]) => id);
-  return ids.length ? expandGroups(store, ids) : [];
+  if (ids.length === 0) return [];
+  const [grouped, twins] = await Promise.all([expandGroups(store, ids), shortNameTwins(store, ids).catch(() => [] as string[])]);
+  return [...new Set([...grouped, ...twins])];
 }
 
 /** Documents of a named entity read at most, for excerpts: a name in every document narrows nothing. */
@@ -96,7 +105,7 @@ const NEIGHBOURS_CAP = 60;
 const VARIANTS_CAP = 60;
 
 const LIVE_CLAIM = `cl.tx_to IS NULL AND cl.canonical_id IS NULL AND cl.superseded_by IS NULL`;
-const CLAIM_COLUMNS = `se.name AS subject, oe.name AS object, cl.type, cl.statement, cl.status, cl.kind,
+const CLAIM_COLUMNS = `cl.subject_id, se.name AS subject, oe.name AS object, cl.type, cl.statement, cl.status, cl.kind,
   cl.valid_from, cl.valid_to, cl.event_at, s.key AS path, cl.evidence_count, cl.chunk_id`;
 /** A claim's nearness to the question, where it has an embedding of the question's model. */
 const simOf = (vector: string, model: string) =>
@@ -104,7 +113,7 @@ const simOf = (vector: string, model: string) =>
 const CLAIM_JOINS = `JOIN entities se ON se.id = cl.subject_id LEFT JOIN entities oe ON oe.id = cl.object_id LEFT JOIN scopes s ON s.id = cl.primary_scope_id`;
 
 interface Row {
-  id: string; via: number; subject: string; object: string | null; type: string; statement: string; status: string; kind: string;
+  id: string; via: number; subject_id: string; subject: string; object: string | null; type: string; statement: string; status: string; kind: string;
   valid_from: string | null; valid_to: string | null; event_at: string | null; path: string | null; evidence_count: number; chunk_id: string | null; sim: number | null;
 }
 
@@ -154,12 +163,43 @@ export async function factsForQuestion(store: Store, question: string, contexts:
   const pool = rows.filter((r) => !(r.chunk_id && inContext.has(r.chunk_id) && r.status === 'fact' && (r.kind ?? 'fact') === 'fact'));
   if (pool.length === 0) return [];
 
-  const picked = pickRelevant(question, pool, limit, { sim: (r) => r.sim, named: (r) => r.via === 0 });
+  // a claim about a named entity's short-name twin ("PAY1-C1 is 9000 dollars from week 33") is about the entity
+  // the question names by its full name ("per-refund approval limit"): it is matched under both names
+  const owners = await aliasOwners(store, named);
+  // a question naming a team and one of its settings asks about the setting: claims about a named entity with few
+  // claims rank by that too, beside the words and the embedding (the team's hundreds stay ranked by those alone)
+  const namedSet = new Set(named);
+  const perSubject = new Map<string, number>();
+  for (const r of pool) if (namedSet.has(r.subject_id) && !r.id.startsWith('relation:')) perSubject.set(r.subject_id, (perSubject.get(r.subject_id) ?? 0) + 1);
+  const specific = perSubject.size > 1 ? (r: Row) => {
+    const n = r.id.startsWith('relation:') ? 0 : perSubject.get(r.subject_id) ?? 0;
+    return n > 0 && n <= SPECIFIC_MAX ? 1 / n : null;
+  } : undefined;
+  const picked = pickRelevant(question, pool, limit, {
+    sim: (r) => r.sim, named: (r) => r.via === 0, specific,
+    text: (r) => {
+      const owner = owners.get(r.subject.toLowerCase());
+      return owner && owner !== r.subject ? `${owner} ${r.subject} ${r.statement} ${r.object ?? ''}` : `${r.subject} ${r.statement} ${r.object ?? ''}`;
+    },
+  });
   return picked.map((r) => ({
     id: r.id, subject: r.subject, object: r.object, type: r.type, statement: r.statement, status: r.status, kind: r.kind,
     startDate: toDateString(r.valid_from), endDate: toDateString(r.valid_to), eventDate: toDateString(r.event_at),
     path: r.path, evidenceCount: r.evidence_count, chunkId: r.chunk_id,
   }));
+}
+
+/** The named entities' names by each of their aliases (lowercased): a twin goes by one of those. */
+async function aliasOwners(store: Store, named: string[]): Promise<Map<string, string>> {
+  if (named.length === 0) return new Map();
+  const rows = await store.query<{ name: string; aliases: unknown }>(`SELECT name, aliases FROM entities WHERE id = ANY($1::text[])`, [named]).catch(() => []);
+  const out = new Map<string, string>();
+  for (const r of rows) {
+    for (const a of Array.isArray(r.aliases) ? r.aliases : []) {
+      if (typeof a === 'string' && a.length > 1 && a.toLowerCase() !== r.name.toLowerCase() && !out.has(a.toLowerCase())) out.set(a.toLowerCase(), r.name);
+    }
+  }
+  return out;
 }
 
 /**
@@ -191,7 +231,7 @@ async function listRoutes(store: Store, named: string[], vector: { literal: stri
   const relationPath = relationSourceSql('r', 'path');
   const [relations, claims] = await Promise.all([
     store.query<Row>(
-      `SELECT 'relation:' || r.id AS id, 0 AS via, se.name AS subject, te.name AS object, r.type,
+      `SELECT 'relation:' || r.id AS id, 0 AS via, r.source_id AS subject_id, se.name AS subject, te.name AS object, r.type,
               se.name || ' ' || replace(r.type, '_', ' ') || ' ' || te.name || CASE WHEN r.description <> '' THEN ': ' || r.description ELSE '' END AS statement,
               'fact' AS status, 'fact' AS kind, r.valid_from, r.valid_to, NULL::timestamptz AS event_at,
               COALESCE((SELECT d.path FROM documents d WHERE d.id = r.document_id), ${relationPath}) AS path,
@@ -243,11 +283,19 @@ export function pickRelevant<T extends RankableClaim>(
   question: string,
   pool: T[],
   limit: number,
-  opts: { sim?: (c: T) => number | null | undefined; named?: (c: T) => boolean } = {},
+  opts: {
+    sim?: (c: T) => number | null | undefined;
+    named?: (c: T) => boolean;
+    /** The text a claim is matched by (default its subject, statement and object). */
+    text?: (c: T) => string;
+    /** A third order, fused like the other two: how specific to the question the claim's subject is (higher first; null: not ranked by it). */
+    specific?: (c: T) => number | null | undefined;
+  } = {},
 ): T[] {
   if (pool.length === 0 || limit <= 0) return [];
-  const terms = keywordTerms(question);
-  const texts = pool.map((r) => `${r.subject} ${r.statement} ${r.object ?? ''}`.toLowerCase());
+  // "now", "最新": the question asks for the latest state, and claims holding the word are no nearer to it
+  const terms = keywordTerms(question).filter((t) => !RECENCY_TERMS.has(t.toLowerCase()));
+  const texts = pool.map((r) => (opts.text ? opts.text(r) : `${r.subject} ${r.statement} ${r.object ?? ''}`).toLowerCase());
   const idf = terms.map((t) => {
     const df = texts.filter((x) => termCount(x, t) > 0).length;
     return df === 0 ? 0 : Math.log(1 + (pool.length - df + 0.5) / (df + 0.5));
@@ -260,11 +308,14 @@ export function pickRelevant<T extends RankableClaim>(
   };
   const byTerms = rankOf((i) => lexical[i]);
   const byVector = opts.sim ? rankOf((i) => opts.sim!(pool[i])) : new Map<number, number>();
+  const bySubject = opts.specific ? rankOf((i) => opts.specific!(pool[i])) : new Map<number, number>();
   const ranked = pool
     .map((r, i) => {
       let score = 0;
       if (byTerms.has(i)) score += 1 / (RRF_K + byTerms.get(i)! + 1);
       if (byVector.has(i)) score += 1 / (RRF_K + byVector.get(i)! + 1);
+      // only beside a match: a specific subject's claim that matches neither the words nor the embedding stays a named one
+      if (bySubject.has(i) && score > 0) score += 1 / (RRF_K + bySubject.get(i)! + 1);
       return { r, score, named: opts.named?.(r) ?? false };
     })
     .filter((x) => x.score > 0 || x.named)
