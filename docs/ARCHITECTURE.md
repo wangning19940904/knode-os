@@ -226,6 +226,8 @@ recommendations. **Dream** runs at `dream.schedule` (03:00) and writes
 Generators in `src/wiki/pages.ts`, `nav-views.ts` and `corpus-views.ts` each
 declare their inputs; a page re-renders only when its inputs' fingerprint
 (`sha16`) changes, and a human-written region of a page survives re-rendering.
+A page an agent or a person wrote has no `pages` row and is never re-rendered;
+its citations are dependencies of another kind (§5.4).
 Kinds: source summaries (a model-written body plus a generated claims region),
 entity pages, dataset pages, hot topics, the research index, navigation indexes
 and `overview.md`, and the model-free corpus pages `wiki/mentions/`,
@@ -244,6 +246,27 @@ bytes. Failures are classified `quota`, `transient`, `setup` or `other`; only
 the same agent. **Init** is a research job that reads the whole workspace and
 writes `wiki/overview.md` and the root `AGENTS.md`. Profiles live in
 `playbooks/research/profiles/`, agents in `playbooks/agents/`.
+
+**Keeping agent pages true** (design 37 §5). A wiki page no generator owns
+(no `pages` row) depends on the files it cites: when it is applied, every
+`raw/docs/…` and `raw/codebase/…` path in its text, with or without `#L…`,
+becomes a `deps` row on that document with its hash, `required: false`
+(`src/lineage/page-deps.ts`). The page's scope writes these rows, so `rebuild`
+and a sync produce the same rows. Repository cards are left out, and the
+commits of the cited repositories are kept in the scope's `meta.citedCommits`.
+Such a page is not a view: `propagate` and `reconcileViews` never mark,
+re-render or archive it. After each sync, `fileCitationRefreshes`
+(`src/research/cited-refresh.ts`) compares the recorded hashes with the index
+and gives each agent page whose cited files changed or went one `refresh`
+suggestion, the id the entity signal uses. Its reason counts the files and
+names the page's commit (`repositories[].commit`, else `citedCommits`) and
+the card's. Nothing is filed while a refresh job for the page is open, and a
+person's accept or reject holds until the state changes. The job's brief lists
+the changed and removed files: the job re-checks only the statements citing
+them and updates `repositories[].commit`. `research.auditAfterUpdates`
+(default 30, `0` off) files an audit suggestion after that many card versions
+with no rewrite; its brief asks for the entry points to be listed again.
+Human pages get the dependency rows and no suggestion.
 
 ## 6. Retrieval and answering
 

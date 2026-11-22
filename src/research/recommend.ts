@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { AppContext } from '../context.js';
@@ -10,6 +9,7 @@ import { queryTerms } from '../search/search.js';
 import { toIso } from '../store/temporal.js';
 import { hotEntities } from '../wiki/pages.js';
 import { detectCommunities } from '../wiki/refine.js';
+import { citationPayloadOf, wikiSuggestionId } from './cited-refresh.js';
 import { listJobs, queueJob } from './jobs.js';
 import { ResearchKind, researchSlug } from './templates.js';
 
@@ -46,9 +46,7 @@ export interface RecommendOptions {
   lookbackDays?: number;
 }
 
-export function wikiSuggestionId(kind: string, target: string): string {
-  return crypto.createHash('sha256').update(`wiki|${kind}|${target}`).digest('hex').slice(0, 16);
-}
+export { wikiSuggestionId };
 
 function norm(v: number, max: number): number {
   return max > 0 ? Math.min(1, v / max) : 0;
@@ -278,7 +276,9 @@ export async function refreshRecommendations(ctx: AppContext, opts: RecommendOpt
     await ctx.store.query(
       `INSERT INTO suggestions (id, kind, title, body, evidence, status, payload)
        VALUES ($1, 'wiki', $2, $3, $4::jsonb, 'pending', $5::jsonb)
-       ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, evidence = EXCLUDED.evidence, payload = EXCLUDED.payload,
+       ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, evidence = EXCLUDED.evidence,
+         -- a refresh filed for changed cited files keeps what it carries for the job's brief (src/research/cited-refresh.ts)
+         payload = EXCLUDED.payload || CASE WHEN suggestions.payload ? 'citations' THEN jsonb_build_object('citations', suggestions.payload -> 'citations') ELSE '{}'::jsonb END,
          status = CASE WHEN suggestions.status = 'stale' THEN 'pending' ELSE suggestions.status END`,
       [
         id, label,
@@ -298,7 +298,9 @@ export async function queueFromSuggestion(ctx: AppContext, payload: Record<strin
   const kind = typeof payload?.kind === 'string' ? (payload.kind as ResearchKind) : 'entity';
   const target = typeof payload?.target === 'string' ? payload.target : '';
   if (!target) throw new Error('wiki suggestion has no target');
-  return queueJob(ctx.store, kind === 'question' ? { kind, query: target, requestedBy } : { kind, target, requestedBy });
+  // a refresh filed because cited files changed carries them into the job's brief (src/research/workspace.ts)
+  const citations = kind === 'refresh' ? citationPayloadOf(payload) : null;
+  return queueJob(ctx.store, kind === 'question' ? { kind, query: target, requestedBy } : { kind, target, requestedBy, ...(citations ? { payload: { citations } } : {}) });
 }
 
 /** Auto mode: accept the best pending recommendations, at most `dailyJobs` per day. */

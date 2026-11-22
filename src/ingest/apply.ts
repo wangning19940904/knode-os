@@ -15,6 +15,7 @@ import { applyTier1Scope, enqueueTier1, segmentRangesOf } from '../graph/tier1.j
 import { PageContext } from '../graph/store.js';
 import { applyWirePlan, extractWikilinks, planWireFromMarkdown, WikiIndex } from '../graph/wire.js';
 import { isReservedWikiFile } from '../lineage/declared.js';
+import { CITE_DEPS_VERSION, CitationDepsPlan, planCitationDeps } from '../lineage/page-deps.js';
 import { applyScope, findLiveScope } from '../lineage/scope.js';
 import { ParsedMarkdown, parseFrontmatter, titleFromMarkdown } from '../markdown.js';
 import { isGeneratedConcept } from '../okf/index.js';
@@ -166,12 +167,17 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const citationsStale = root === 'wiki' && live !== null && live.sha === sha && sameModel
     && live.meta.citations !== CITATIONS_VERSION && live.meta.kind !== 'view'
     && !isReservedWikiFile(file) && raw.includes('raw/docs/');
+  // a page applied before its cited files became dependencies is read again once (docs/design/37 §5): this is
+  // the backfill of the research pages written earlier
+  const citeDepsStale = root === 'wiki' && live !== null && live.sha === sha && sameModel
+    && live.meta.citeDeps !== CITE_DEPS_VERSION && live.meta.kind !== 'view'
+    && !isReservedWikiFile(file) && (raw.includes('raw/docs/') || raw.includes('raw/codebase/'));
   // a mind map applied by an older planner is read again once (docs/design/19)
   const mindMapStale = live !== null && live.sha === sha && sameModel && live.meta.mindmap !== MINDMAP_PLAN_VERSION && looksLikeMindMap(raw);
   // a document applied under older date rules has its date read again, and is re-dated in place when it reads otherwise
   const code = root === 'codebase';
   const parse = (): ParsedMarkdown => (code ? { frontmatter: {}, body: raw } : parseFrontmatter(raw));
-  if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale && !mindMapStale) {
+  if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale && !citeDepsStale && !mindMapStale) {
     await redateDocument(store, live, { file, root, raw, sha, docId, at: opts.at, actor }, parse, progress);
     // a sidecar may have gained a replayable tier-1 extraction since (copied
     // from another machine, or written by a bench run) — apply it as the
@@ -259,6 +265,10 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     const typed = declaredWiki.citations.map((d) => ({ ...relationCitation(ontology, d), chunkId: null }));
     wirePlan.citations = dedupeCitations([...wirePlan.citations, ...typed]);
   }
+  // a wiki page no generator owns depends on the files it cites (docs/design/37 §5); a view's inputs are its generator's
+  const citeDeps: CitationDepsPlan | null = root === 'wiki' && isSource && !isReservedWikiFile(file)
+    ? await planCitationDeps(store, store.dataDir, raw)
+    : null;
   const declared = root === 'docs' && isSource ? frontmatterExtraction(fm) : null;
   // tier-0 links what the graph already knows and mines the rest; both are
   // planned here (two reads) so the scope body only writes
@@ -309,13 +319,14 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     {
       actor,
       at: opts.at,
-      force: Boolean(live && (!sameModel || opts.reapply || citationsStale || mindMapStale)),
+      force: Boolean(live && (!sameModel || opts.reapply || citationsStale || citeDepsStale || mindMapStale)),
       keepProjectionOnReplace: true,
       trust,
       acl: declaredAcl,
       meta: {
         documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title, dateRules: DOC_DATE_RULES,
-        ...(root === 'wiki' ? { citations: CITATIONS_VERSION } : {}),
+        ...(root === 'wiki' ? { citations: CITATIONS_VERSION, citeDeps: CITE_DEPS_VERSION } : {}),
+        ...(citeDeps && Object.keys(citeDeps.commits).length ? { citedCommits: citeDeps.commits } : {}),
         ...(mindMapPlan ? { mindmap: MINDMAP_PLAN_VERSION } : {}),
       },
     },
@@ -328,6 +339,9 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
         vectors,
         embedder.model,
       );
+      // the page's own deps row set: replacing the scope restores the previous set first, so a page that stops
+      // citing a file stops depending on it
+      if (citeDeps?.deps.length) await w.deps({ kind: 'page', id: file }, citeDeps.deps);
       if (wirePlan) {
         const s = await applyWirePlan(w, page, wirePlan, { extractor: 'tier0.wikilink' });
         g = { entities: g.entities + s.entities, relations: g.relations + s.relations };
