@@ -1,4 +1,6 @@
+import path from 'node:path';
 import { isolatedCopy, runAgent } from '../agent.js';
+import type { StagedCorpus } from '../pack.js';
 import { recordAgent, SystemEnv, SystemUnderTest } from './types.js';
 
 /**
@@ -51,6 +53,19 @@ export function armBrief(has: string, guide?: string): string {
 /** Arm A's sentence: the sources, nothing else. */
 export const GREP_HAS = 'The current directory holds the source documents.';
 
+/**
+ * A code localization pack's repository (docs/design/37 §3): the name of the one `codebase/<name>/`
+ * folder every staged document lies in, or null for any other corpus.
+ */
+export function stagedRepository(staged: Pick<StagedCorpus, 'docs'>): string | null {
+  const names = new Set(staged.docs.map((d) => /^codebase\/([^/]+)\//.exec(d.path)?.[1] ?? ''));
+  const [name] = names;
+  return names.size === 1 && name ? name : null;
+}
+
+/** Arm A's sentence on a repository: the session's working tree is the repository at its base commit. */
+export const GREP_HAS_REPOSITORY = (name: string) => `The current directory is the code repository ${name}: its files as of one commit, without git history.`;
+
 export function agentGrep(): SystemUnderTest {
   return {
     id: 'agent-grep',
@@ -62,17 +77,19 @@ export function agentGrep(): SystemUnderTest {
       await env.quota.wait();
       // a fresh copy per question: nothing one session leaves behind reaches the next
       const copy = isolatedCopy(env.staged.dir, 'corpus');
+      // a repository is the session's working tree, as it is for a coding agent (docs/design/37 §3)
+      const repo = stagedRepository(env.staged);
       try {
         const r = await runAgent({
-          cwd: copy.dir,
+          cwd: repo ? path.join(copy.dir, 'codebase', repo) : copy.dir,
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
           maxSteps: agentMaxSteps(),
-          prompt: `${armBrief(GREP_HAS)}\n\n${prompt}`,
+          prompt: `${armBrief(repo ? GREP_HAS_REPOSITORY(repo) : GREP_HAS)}\n\n${prompt}`,
         });
         recordAgent(env.meter, { system: 'agent-grep', stage: 'agent', task: task.id }, env.models.model, r);
-        return { text: r.text, retrieved: r.filesTouched, toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
+        return { text: r.text, retrieved: repo ? r.filesTouched.map((f) => `codebase/${repo}/${f}`) : r.filesTouched, toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
       } finally {
         copy.cleanup();
       }

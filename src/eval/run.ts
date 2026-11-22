@@ -120,6 +120,8 @@ export interface RunOptions {
   limit?: number;
   /** Only tasks of these types (a focused run: the corpus-level types, deep hops, updates). */
   types?: TaskType[];
+  /** Only tasks whose `meta.stratum` is one of these (a code localization pack's `plain`, say: docs/design/37 §2). */
+  strata?: string[];
   agentLimit?: number;
   /**
    * How the agent sample is spread over task types (weights, counts, or
@@ -592,6 +594,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       limit: opts.limit ?? null,
       versions: {},
       ...(opts.types?.length ? { types: opts.types } : {}),
+      ...(opts.strata?.length ? { strata: opts.strata } : {}),
     };
     meta.database ??= { kind: database.kind, at: describeDatabase(database) };
     meta.agentSample = { limit: agentLimit, updateLimit: agentUpdateLimit, allocation, byPack: meta.agentSample?.byPack ?? {}, updates: meta.agentSample?.updates ?? {} };
@@ -695,7 +698,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       for (const s of systems) (groups.get(s.group) ?? groups.set(s.group, []).get(s.group)!).push(s);
 
       const failed = new Set<string>();
-      const typed = opts.types?.length ? staged.tasks.filter((t) => opts.types!.includes(t.type)) : staged.tasks;
+      const typed = (opts.types?.length ? staged.tasks.filter((t) => opts.types!.includes(t.type)) : staged.tasks)
+        .filter((t) => !opts.strata?.length || opts.strata.includes(String(t.meta?.stratum ?? '')));
       const allTasks = selectTasks(typed.filter((t) => !t.afterUpdate), suites, opts.limit, seed);
       const updateTasks = suites.has('update') ? typed.filter((t) => t.afterUpdate) : [];
       // the agent sample: round-robin over types, or by the run's allocation

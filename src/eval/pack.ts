@@ -156,6 +156,12 @@ export function validatePack(pack: LoadedPack): PackIssues {
 
   if (pack.docs.length === 0) errors.push('corpus/ holds no documents');
   for (const d of pack.docs) if (!fs.existsSync(path.join(pack.dir, 'corpus', d.path))) errors.push(`corpus.jsonl lists ${d.path}, which is not in corpus/`);
+  // the leak rule on dates (docs/design/37 §2): nothing in the corpus is dated after the pack's cutoff
+  const cutoff = pack.manifest.cutoff ? Date.parse(pack.manifest.cutoff) : NaN;
+  if (Number.isFinite(cutoff)) {
+    const late = pack.docs.filter((d) => d.date && Date.parse(d.date) > cutoff);
+    if (late.length) errors.push(`${late.length} corpus documents are dated after the cutoff ${pack.manifest.cutoff}: ${late.slice(0, 3).map((d) => d.path).join(', ')}`);
+  }
 
   const ids = new Set<string>();
   // an update task's evidence may lie in its batch or an earlier one (batches apply cumulatively)

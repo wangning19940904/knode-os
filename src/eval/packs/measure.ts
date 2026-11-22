@@ -88,7 +88,8 @@ function answerStrings(t: Task): string[] {
 
 export function cheapLint(pack: LoadedPack): PackMeasure['lint'] {
   const paths = pack.docs.map((d) => d.path.normalize('NFKC').toLowerCase());
-  const answerInFileName = pack.tasks.filter((t) => answerStrings(t).some((a) => paths.some((p) => p.includes(a)))).map((t) => t.id);
+  // a localization task's answer is a path by design (docs/design/37 §2): its question is what must not give it
+  const answerInFileName = pack.tasks.filter((t) => t.type !== 'localization' && answerStrings(t).some((a) => paths.some((p) => p.includes(a)))).map((t) => t.id);
   const byQuestion = new Map<string, Task[]>();
   for (const t of pack.tasks) {
     const k = foldSpace(t.question).toLowerCase();

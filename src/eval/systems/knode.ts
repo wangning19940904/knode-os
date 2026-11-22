@@ -608,7 +608,7 @@ async function buildWorkspace(s: KnodeState, env: SystemEnv): Promise<{ notes?: 
         fs.cpSync(env.staged.dir, path.join(s.ws, 'raw', 'docs'), { recursive: true });
       }
       // only the staged corpus: never a gold, holdout or task file of the pack (docs/design/35 D7)
-      assertNoLeak(s.ws, env.pack.dir, 'after staging');
+      assertNoLeak(s.ws, env.pack.dir, 'after staging', env.pack.manifest.cutoff);
       const progress: BuildProgress = prior
         ? { ...prior, done: [...prior.done], attempts: prior.attempts + 1 }
         : { fingerprint: buildFingerprint(env), startedAt: new Date().toISOString(), attempts: 1, done: [] };

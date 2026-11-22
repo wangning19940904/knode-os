@@ -343,7 +343,12 @@ extraction spot checks.
   (`KNODE_EVAL_HOME`). Recipes build them: synthetic weekly reports (v2 by
   default, v3 with `--options '{"version":3}'`), a life ledger, domain packs
   from real documents, and real-document recipes (Loong, MuDABench, wiki-hops,
-  CRUD news). `eval pack lint` runs before every run.
+  CRUD news). `code-localization` (design 37) builds a pack from a
+  repository's history with no model: the corpus is the tree at one base
+  commit under `corpus/codebase/<repo>/`, each task a later commit's message,
+  its gold the files the commit touched (set F1 by path), its `meta.stratum`
+  `named`, `symbol` or `plain`. `eval pack lint` runs before every run;
+  `eval run --strata` keeps the tasks of named strata.
 - **Systems.** Track `ladder` = `agent-grep`, `agent-rag`,
   `agent-knode-wiki-sources`, `agent-knode-full`, `knode-ask`, `rag-hybrid`;
   track `single-call` = the last two. `agent-knode` and `agent-knode-wiki` are
@@ -361,7 +366,10 @@ extraction spot checks.
   another model family; `--judge-audit` re-asks a sample and `--repeat-sample`
   measures repeat variance. Reports carry per-type tables, minimum detectable
   effects and cost-normalised figures.
-- A build that contains a gold, holdout or tasks file fails the leak check.
+- A build that contains a gold, holdout or tasks file fails the leak check, as
+  does a pack with a `cutoff` (a localization pack's base date) whose corpus or
+  staged `raw/` Markdown is dated after it.
+- On a repository pack `agent-grep` works in the repository's own tree.
 
 ## 9. Surfaces and clients
 
