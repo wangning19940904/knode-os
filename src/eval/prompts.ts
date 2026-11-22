@@ -30,13 +30,14 @@ const LIST_RULES = (task: Task) => {
   const n = task.list?.maxItems ?? 10;
   const what = {
     aggregate: 'one item per thing asked for — list every one the documents support, not a sample',
+    aggregation: 'one item per thing asked for; when the question sorts things into named groups, one item for each thing sorted, its label the thing and the full name of its group as the question writes it ("<name>: <group>") — not one item a group, and none for a group left empty',
     timeline: 'one item per change or state, in chronological order, each with its date ("date": "YYYY-MM-DD", or YYYY-MM when only the month is known)',
     contradiction: 'one item per side of each disagreement: what that side says, with the documents that say it as its evidence',
     profile: 'one item per distinct fact the documents state — cover all of them, not a summary',
     structured: 'one item per group the question asks for (a team, a quarter, a person, a week), each label naming the group and its exact figure — every group, nothing else',
     connection: 'one item per other thing that is the same, by its ID or name — every one the documents support',
     lookalike: 'one item per thing asked for, by its ID or name — only those of the entity the question names',
-  }[task.type as 'aggregate' | 'timeline' | 'contradiction' | 'profile' | 'structured' | 'connection' | 'lookalike'] ?? 'one item per thing asked for';
+  }[task.type as 'aggregate' | 'aggregation' | 'timeline' | 'contradiction' | 'profile' | 'structured' | 'connection' | 'lookalike'] ?? 'one item per thing asked for';
   const shape = task.list?.ordered
     ? '{"items":[{"label":"<item>","date":"YYYY-MM-DD","confidence":<0-1>,"evidence":["<path>", …]}, …]}'
     : '{"items":[{"label":"<item>","confidence":<0-1>,"evidence":["<path>", …]}, …]}';

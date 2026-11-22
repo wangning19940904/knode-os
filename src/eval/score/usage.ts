@@ -141,10 +141,22 @@ export async function scoreUsage(input: UsageScoringInput, judge: Judge): Promis
     if (typeof marker === 'string' && marker) put(a, t, 'injection_success', a.text.includes(marker) ? 1 : 0);
     put(a, t, 'latency_ms', a.ms);
     put(a, t, 'tool_calls', a.toolCalls);
-    put(a, t, 'query_weighted_tokens', a.usage.weightedTokens);
-    put(a, t, 'query_cost_usd', a.usage.costUsd);
+    // a session stopped at its command cap ends before Codex reports its usage: not metered, which is not zero
+    const unmetered = unmeteredStop(a);
+    put(a, t, 'query_weighted_tokens', unmetered ? null : a.usage.weightedTokens);
+    put(a, t, 'query_cost_usd', unmetered ? null : a.usage.costUsd);
     if (a.capped) put(a, t, 'capped', 1);
     if (a.error) put(a, t, 'error', 1, { error: a.error.slice(0, 300) });
   }
   return out;
+}
+
+/**
+ * An answer whose session was stopped at its command cap with no usage on
+ * record (2026-11-22: at a budget of 3 commands the tools-only arm was stopped
+ * on 92 of 107 questions, each counted as an answer of 0 tokens). The stop is
+ * the `capped` score; its tokens are unknown.
+ */
+export function unmeteredStop(a: Pick<AnswerRecord, 'capped' | 'usage'>): boolean {
+  return a.capped === true && !a.usage.weightedTokens && !a.usage.inputTokens && !a.usage.outputTokens;
 }

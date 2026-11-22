@@ -1,3 +1,4 @@
+import { unmeteredStop } from './score/usage.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { mdTable } from '../bench/util.js';
@@ -273,7 +274,8 @@ export interface ReportData {
   retrieval: Record<string, Record<string, Record<string, Cell>>>;
   emergence: Record<string, Record<string, Record<string, Cell>>>;
   generation: Record<string, Record<string, Record<string, Cell>>>;
-  perQuery: Record<string, Record<string, { latencyP50: number; toolCalls: number; weightedTokens: number; costUsd: number; n: number; capped: number; leaked: number; errors: number }>>;
+  /** `weightedTokens` and `costUsd` are means over the answers with usage on record: `unmetered` counts those stopped at their command cap before any was reported. */
+  perQuery: Record<string, Record<string, { latencyP50: number; toolCalls: number; weightedTokens: number; costUsd: number; n: number; capped: number; unmetered?: number; leaked: number; errors: number }>>;
   /**
    * What the agents did, per pack and agent system: tool calls per answer and
    * the programs (shell agents) or knode tools (the MCP agent) behind them,
@@ -393,12 +395,13 @@ export function buildReportData(runDir: string): ReportData {
 
   const perQuery: ReportData['perQuery'] = {};
   for (const a of answers) {
-    const p = ((perQuery[a.pack] ??= {})[a.system] ??= { latencyP50: 0, toolCalls: 0, weightedTokens: 0, costUsd: 0, n: 0, capped: 0, leaked: 0, errors: 0 });
+    const p = ((perQuery[a.pack] ??= {})[a.system] ??= { latencyP50: 0, toolCalls: 0, weightedTokens: 0, costUsd: 0, n: 0, capped: 0, unmetered: 0, leaked: 0, errors: 0 });
     p.n++;
     p.toolCalls += a.toolCalls;
     p.weightedTokens += a.usage.weightedTokens;
     p.costUsd += a.usage.costUsd;
     if (a.capped) p.capped++;
+    if (unmeteredStop(a)) p.unmetered = (p.unmetered ?? 0) + 1;
     if (a.leaked?.length) p.leaked++;
     if (a.error) p.errors++;
   }
@@ -407,8 +410,10 @@ export function buildReportData(runDir: string): ReportData {
       const lat = answers.filter((a) => a.pack === pack && a.system === system).map((a) => a.ms).sort((x, y) => x - y);
       p.latencyP50 = lat[Math.floor(lat.length / 2)] ?? 0;
       p.toolCalls /= p.n;
-      p.weightedTokens /= p.n;
-      p.costUsd /= p.n;
+      // over the answers whose usage is on record: a stopped session's is unknown, not zero
+      const metered = Math.max(1, p.n - (p.unmetered ?? 0));
+      p.weightedTokens /= metered;
+      p.costUsd /= metered;
     }
   }
 
@@ -1288,6 +1293,8 @@ export function renderReport(d: ReportData): string {
       lines.push('### Per-query cost', '');
       lines.push(mdTable(['system', 'answers', 'p50 latency', 'tool calls', 'weighted tokens', 'USD (API prices)', 'capped', 'leaked', 'errors'],
         Object.entries(pq).sort().map(([s, p]) => [s, p.n, fmtMs(p.latencyP50), p.toolCalls.toFixed(1), fmtNum(p.weightedTokens), p.costUsd.toFixed(4), p.capped, p.leaked, p.errors])), '');
+      const stopped = Object.entries(pq).filter(([, p]) => p.unmetered).sort();
+      if (stopped.length) lines.push(`Stopped at the command cap before any usage was reported, an empty answer each: ${stopped.map(([s, p]) => `${s} ${p.unmetered} of ${p.n}`).join(', ')}. Their tokens are unknown and are left out of the means above; their correctness is 0, so a comparison of correctness between these systems also compares how often each was stopped.`, '');
       const pts = Object.entries(pq).filter(([s]) => u?.[s]?.correctness);
       if (pts.length >= 2) {
         lines.push(chartBlock({ type: 'scatter', title: `${pack}: correctness vs cost per query`, x: pts.map(([s]) => s), series: [

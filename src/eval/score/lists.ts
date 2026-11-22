@@ -18,7 +18,8 @@ import { judgeItemKey, repeatOf, scoreKey } from './keys.js';
  * a sample), times order accuracy for a timeline. A structured query
  * (docs/design/28) matches by fields — every field of the gold item (a team,
  * a quarter, a count) named in one predicted label — and is right only when
- * the whole set is. A look-alike task names its distractors: the share of
+ * the whole set is; a group written as one entry ("中利润：甲、乙") is read as
+ * its members (`matchFieldEntries`). A look-alike task names its distractors: the share of
  * predicted items that are the look-alike's is `distractor_rate`.
  */
 
@@ -125,19 +126,162 @@ export function splitListedItems<T extends { label: string }>(items: T[], gold: 
 }
 
 /** Pairs [predicted, gold] where the predicted label names every field of the gold item (one term of each group), each used once. */
-export function matchByFields(predicted: string[], gold: GoldItem[]): [number, number][] {
+export function matchByFields(predicted: string[], gold: GoldItem[], shorts: Map<string, string>[] = shortNames(gold)): [number, number][] {
   const usedP = new Set<number>();
   const out: [number, number][] = [];
   // the most specific items first, so a looser one does not take their label
   const order = gold.map((g, gi) => ({ g, gi })).sort((a, b) => (b.g.fields?.length ?? 0) - (a.g.fields?.length ?? 0));
   for (const { g, gi } of order) {
     if (!g.fields?.length) continue;
-    const pi = predicted.findIndex((p, i) => !usedP.has(i) && g.fields!.every((group) => group.some((term) => containsTerm(p, term))));
+    const pi = predicted.findIndex((p, i) => !usedP.has(i) && namesAllFields(p, g, shorts));
     if (pi < 0) continue;
     usedP.add(pi);
     out.push([pi, gi]);
   }
   return out.sort((a, b) => a[0] - b[0]);
+}
+
+/**
+ * The short names of a list's classes: where the terms of one field share an
+ * ending or a beginning across the gold ("high liabilities", "medium
+ * liabilities"; 高利润, 中利润), what is left of each ("high", 高). An answer
+ * that writes "BIOLARGO, INC. — high" has named the class. Only for a field of
+ * two or more different values whose remainders are all words, by field
+ * position; `shortNames(gold)[i]` maps a term's matched form to its short name.
+ */
+export function shortNames(gold: GoldItem[]): Map<string, string>[] {
+  const arity = gold[0]?.fields?.length ?? 0;
+  if (!arity || gold.some((g) => g.fields?.length !== arity)) return [];
+  return Array.from({ length: arity }, (_, i) => {
+    const terms = [...new Set(gold.flatMap((g) => g.fields![i].map(matchForm)))].filter(Boolean);
+    const out = new Map<string, string>();
+    if (terms.length < 2) return out;
+    for (const side of ['end', 'start'] as const) {
+      let n = 0;
+      const at = (t: string, k: number) => (side === 'end' ? t[t.length - 1 - k] : t[k]);
+      while (terms.every((t) => t.length - 1 > n && at(t, n) === at(terms[0], n))) n++;
+      // a Latin word is not cut in two: back to the nearest space
+      const cut = (t: string) => (side === 'end' ? t.slice(0, t.length - n) : t.slice(n));
+      const whole = () => terms.every((t) => {
+        const edge = side === 'end' ? [t[t.length - n - 1], t[t.length - n]] : [t[n - 1], t[n]];
+        return !(isLatin(edge[0]) && isLatin(edge[1]));
+      });
+      while (n > 0 && !whole()) n--;
+      if (!n) continue;
+      const rest = terms.map((t) => cut(t).trim());
+      if (rest.some((r) => !r || !/^[\p{L}\s-]+$/u.test(r) || (!hasCjk(r) && r.length < 3)) || new Set(rest).size < rest.length) continue;
+      terms.forEach((t, j) => out.set(t, rest[j]));
+      break;
+    }
+    return out;
+  });
+}
+
+/**
+ * Does the label name every field of the gold item: one term of each group,
+ * or, for a class the label writes short, its short name — counted only when
+ * the label holds no class's full name, and, once the item's other fields are
+ * taken out of it, the short name of this class and of no other (a company
+ * called 中粮科工 does not name the class 中).
+ */
+function namesAllFields(label: string, g: GoldItem, shorts: Map<string, string>[] = []): boolean {
+  if (!g.fields?.length) return false;
+  const full = g.fields.map((group) => group.find((term) => containsTerm(label, term)));
+  if (full.every(Boolean)) return true;
+  return g.fields.every((group, i) => {
+    if (full[i]) return true;
+    const names = shorts[i];
+    if (!names?.size) return false;
+    if ([...names.keys()].some((term) => containsTerm(label, term))) return false;
+    let rest = matchForm(label);
+    for (const [j, term] of full.entries()) if (j !== i && term) rest = rest.split(matchForm(term)).join(' ');
+    // the longest short names first: "very high" is not also "high"
+    const found = new Set<string>();
+    for (const short of [...new Set(names.values())].sort((a, b) => b.length - a.length)) {
+      if (!containsTerm(rest, short)) continue;
+      found.add(short);
+      rest = rest.split(short).join(' ');
+    }
+    return found.size === 1 && group.some((term) => names.get(matchForm(term)) === [...found][0]);
+  });
+}
+const groupForm = (group: string[]) => [...new Set(group.map(matchForm))].sort().join('\u0001');
+
+/** The one field in which these gold items differ (a group's members: the company, where the class is shared), or -1. */
+function varyingField(items: GoldItem[]): number {
+  const n = items[0].fields!.length;
+  if (items.some((g) => g.fields!.length !== n)) return -1;
+  const varying = Array.from({ length: n }, (_, i) => i).filter((i) => new Set(items.map((g) => groupForm(g.fields![i]))).size > 1);
+  return varying.length === 1 ? varying[0] : -1;
+}
+
+/**
+ * Matching by fields, with a group written as one entry read as its members
+ * (2026-11-22: "中利润：百亚股份、蓝晓科技" matched one gold item where it names
+ * two, and an answer with every company in its class scored 0 on the exact set;
+ * 8 of one arm's 65 answers, 1 or 2 of the others', which was the whole
+ * difference the run recorded between them). A label that names every field of
+ * two or more gold items that differ in one field only (the member; the class
+ * is the same) is that many entries, each paired with its item. It is also an
+ * entry for each further gold item whose member it names: a company put in a
+ * class the gold does not put it in, or one another entry already gave. However
+ * the label is punctuated: what it names is read, not how it lists. A member
+ * the gold does not hold, listed inside a group, is not seen. Every other label
+ * is one entry, paired as `matchByFields` pairs it.
+ * `entries[i]` is how many entries label i stands for.
+ */
+export function matchFieldEntries(labels: string[], gold: GoldItem[]): { pairs: [number, number][]; entries: number[] } {
+  const entries = labels.map(() => 1);
+  const shorts = shortNames(gold);
+  const usedG = new Set<number>();
+  const grouped = new Set<number>();
+  const pairs: [number, number][] = [];
+  labels.forEach((label, pi) => {
+    const full = gold.map((_, gi) => gi).filter((gi) => namesAllFields(label, gold[gi], shorts));
+    if (full.length < 2) return;
+    const at = varyingField(full.map((gi) => gold[gi]));
+    if (at < 0) return;
+    grouped.add(pi);
+    const taken = full.filter((gi) => !usedG.has(gi));
+    for (const gi of taken) {
+      usedG.add(gi);
+      pairs.push([pi, gi]);
+    }
+    const arity = gold[full[0]].fields!.length;
+    const others = gold.filter((g, gi) => !taken.includes(gi) && g.fields?.length === arity && g.fields[at].some((term) => containsTerm(label, term))).length;
+    entries[pi] = Math.max(1, taken.length + others);
+  });
+  const restP = labels.map((_, i) => i).filter((i) => !grouped.has(i));
+  const restG = gold.map((_, i) => i).filter((i) => !usedG.has(i));
+  for (const [p, g] of matchByFields(restP.map((i) => labels[i]), restG.map((i) => gold[i]), shorts)) pairs.push([restP[p], restG[g]]);
+  return { pairs: pairs.sort((a, b) => a[0] - b[0] || a[1] - b[1]), entries };
+}
+
+/** The entries a field-matched list stands for, written out (a group as one entry per member), and their pairs. */
+export function fieldEntries<T extends { label: string }>(items: T[], gold: GoldItem[]): { items: T[]; pairs: [number, number][] } {
+  const m = matchFieldEntries(items.map((i) => i.label), gold);
+  const out: T[] = [];
+  const pairs: [number, number][] = [];
+  items.forEach((it, pi) => {
+    const start = out.length;
+    for (let k = 0; k < m.entries[pi]; k++) out.push(it);
+    m.pairs.filter(([p]) => p === pi).forEach(([, g], k) => pairs.push([start + k, g]));
+  });
+  return { items: out, pairs };
+}
+
+const EMPTY_GROUP = /∅|空集|\{\s*\}|(?:^|[\s:(—–-])(?:none|empty|nil|n\/a|无|暂无\S*)\s*[).。]?\s*$/iu;
+
+/**
+ * An entry that says a group has no members ("负利润：空集", "Positive cash
+ * flow: none") and names nothing the gold holds: part of a right answer to
+ * "sort these into groups", and not an item given. An entry that names a gold
+ * member or a gold class stays: "无法确定：甲公司" is a company left unsorted,
+ * and "中利润：空集" where the gold has a company there is wrong either way.
+ */
+export function saysEmptyGroup(label: string, gold: GoldItem[]): boolean {
+  if (!EMPTY_GROUP.test(label.normalize('NFKC'))) return false;
+  return !gold.some((g) => (g.fields ?? []).some((group) => group.some((term) => containsTerm(label, term))));
 }
 
 /**
@@ -328,6 +472,13 @@ export async function scoreLists(input: ListInput, judge: Judge): Promise<ScoreR
     if (!t || !t.list || t.scoring !== 'set' || !t.items?.length || a.leaked?.length) continue;
     const spec = listSpec(t);
     const given = parseStructured(a.text).items.slice(0, spec.maxItems);
+    if (spec.match === 'fields') {
+      // matched by fields: a group in one entry counts as its members, an empty group as nothing given
+      const f = fieldEntries(given.filter((i) => !saysEmptyGroup(i.label, t.items!)), t.items);
+      put(a, t, 'items_returned', f.items.length);
+      listScores(a, t, spec, f.pairs, f.items, input.corpusDocs.get(a.pack) ?? new Set<string>(), put);
+      continue;
+    }
     // matched by name: an entry that lists several gold items counts as its parts
     const items = spec.match === 'alias' ? splitListedItems(given, t.items) : given;
     put(a, t, 'items_returned', items.length);
@@ -345,8 +496,7 @@ export async function scoreLists(input: ListInput, judge: Judge): Promise<ScoreR
     const docs = input.corpusDocs.get(a.pack) ?? new Set<string>();
     const pairs = !items.length ? [] : spec.match === 'docs'
       ? matchByDocs(items.map((i) => i.evidence), t.items, docs)
-      : spec.match === 'fields' ? matchByFields(items.map((i) => i.label), t.items)
-        : matchByAlias(items.map((i) => i.label), t.items);
+      : matchByAlias(items.map((i) => i.label), t.items);
     listScores(a, t, spec, pairs, items, docs, put);
   }
 
