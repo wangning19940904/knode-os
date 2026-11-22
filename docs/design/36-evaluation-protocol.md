@@ -1,6 +1,6 @@
 # 36 — Evaluation protocol: what the next run must show, decided before it runs
 
-> **Record status (2026-11-22): run started 2026-11-21 20:32 and finished 2026-11-22 05:14; all four questions answered (§5). Q1 is a tie at both budgets with knode costing more; reading it found two grading defects and wrong gold in the sample (§5, "What the reading of Q1 found").** This is a decision record for one run, not the description of the system.
+> **Record status (2026-11-22): run started 2026-11-21 20:32 and finished 2026-11-22 05:14; all four questions answered (§5). Q1 is a tie at both budgets with knode costing more; reading it found two grading defects and wrong gold in the sample, since fixed and the run read again (§5, "What the reading of Q1 found" and "Fixed, and the run read again").** This is a decision record for one run, not the description of the system.
 
 ## 0. Why
 
@@ -155,7 +155,26 @@ As recorded, the three knode arms were 0.04 to 0.06 above grep on `real-loong-fi
 2. **The gold of the sample is wrong where the headroom was.** Of the 58 aggregation questions, all five arms are right on 23, some on 3, and none on 32; on each of those 32 all five arms put the same member in a class the gold does not, through three different interfaces. Four were checked against the filings and the gold is wrong in all four: 平安银行 reports in 人民币百万元 and its 18,525 is graded as a profit under 1,000,000,000; GSE Systems reports in thousands and its $4,746 is graded "below 100,000"; 格力电器's 5,318,471,160.65 is graded a loss; 联科科技's 5,117,932.64 is graded "above 10,000,000". The allocation by headroom took its questions from where the campaign's arms had scored low, which is where the gold is wrong: 32 of the 120 can be won by no arm, and on the other 88 grep scores 0.835. On `real-mudabench` the five arms return the same items and none is scored right on 21 of 107; those were not checked.
 3. **A stopped agent records nothing.** At budget 3 the agent is told three commands and its session is killed at the sixth, with an empty answer and no tokens recorded. The budget-3 score therefore mixes "can answer in five steps" with "stops when told", and the tokens of the arms that are stopped most are undercounted.
 
-Before another run reads correctness on these packs: the exact-set score has to read a grouped item as its members; the 32 questions (and the 21) have to be checked against the filings and repaired or removed, and headroom allocation has to draw from questions at least one arm has answered; a stopped agent has to be asked for its answer, or its stop recorded as its own outcome.
+### Fixed, and the run read again (2026-11-22)
+
+- **Grading** (de7b6c1): a field-matched entry that names several gold items of one class counts as that many; a class may be named short ("— high" for "high liabilities") when the label holds that one short name and no other outside the company's name; "this group is empty" is not an item; a grouping question now says how to write its items. A stopped session's tokens are null, not 0, and the report says how many were stopped. It is still not asked for its answer: that needs the workers' code, and its stop is recorded as its own outcome instead.
+- **Gold.** Every company the five arms placed against the gold (84, in 29 questions) was read again in its filing by auditors that saw neither the gold nor the answers, each reading with its line and unit, each quoted line checked at its line number. 69 contradict the gold and agree with the arms, 14 confirm it (one question, whose gold lacked a fifteenth company the question lists), 1 is ambiguous. `~/knode-eval/packs-next/real-loong-finance` (version 2): 62 companies moved in 27 questions, one added, 4 questions removed. `~/knode-eval/packs-next/real-mudabench` (version 2): of the 21 suspect questions, 7 were audited and none can be answered as the gold has it from the corpus supplied (a calendar-year filer's report is filed under the following year; two reports lost their Chinese text; "inventory intensity" and "other business revenue" are not reported figures) and are removed; 14 questions that ask "which companies achieved the highest …" with a gold of three now ask for three; 4 large ones are unchecked and left. `packs-next/REPAIRS.md` lists every change with its line.
+- **The same answers under both** (`rescored-20261122/` in the run folder; no model called, the judge's verdicts from the run's cache; no score fell):
+
+| | grep | wiki + sources | full | tools only | RAG agent |
+| --- | --- | --- | --- | --- | --- |
+| `real-loong-finance`, budget 20 (118) | 0.852 | 0.852 | 0.847 | 0.850 | 0.839 |
+| − grep | — | 0.000 (−0.017 to +0.017) | −0.004 (−0.013 to 0.000) | 0.000 (−0.013 to +0.013) | −0.013 (−0.034 to 0.000) |
+| tokens per correct answer, against grep | — | 1.34× | 1.37× (1.25 to 1.51) | 1.51× | 1.15× |
+| `real-mudabench`, budget 20 (100) | 0.555 | 0.630 | 0.570 | 0.588 | 0.560 |
+| − grep | — | +0.075 (+0.010 to +0.145) | +0.015 (−0.040 to +0.070) | +0.026 (−0.046 to +0.103) | +0.005 |
+| `real-loong-finance`, budget 3 (118) | 0.818 | — | 0.792 | 0.739 | — |
+| `real-mudabench`, budget 3 (100) | 0.445 | — | 0.400 | 0.093 | — |
+
+112 of the 118 `real-loong-finance` questions now get the same score from all five arms, and aggregation is 0.93 for every arm where it was recorded as 0.31 to 0.43. The named comparisons do not change their answer: tokens per correct answer, full against grep, 1.28× pooled (1.19 to 1.37); at budget 3, full − grep −0.034 (−0.083 to +0.014), tools-only − grep −0.208 (−0.264 to −0.154; stopped on 101 of 214 against grep's 15). The wiki arm's pooled +0.034 (+0.002 to +0.067) is all `real-mudabench`, where the 14 reworded questions were answered under the old wording (every arm 0 on them) and a repeat of the same arm changes 3 to 6 of 30 answers: the one thing here worth a second look, not a result. Ask on `real-loong-finance` is 0.304 over 620 against the agents' 0.85 on their sample, and 0.08 on aggregation.
+
+Still open: `real-loong-finance` on its 118-question sample is now at 0.85 for every arm with 13 questions none gets right (5 comparisons, 2 trends, 2 lookups and 4 groupings not yet read against the filings), so it has little room left to separate agents; headroom allocation still draws from where every arm failed; the MuDABench corpus heads a calendar-year filer's report with the wrong year.
+
 
 ## 6. The stop on 2026-11-21, and what it changed
 
