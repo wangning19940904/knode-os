@@ -4,7 +4,7 @@ import path from 'node:path';
 import { mdTable } from '../bench/util.js';
 import { chartBlock } from '../research/chart.js';
 import { bootstrapMean, holm, mean, minimumDetectableEffect, pairedBootstrap, round, sd, wilson } from './metrics/stats.js';
-import { describeAllocation, type AgentSample, type TypeEvidence } from './allocation.js';
+import { describeAllocation, questionClasses, SAMPLE_TIERS, type AgentSample, type AnswerScore, type QuestionClass, type TypeEvidence, type TypeTaken } from './allocation.js';
 import { fileLines, RunStore } from './runstore.js';
 import { judgeItemKey } from './score/keys.js';
 import { SYSTEMS } from './systems/index.js';
@@ -536,7 +536,7 @@ export function buildReportData(runDir: string): ReportData {
 const SEPARATION_TYPES = new Set<string>(SEPARATION_TASK_TYPES);
 
 /** An agent system: one that answers with an agent session (the ladder's arms, the diagnostics, the llm-wiki agents). */
-function isAgentSystem(system: string): boolean {
+export function isAgentSystem(system: string): boolean {
   try {
     return SYSTEMS[system]?.().kind === 'agent';
   } catch {
@@ -729,7 +729,21 @@ function verdictOf(c: { n: number; allRight: number; noneRight: number; differ: 
  * versions of a pack share a manifest id), any other by manifest id.
  */
 export function headroomEvidence(sources: string[]): Record<string, Record<string, TypeEvidence>> {
+  return headroomRecords(sources).types;
+}
+
+/**
+ * What `--agent-headroom-from` reads of earlier records: per pack and type
+ * (`headroomEvidence`), and per pack and question its class over the agent
+ * arms' answers, repeats included (`questionClasses`), from every source with
+ * per-question scores (a `report.json` has none). A question several sources
+ * scored is classed over all their answers, each source's arms its own: give
+ * a run once — its re-scored copy, or the original, not both.
+ */
+export function headroomRecords(sources: string[]): { types: Record<string, Record<string, TypeEvidence>>; questions: Record<string, Record<string, { type: string; cls: QuestionClass }>> } {
   const out: Record<string, Record<string, TypeEvidence>> = {};
+  const answers: AnswerScore[] = [];
+  let source = 0;
   const add = (pack: string, type: string, e: TypeEvidence) => {
     const t = ((out[pack] ??= {})[type] ??= { n: 0, differ: 0, spread: 0, allRight: 0, noneRight: 0 });
     t.n += e.n;
@@ -763,6 +777,11 @@ export function headroomEvidence(sources: string[]): Record<string, Record<strin
     for (const [pack, types] of Object.entries(found)) {
       for (const [type, e] of Object.entries(types)) add(single ? as : pack, type, e);
     }
+    // every answer of an agent arm, repeats apart, for the question's class
+    const src = source++;
+    const mine = [...latest.values()].filter((r) => r.taskId !== undefined && isAgentSystem(r.system));
+    const onePack = as && new Set(mine.map((r) => r.pack)).size === 1;
+    for (const r of mine) answers.push({ arm: `${src}\u0000${r.system}`, pack: onePack ? as : r.pack, taskId: r.taskId!, taskType: r.taskType, value: r.value });
   };
   const fromReport = (file: string) => {
     const r = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<ReportData>;
@@ -788,14 +807,15 @@ export function headroomEvidence(sources: string[]): Record<string, Record<strin
     return fromReport(at);
   };
   for (const src of sources) one(src);
-  return out;
+  return { types: out, questions: questionClasses(answers) };
 }
 
 /** The pack directory's name a run of one pack recorded (`run.json` `packs`), if it is one. */
 function oneRunPack(runDir: string): string | undefined {
   try {
     const packs = (JSON.parse(fs.readFileSync(path.join(runDir, 'run.json'), 'utf8')) as { packs?: string[] }).packs;
-    return packs?.length === 1 ? packs[0] : undefined;
+    // a pack directory's name, also where a copied run recorded its path
+    return packs?.length === 1 ? path.basename(packs[0]) : undefined;
   } catch {
     return undefined;
   }
@@ -1168,11 +1188,17 @@ function separabilityLines(d: Separability | undefined): string[] {
     out.push(`Agent sample: ${s.allocation?.mode === 'counts' ? 'the counts below' : `${s.limit} a pack`} by ${describeAllocation(s.allocation)}${s.updateLimit !== null ? `; at most ${s.updateLimit} update tasks a pack` : '; every update task'}.`);
     const packs = Object.keys(s.byPack).sort();
     if (s.allocation && packs.length) {
-      out.push('', mdTable(['pack', 'taken / available by type (weight)', 'update tasks'], packs.map((p) => [
+      const seen = (c: TypeTaken['seen']) => (c ? ` [${SAMPLE_TIERS.filter((k) => c[k]).map((k) => `${c[k]} ${k === 'unseen' ? 'unseen' : k}`).join(', ')}]` : '');
+      out.push('', mdTable(['pack', 'taken / available by type (weight) [what the records saw of those taken]', 'update tasks'], packs.map((p) => [
         p,
-        Object.entries(s.byPack[p]).sort(([, a], [, b]) => b.taken - a.taken || b.available - a.available).map(([t, c]) => `${t} ${c.taken}/${c.available}${c.weight !== undefined ? ` (${round(c.weight, 2)})` : ''}`).join(', '),
+        Object.entries(s.byPack[p]).sort(([, a], [, b]) => b.taken - a.taken || b.available - a.available).map(([t, c]) => `${t} ${c.taken}/${c.available}${c.weight !== undefined ? ` (${round(c.weight, 2)})` : ''}${seen(c.seen)}`).join(', '),
         s.updates?.[p] ? `${s.updates[p].taken}/${s.updates[p].available}` : '—',
       ])));
+      for (const p of packs) {
+        const q = s.questions?.[p];
+        if (!q) continue;
+        out.push('', `${p}: ${q.expected !== null ? `about ${q.expected.toFixed(1)} of ${q.n} questions expected to be contested before the run` : `${q.taken.contested} of ${q.n} seen contested`}${q.suspects.length ? `; ${q.suspects.length} all-wrong question(s) left out for audit` : ''}.${q.warning ? ` Warning: ${q.warning}.` : ''}`);
+      }
     }
     out.push('');
   }
