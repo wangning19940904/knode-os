@@ -16,6 +16,7 @@ import { ScopeKind, ScopeRow } from '../lineage/types.js';
 import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
 import { IngestStats } from '../types.js';
+import { fileCitationRefreshes } from '../research/cited-refresh.js';
 import { reconcileViews } from '../wiki/pages.js';
 import { applyDocScope } from './apply.js';
 import { originalOfTranscript, transcriptPathFor } from './convert.js';
@@ -317,6 +318,18 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
   stats.pagesRegenerated += views.regenerated;
   stats.pagesArchived += views.archived;
   stats.pagesDeferred += views.deferred;
+
+  // an agent's page whose cited files changed is not a view: it gets a refresh suggestion, never a re-render (docs/design/37 §5).
+  // A scoped sync that applied and removed nothing cannot have changed what a page cites; a full one always compares,
+  // which also catches what changed outside a sync
+  if (!prefixes || stats.applied > 0 || stats.removed > 0) {
+    try {
+      const refreshes = await fileCitationRefreshes(ctx, { prefixes });
+      if (refreshes.filed.length) progress(`refresh: ${refreshes.filed.length} agent page(s) cite files that changed`);
+    } catch (err) {
+      progress(`refresh suggestions failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
 
   // the corpus-frequent stop terms follow the corpus: a full pass that applied
   // documents learns them again when the list is missing, old, or the corpus doubled

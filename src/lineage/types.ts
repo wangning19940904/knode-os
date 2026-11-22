@@ -49,7 +49,12 @@ export interface DepDecl {
   sha?: string | null;
 }
 
-export type ArtifactKind = 'page' | 'suggestion';
+/**
+ * `page`: a generated page's declared inputs (propagate marks it dirty or archives it). `suggestion`: what a
+ * suggestion rests on. `cites`: the documents a page no generator owns cites (src/lineage/page-deps.ts) — kept
+ * apart so they are read directly, and so propagate, which acts on `page` and `suggestion` only, never touches the page.
+ */
+export type ArtifactKind = 'page' | 'suggestion' | 'cites';
 
 export interface DepRow {
   input_kind: DepInputKind;

@@ -44,7 +44,8 @@ const TABLE: Record<'entity' | 'relation' | 'claim', string> = { entity: 'entiti
 export async function lineageOf(store: Store, kind: LineageReport['kind'], id: string): Promise<LineageReport> {
   if (kind === 'page') {
     const [current] = await store.query<Record<string, unknown>>(`SELECT * FROM pages WHERE path = $1`, [id]);
-    const deps = await readDeps(store, { kind: 'page', id });
+    // a generated page's inputs, or the documents a page no generator owns cites
+    const deps = [...await readDeps(store, { kind: 'page', id }), ...await readDeps(store, { kind: 'cites', id })];
     const scopes = await scopesForKey(store, 'page', id);
     return { kind, id, current: current ?? null, evidence: [], deps, scopes };
   }

@@ -932,6 +932,14 @@ export interface ResearchConfig {
   /** Accept the top recommendations automatically, up to `dailyJobs` per day. */
   auto: { enabled: boolean; dailyJobs: number };
   /**
+   * The audit of an agent page that cites a repository (docs/design/37 §5):
+   * after this many updates of the repository with no rewrite of the page,
+   * it gets a refresh suggestion anyway, whose brief asks for the entry
+   * points to be listed again from scratch — following the page's own
+   * citations never finds a path it missed. 0 turns the audit off. Not in Settings.
+   */
+  auditAfterUpdates: number;
+  /**
    * 'native' (default): one orchestrator session with the profile's native
    * roles registered as the CLI's own sub-agents (claude --agents, codex
    * agents.<id>, cursor .cursor/agents); it splits the research by period or
@@ -1428,6 +1436,7 @@ export function defaultConfig(): KnodeConfig {
       keepRuns: 20,
       readDirs: ['raw/docs', 'raw/codebase', 'wiki', '.sidecar'],
       auto: { enabled: false, dailyJobs: 3 },
+      auditAfterUpdates: 30,
       pipeline: 'native',
       profile: 'default',
       researchers: 3,

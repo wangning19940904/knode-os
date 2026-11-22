@@ -9,6 +9,7 @@ import { loadOntology, promptFragment } from '../graph/ontology.js';
 import { parseFrontmatter } from '../markdown.js';
 import { archivePage } from '../wiki/pages.js';
 import { stripRegions } from '../wiki/regions.js';
+import { citationBrief, citationChanges, citationPayloadOf, CitationPayload } from './cited-refresh.js';
 import { ResearchJob } from './jobs.js';
 import { loadResearchProtocol, renderOutputPath, ResearchTemplate, subjectOf } from './templates.js';
 import { profileBrief, requiredSections, ResearchProfile } from './profile.js';
@@ -248,6 +249,8 @@ export async function prepareRunWorkspace(ctx: AppContext, job: ResearchJob, tem
   ].filter(Boolean).join('\n');
 
   const previous = Array.isArray(job.payload.rejections) ? (job.payload.rejections as string[]) : [];
+  // a refresh of a page whose cited files changed is told which, read again now: more may have changed since it was queued
+  const cited = job.kind === 'refresh' ? await citedFilesNow(ctx, outputPath, citationPayloadOf(job.payload)) : [];
   const closing = job.kind === 'init'
     ? '开始吧：先按「知识库概况」摸底（knode_survey / knode_ls / knode_graph_insights），然后按模版逐节取证，最后 knode_write 总览与指南 → knode_feedback → knode_commit。'
     : '开始吧：先 knode_resolve，然后按模版逐节取证，最后 knode_write → knode_feedback → knode_commit。';
@@ -279,6 +282,7 @@ export async function prepareRunWorkspace(ctx: AppContext, job: ResearchJob, tem
     previous.length ? `## 上一次提交被退回，原因\n\n${previous.map((r) => `- ${r}`).join('\n')}\n` : '',
     existingPage ? `## 输出路径上已有页面（${humanParagraphs.length} 段人写内容必须原样保留）\n\n\`\`\`markdown\n${existingPage.trim()}\n\`\`\`\n` : '',
     ...companions.filter((c) => c.backupPath).map((c) => `## ${c.path} 上一版（可以重写；「${HUMAN_NOTES_HEADING.replace(/^#+\s*/, '')}」段由系统原样保留，你只需保留该标题）\n\n\`\`\`markdown\n${fs.readFileSync(c.backupPath!, 'utf8').trim()}\n\`\`\`\n`),
+    ...cited,
     ...(opts.seed !== undefined ? [opts.seed.trim(), ''] : ['## 知识库预整理', '', await contextSeed(ctx, subject, worksetId), '']),
     ...(opts.extraBrief ?? []),
     closing,
@@ -289,6 +293,26 @@ export async function prepareRunWorkspace(ctx: AppContext, job: ResearchJob, tem
   writeAgentFiles(dir, { schema, mcp: opts.mcp, extraMcp: opts.extraMcp, readme: `Run workspace for research job ${job.id}. brief.md is the prompt; CLAUDE.md / AGENTS.md the schema; transcript.jsonl the agent's output.\n` });
 
   return { dir, briefPath, outputPath, actor, research, worksetId, existingPage, humanParagraphs, companions };
+}
+
+/**
+ * The cited-files section of a refresh brief: the page's citation state now,
+ * joined with what the queued job carried (an audit, files that changed
+ * again in the meantime). Empty when neither says anything changed.
+ */
+async function citedFilesNow(ctx: AppContext, page: string, queued: CitationPayload | null): Promise<string[]> {
+  const [now] = await citationChanges(ctx.store, ctx.dataDir, { pages: [page], auditAfter: ctx.config.research.auditAfterUpdates ?? 0 }).catch(() => []);
+  if (!now && !queued) return [];
+  if (!now) return citationBrief(queued);
+  const union = (a: string[], b: string[] = []) => [...new Set([...a, ...b])];
+  return citationBrief({
+    cited: now.cited,
+    changed: union(now.changed, queued?.changed.filter((p) => !now.removed.includes(p))),
+    removed: union(now.removed, queued?.removed),
+    repositories: now.repositories.length ? now.repositories : queued?.repositories ?? [],
+    audit: now.audit ?? queued?.audit ?? null,
+    fingerprint: now.fingerprint,
+  });
 }
 
 /** Keep only the newest `keep` run directories. */

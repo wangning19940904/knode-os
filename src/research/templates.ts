@@ -259,14 +259,15 @@ requires:
 ---
 # 刷新页面：{target}
 
-页面 **{target}** 依据的事实已经变化（brief 里列出了变化）。重新核对并更新它，而不是重写。
+页面 **{target}** 依据的事实或它引用的文件已经变化（brief 里列出了变化）。重新核对并更新它，而不是重写。
 
 ## 步骤
 
 1. 读 brief 附上的现有页面全文与"变化清单"（新增 / 过期 / 被替代的事实、新的矛盾）。
-2. 用 \`knode_claims\`（include_superseded=true）和 \`knode_search\` 核对每一节；改正过时的数字与说法，补充新事实，更新时间线。
-3. 人写的段落原样保留；只改机器可核查的内容；在 "## 争议与缺口" 记录本次仍未解决的问题。
-4. 更新 frontmatter 的 claims / relations / sources；\`research\` 键用 brief 给的新值。
+2. brief 有"引用的文件已变化"一节时，本次刷新的范围就是它：只重新核对引用了那些文件的陈述，用 \`knode_read\` 读文件的当前版本，改正说法与行号；引用了已删除文件的陈述，找到新位置改引，找不到就移到"未核实"或"争议与缺口"；其余段落原样保留。该节要求审计时，再从头列一遍入口并与页面对比。
+3. 没有那一节时：用 \`knode_claims\`（include_superseded=true）和 \`knode_search\` 核对每一节；改正过时的数字与说法，补充新事实，更新时间线。
+4. 人写的段落原样保留；只改机器可核查的内容；在 "## 争议与缺口" 记录本次仍未解决的问题。
+5. 更新 frontmatter 的 claims / relations / sources；\`research\` 键用 brief 给的新值。frontmatter 有 \`repositories: [{ name, commit }]\` 时，把重新核对过的仓库的 \`commit\` 改成 brief 列出的镜像当前 commit，没核对的仓库保持原值。
 `;
 
 const VERIFY = `---
