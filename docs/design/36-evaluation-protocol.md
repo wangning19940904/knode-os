@@ -107,7 +107,7 @@ Ask's prompts replayed on the run's builds (read-only, the run's question vector
 Ruled out: supersession (the new values are live, the old ones superseded where they share an entity); the 2026-11-21 answer rules (every decline had a prompt without the answer); wiki pages crowding the update's document (it was not ranked at all). Three `cfg` questions per pack (`GRW1-C1-01`, `-02`, `PAY1-C1-01`) ask for a value set before the batches: they test the current value, not the update.
 
 Fixed on branch `claude/ask-stale-update-answers-c8e221`:
-- `search/newest.ts`: a question asking for the latest or current state ("latest", "newest", "now", "最新", "目前", "现在"; not "current ratio", not "最近三个月") gets the newest dated sources about what it names, before the passages: of the entity's own sources (titled with its name) whose titles hold the question's words best, the newest, and the newest holding the question's other words (each weighted by the share of candidates holding it, so cross-word bigrams count for little). Marked `newest` with the date; a rule says the newest source decides and a restated initial value is history.
+- `search/newest.ts`: a question asking for the latest or current state ("latest", "newest", "now", "最新", "目前", "现在"; not "current ratio", not "最近三个月"; "now" and its kin dropped after the model check below) gets the newest dated sources about what it names, before the passages: of the entity's own sources (titled with its name) whose titles hold the question's words best, the newest, and the newest holding the question's other words (each weighted by the share of candidates holding it, so cross-word bigrams count for little). Marked `newest` with the date; a rule says the newest source decides and a restated initial value is history.
 - Every passage header carries its source's date.
 - `graph/resolve.ts` `shortNameTwins`: the named entities include short-name twins, by exact alias key (indexed), for entities with at most 16 aliases; a twin's claims are ranked under its owner's name too; claims about a specific named entity (≤ 30 candidates) rank by that beside words and embedding; "now"/"最新" no longer rank claims.
 
@@ -122,6 +122,36 @@ Measured, same replay, before → after, the newest sources read at each batch's
 | prompt characters, mean | 27,985 | 30,215 |
 
 The 83 questions Ask got right keep the evidence they had (every incident id and setting value present before is present after). The packs' other 916 questions with evidence (the campaign's vectors), share of evidence documents in the prompt: 0.698 → 0.738, 90 better, 13 worse; by type alias 0.608 → 0.773, stale 0.839 → 0.904, timeline 0.790 → 0.821, paraphrase 0.894 → 0.936, deep-hop 0.207 → 0.200 (4 better, 12 worse: a chain's facts give way to the claims of the specific entities it names), the rest unchanged; the newest sources fired on 15 of them; median replay 116 → 111 ms. Not handled: a source titled with the entity and newer than its last report that counts incidents without naming them would be taken as the newest. On `ws_finance_a8349022` (read-only) twins take 2–35 ms and the newest sources 85–550 ms under a machine load of about 45. Whether the answers follow needs a model run: both Ask builds over the 121 questions, rebuilt from the run's cached replies, under the protocol's rules with local Codex and a local Claude judge.
+
+#### The model check (2026-11-22 18:22 to 2026-11-23 00:48)
+
+The cached replies could not be replayed: a knode build's prompts depend on the order its calls run in (the known-entities block of extraction, the names a summary is told the graph holds), so a zero-spend probe missed on all 54 build calls. The owner chose the full run instead, knowing the build would be live: two arms, each a fresh knode build of both packs and Ask on the update suite with two repeats, `before` = a7f5892 as run in Q3, `after` = a7f5892 plus this branch (92095b9). Local Codex `gpt-6.1-sol` (a ChatGPT account refuses `spacex-aiops/gpt-6.1-sol`; the pool's workers run the same model under the short name), effort low to build and medium to answer, judge `claude-cli` Sonnet 5.5, embeddings on the local bge-m3 endpoint (:12020, calibrated at cosine 0.99999 against the pool's identity). Spent: 2,762 Codex calls (2,286 to build, 476 to answer), 57.4M input and 4.1M output tokens, no API cost, 8,539 embedding calls, none on the pool; no call failed. Records in `~/knode-eval/runs/ask-update-check-20261122/`.
+
+The same 115 questions as the diagnosis (the four `upd-metric-D1T3` and the two grading defects left out), both repeats of each arm answered fresh:
+
+| arm | repeat 1 | repeat 2 | stale answers (repeat 2) |
+| --- | --- | --- | --- |
+| Q3 as recorded | 83 (0.722) | — | 15 |
+| `before` | 78 (0.678) | 79 (0.687) | 11 |
+| `after` | 103 (0.896) | 104 (0.904) | 9 |
+
+Paired on repeat 2: 32 questions right only after, 7 right only before, 72 right in both, 4 in neither. By class, right of n (before / after, repeat 2; repeat 1 of `after` within one of it everywhere):
+
+| class | en | zh |
+| --- | --- | --- |
+| risks, "latest weekly report" | 2 → 11 of 11 | 1 → 12 of 12 |
+| newest incident | 6 → 12 of 12 | 7 → 10 of 12 |
+| metric of the latest report | 7 → 8 of 8 | 12 → 12 of 12 |
+| head count "now" | 12 → 12 of 12 | 12 → 12 of 12 |
+| setting "now" | 9 → 8 of 12 | 11 → 7 of 12 |
+
+The grading defect `upd-risks-D1T2-03` is right after in both repeats; `upd-prog-D1T2-J5-01` is wrong in every arm.
+
+The seven lost, read:
+- five settings (`cfg`: en `PAY1-C1-04`, zh `GRW1-C1-01`, `-02`, `-04`, `PLT1-C1-04`), the same wrong value in both repeats: "now" fired the newest sources, which gave the team's two newest reports. Neither names the setting: it changed in an older report, often under its short name ("推送配额从本周起改成6条", "PAY1-C1 changed to 8000 dollars"), which the search found before. Ask took the newest-marked passages as the latest state and answered from an older change it found beside them ("该配置自2025年6月23日起恢复为5条", the value before last). The setting's own entity is no help: its mentions miss the changes stated under the short name (en `per-refund-approval-limit`: newest mention 2026-W16, the change in W20).
+- two incidents (zh `lastinc-D1T2-01`, `-02`, gold INC-1224 in 2026-W15, asked after batch 01 ending W19): replayed at the batch's date, the newest sources give W19 and W16, whose incident line is "INC-1224已修复". The evidence was there, and Ask declined in three of the four answers because the newest report (W19) names no incident. That is the reading of the question ("the latest report's incident" against "the latest incident reported"), not retrieval; left as is.
+
+Changed after it (2026-11-23, same branch): `asksLatest` no longer reads "now", "currently", "at present", "现在", "目前", "当前", "如今", "眼下". A current value is in the source that last changed it, not the newest one, and the claims with their supersession and the search already answer it. The newest sources now fire only for "latest", "newest", "most recent", "最新", "最近一次" and the like: the risks, incident and metric classes, which went 35 → 65 of 67. The settings and head counts get the prompt `before` had plus the rest of the fix (short-name twins among the named entities, dated passage headers). No model has answered with this change: it removes the step from 48 questions, all of which it either left unchanged (head counts) or made worse (settings), but it also takes the twins and the dated headers without the newest sources, a combination not measured. Measuring it means rebuilding the update suite in place (about 1,100 build calls for the two packs, as the `after` arm spent) and answering the 48.
 
 ### Q2 — as the free gate said
 
