@@ -161,12 +161,15 @@ export function attributeOf(question: string, subject: string | null, periodWord
  * concept — "营业收入" is an attribute, not a company) whose name it contains.
  */
 export async function subjectOf(store: Store, question: string): Promise<string | null> {
+  // a parenthesized note says how to read the sources ("项目管理办公室月报与周报不一致时以月报为准"), not what is asked about:
+  // found by a real model's write-back, whose fact went to 项目管理办公室 instead of the team the question named
+  const asked = question.normalize('NFKC').replace(/（[^）]*）|\([^)]*\)/g, ' ');
   const rows = await store.query<{ name: string }>(
     `SELECT name FROM entities
      WHERE tx_to IS NULL AND canonical_id IS NULL AND type <> 'concept' AND length(name) BETWEEN 2 AND 40
        AND strpos(lower($1), lower(name)) > 0
      ORDER BY length(name) DESC LIMIT 1`,
-    [question.normalize('NFKC')],
+    [asked],
   );
   return rows[0]?.name ?? null;
 }

@@ -8,7 +8,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { AppContext, createContext } from '../src/context.js';
 import { sync } from '../src/ingest/sync.js';
 import { LEARNED_DIR, learnConfig } from '../src/learn/config.js';
-import { attributeOf, periodOf } from '../src/learn/facts.js';
+import { attributeOf, periodOf, subjectOf } from '../src/learn/facts.js';
 import { answerFigures, declaredScale, figureOnLine, numbersIn } from '../src/learn/numbers.js';
 import { learnedPathFor, readLearnedPage } from '../src/learn/page.js';
 import { checkCitation, namesAttribute, parseSourceRef } from '../src/learn/verify.js';
@@ -127,6 +127,13 @@ describe('numbers as answers and lines write them', () => {
     expect(attributeOf('澄海科技2023年的营业收入是多少？', '澄海科技', '2023年')).toBe('营业收入');
     expect(attributeOf('英力特的公允价值变动收益是多少？', null, null)).toBe('公允价值变动收益');
     expect(attributeOf('What is the Basic Earnings Per Share of Zenith Holdings?', 'Zenith Holdings', null)).toBe('basic earnings per share');
+  });
+});
+
+describe('the subject a question asks about', () => {
+  it('is never named only in a parenthesized note on how to read the sources', async () => {
+    expect(await subjectOf(ctx.store, 'Zenith Holdings 的总收入是多少？（以澄海科技的口径为准）')).toBe('Zenith Holdings');
+    expect(await subjectOf(ctx.store, '总收入是多少？（以澄海科技的口径为准）')).toBeNull();
   });
 });
 
