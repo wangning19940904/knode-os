@@ -20,7 +20,8 @@ import { judgeItemKey, repeatOf, scoreKey } from './keys.js';
  * a quarter, a count) named in one predicted label — and is right only when
  * the whole set is; a group written as one entry ("中利润：甲、乙") is read as
  * its members (`matchFieldEntries`). A look-alike task names its distractors: the share of
- * predicted items that are the look-alike's is `distractor_rate`.
+ * predicted items that are the look-alike's is `distractor_rate`. A `complete` list
+ * (RAMDocs) is right when every gold item is given and no entry names a distractor.
  */
 
 const CJK_CLASS = '㐀-䶿一-鿿぀-ヿ가-힯';
@@ -516,6 +517,22 @@ export async function scoreLists(input: ListInput, judge: Judge): Promise<ScoreR
   return out;
 }
 
+/**
+ * Does an entry name one of the task's distractors as a whole term. A distractor that is part of a gold name
+ * the entry gives ("New York" in a gold "New York City") is looked for in the rest of the entry only.
+ */
+export function namesDistractor(label: string, paired: GoldItem[], distractors: string[]): boolean {
+  if (!distractors.length) return false;
+  const given = paired.flatMap((g) => [g.label, ...g.aliases]).filter((name) => containsTerm(label, name)).map(matchForm);
+  return distractors.some((d) => {
+    const inside = given.filter((name) => name !== matchForm(d) && containsTerm(name, d));
+    if (!inside.length) return containsTerm(label, d);
+    let rest = matchForm(label);
+    for (const name of inside) rest = rest.split(name).join(' ');
+    return containsTerm(rest, d);
+  });
+}
+
 /** Set precision / recall / F1 over the matched pairs, and what the task type adds: order and dates, attribution. */
 export function listScores(
   a: AnswerRecord, t: Task, spec: ListSpec, matched: [number, number][], items: { label: string; evidence: string[]; date?: string; confidence: number | null }[],
@@ -533,8 +550,13 @@ export function listScores(
   put(a, t, 'set_precision', precision);
   put(a, t, 'set_recall', recall, { matched: pairs.map(([p, g]) => [items[p].label, gold[g].label]), ...(how ? { pairedBy: how } : {}) });
   put(a, t, 'set_f1', f1);
+  const distractors = Array.isArray(t.meta?.distractors) ? (t.meta!.distractors as unknown[]).map(String) : [];
   // exact: the whole set, nothing missing and nothing extra
-  let correctness = spec.primary === 'recall' ? recall : spec.primary === 'exact' ? (pairs.length === gold.length && items.length === gold.length ? 1 : 0) : f1;
+  // complete: nothing missing and no distractor named; an extra entry that names none is let pass
+  let correctness = spec.primary === 'recall' ? recall
+    : spec.primary === 'exact' ? (pairs.length === gold.length && items.length === gold.length ? 1 : 0)
+      : spec.primary === 'complete' ? (pairs.length === gold.length && !items.some((it, i) => namesDistractor(it.label, pairs.filter(([p]) => p === i).map(([, g]) => gold[g]), distractors)) ? 1 : 0)
+        : f1;
   if (spec.ordered) {
     const order = orderAccuracy(pairs, gold);
     put(a, t, 'order_accuracy', order);
@@ -546,9 +568,8 @@ export function listScores(
   if (attributed.length) {
     put(a, t, 'attribution_recall', attributed.reduce((s, [p, g]) => s + gold[g].docs!.filter((d) => cited(p).has(d)).length / gold[g].docs!.length, 0) / attributed.length);
   }
-  put(a, t, 'correctness', correctness, { metric: spec.primary === 'recall' ? 'set_recall' : spec.primary === 'exact' ? 'exact_set' : 'set_f1', ...(spec.ordered ? { times: 'order_accuracy' } : {}) });
+  put(a, t, 'correctness', correctness, { metric: spec.primary === 'recall' ? 'set_recall' : spec.primary === 'exact' ? 'exact_set' : spec.primary === 'complete' ? 'complete_set' : 'set_f1', ...(spec.ordered ? { times: 'order_accuracy' } : {}) });
   // a look-alike's items given for the asked entity's
-  const distractors = Array.isArray(t.meta?.distractors) ? (t.meta!.distractors as unknown[]).map(String) : [];
   if (distractors.length) {
     const took = items.filter((it, i) => !pairs.some(([p]) => p === i) && distractors.some((d) => containsTerm(it.label, d))).length;
     put(a, t, 'distractor_rate', items.length ? took / items.length : 0);

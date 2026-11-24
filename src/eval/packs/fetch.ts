@@ -56,6 +56,18 @@ export async function fetchCached(url: string, opts: FetchOptions): Promise<Fetc
   return { file, record };
 }
 
+/**
+ * A dataset file: fetched once into the cache, or, when the recipe was given a local copy of the dataset
+ * (`from`: an offline build, a test fixture), read from there and hashed here.
+ */
+export async function datasetFile(opts: FetchOptions & { url: string; from?: string; rel: string }): Promise<Fetched> {
+  if (!opts.from) return fetchCached(opts.url, opts);
+  const file = path.join(opts.from, opts.rel);
+  if (!fs.existsSync(file)) throw new Error(`${file} is missing: a local copy of the dataset holds ${opts.rel}`);
+  const sha256 = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  return { file, record: { url: `file://${file}`, license: opts.license, sha256, bytes: fs.statSync(file).size, note: `local copy of ${opts.url}` } };
+}
+
 export async function fetchText(url: string, opts: FetchOptions): Promise<{ text: string; record: SourceRecord }> {
   const f = await fetchCached(url, opts);
   return { text: fs.readFileSync(f.file, 'utf8'), record: f.record };
