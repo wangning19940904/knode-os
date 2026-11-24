@@ -47,7 +47,7 @@ export function asksForValue(question: string): boolean {
 }
 
 /** What frames a value question in Chinese, after its subject: taken off the end of what is left, until none is left. */
-const ZH_TAIL = /(?:(?:分别)?(?:是|为|有)?(?:多少|几)(?:[元万亿个次起人名天]|分钟|小时)?|(?:加起来|一共|总共|合计|累计)|在(?:这|该|各|此).*|是(?:什么|哪[个一家些]+)|呈现(?:了|出)?.*|发生了.*|有(?:何|什么)变化.*|的?(?:变化|发展)?趋势.*|的?变化(?:情况)?.*|最[高低多少大小]的.*|进行划分.*|的?(?:平均值|平均数|合计|总和|总数|最大值|最小值))$/;
+const ZH_TAIL = /(?:(?:分别)?(?:是|为|有)?(?:多少|几)(?:[元万亿个次起人名天]|分钟|小时)?|(?:的)?(?:金额|数额|数值|数字)|(?:加起来|一共|总共|合计|累计)|在(?:这|该|各|此).*|是(?:什么|哪[个一家些]+)|呈现(?:了|出)?.*|发生了.*|有(?:何|什么)变化.*|的?(?:变化|发展)?趋势.*|的?变化(?:情况)?.*|最[高低多少大小]的.*|进行划分.*|的?(?:平均值|平均数|合计|总和|总数|最大值|最小值))$/;
 /** Clauses of a Chinese question that say how to answer, not what: "以项目管理办公室核对后的数字为准", "保留3位小数", "在这两年一季度之间". */
 const ZH_ASIDE = /以[^，,。？?]*为准|保留\d+位小数|在(?:这|该|各|此)[^，,。？?]{0,12}?(?:之间|期间|中|内|里)|(?:请|并)?列出.*|按[^，,。？?]{0,8}(?:顺序|排序).*/g;
 /** What frames it before: "根据X的财报信息，", "考虑以下公司的2024年财报：", "请回答", "请按递增顺序列举上述每个公司". */
@@ -157,6 +157,35 @@ function holds(line: string, term: string): boolean {
   return parts.length > 0 && parts.every((p) => l.includes(p));
 }
 
+/** Share of a metric's pieces a line must hold to be read as naming it in other words. */
+export const FUZZY_SHARE = { cjk: 0.7, latin: 0.75 };
+
+/**
+ * The pieces a metric is matched by in other words: a Chinese one of five characters or more by its character
+ * pairs (公允价值变动损益 → 公允, 允价, … 损益: "公允价值变动收益" holds five of seven), a Latin one of three words or
+ * more by its words ("basic earnings per share": "Net loss per share – basic" holds three of four). Empty when the
+ * metric is too short to be matched loosely.
+ */
+export function fuzzyPieces(term: string): { pieces: string[]; need: number } {
+  const cjk = term.replace(/[^一-鿿]/g, '');
+  if (cjk.length >= 5 && cjk.length === term.replace(/[\s、，,]/g, '').length) {
+    const pieces = [...new Set(Array.from({ length: cjk.length - 1 }, (_, i) => cjk.slice(i, i + 2)))];
+    return { pieces, need: Math.ceil(pieces.length * FUZZY_SHARE.cjk) };
+  }
+  const words = [...new Set(term.split(/\s+/).filter((w) => /^[a-z]/.test(w) && w.length >= 3))];
+  if (words.length >= 3 && !/[一-鿿]/.test(term)) return { pieces: words, need: Math.ceil(words.length * FUZZY_SHARE.latin) };
+  return { pieces: [], need: Infinity };
+}
+
+/** Whether a line names a metric in other words (`fuzzyPieces`). */
+function holdsLoosely(line: string, term: string): boolean {
+  const { pieces, need } = fuzzyPieces(term);
+  if (pieces.length === 0) return false;
+  const l = flat(line);
+  const latin = !/[一-鿿]/.test(term);
+  return pieces.filter((p) => (latin ? new RegExp(`(^|[^a-z])${escapeRe(p)}`).test(l) : l.includes(p))).length >= need;
+}
+
 const TABLE_ROW = /^\s*\|/;
 const TABLE_RULE = /^\s*\|?\s*:?-{3,}/;
 const UNIT_LINE = /单位[：:]|币种[：:]|\bin (?:thousands|millions|billions)\b|\(in (?:thousands|millions)|\$\s*in (?:thousands|millions)|人民币元|美元/i;
@@ -167,14 +196,14 @@ const UNIT_LINE = /单位[：:]|币种[：:]|\bin (?:thousands|millions|billions
  * above its rule), and any line behind the nearest line above it that states a
  * unit. Long lines are cut around their hit.
  */
-export function rowWindows(content: string, terms: string[]): string[] {
+export function rowWindows(content: string, terms: string[], loose = false): string[] {
   const lines = content.split('\n');
   const out: string[] = [];
   const used = new Set<number>();
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!line.trim() || TABLE_RULE.test(line)) continue;
-    const term = terms.find((t) => holds(line, t));
+    const term = terms.find((t) => (loose ? holdsLoosely(line, t) : holds(line, t)));
     if (!term) continue;
     const lead: string[] = [];
     // the table's header: the line above the rule that opens the table this row is in
@@ -244,7 +273,9 @@ export async function rowExcerpts(store: Store, question: string, contexts: Sear
   const has = (s: string) => `strpos(${text}, ${p.add(s)}) > 0`;
   const conds = terms.map((t) => {
     const parts = metricParts(t);
-    return parts.length ? `(${has(t)} OR (${parts.map(has).join(' AND ')}))` : has(t);
+    const { pieces, need } = fuzzyPieces(t);
+    const loose = pieces.length ? ` OR (${pieces.map((x) => `(CASE WHEN ${has(x)} THEN 1 ELSE 0 END)`).join(' + ')}) >= ${need}` : '';
+    return parts.length ? `(${has(t)} OR (${parts.map(has).join(' AND ')})${loose})` : `(${has(t)}${loose})`;
   });
   const rows = await store.query<Hit>(
     `SELECT c.id, c.document_id, c.seq, c.content, d.path, d.title, d.doc_date
@@ -260,8 +291,11 @@ export async function rowExcerpts(store: Store, question: string, contexts: Sear
   const shown = contexts.map((c) => flat(opts.visible ? opts.visible(c) : c.content)).join('\n');
   const byDoc = new Map<string, { hit: Hit; texts: string[] }>();
   const seen = new Set<string>();
+  // a document whose lines name the metric in the question's words gives those; one that names it only in other
+  // words ("公允价值变动收益" for 公允价值变动损益, "Net loss per share – basic") gives those
+  const exact = new Set(rows.filter((r) => rowWindows(r.content, terms).length > 0).map((r) => r.document_id));
   for (const hit of rows) {
-    for (const w of rowWindows(hit.content, terms)) {
+    for (const w of rowWindows(hit.content, terms, !exact.has(hit.document_id))) {
       const key = flat(w);
       const own = flat(w.split('\n').pop() ?? w).replace(/^…|…$/g, '');
       if (seen.has(key) || shown.includes(own)) continue;

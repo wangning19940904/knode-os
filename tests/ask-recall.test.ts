@@ -10,7 +10,7 @@ import { ask } from '../src/search/ask.js';
 import { enumerateClaims, fillShares, subjectTimelines } from '../src/search/enumerate.js';
 import { namedEntities } from '../src/search/facts.js';
 import { questionRange } from '../src/search/route.js';
-import { asksForValue, metricParts, metricTerms, rowExcerpts, rowWindows } from '../src/search/rows.js';
+import { asksForValue, fuzzyPieces, metricParts, metricTerms, rowExcerpts, rowWindows } from '../src/search/rows.js';
 import { around, isConceptWord, namedSubjects, SUBJECT_MIN_CHARS, subjectPassages } from '../src/search/subjects.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 import type { SearchResult } from '../src/types.js';
@@ -248,6 +248,25 @@ describe('R2: the line holding the value asked for', () => {
     const windows = rowWindows(FILLER[11], ['公允价值变动收益']);
     expect(windows).toHaveLength(1);
     expect(windows[0].split('\n')).toEqual(['单位：元', '| 项目 | 本期发生额 | 上期发生额 |', '| 公允价值变动收益（损失以“－”号填列） | 144,480.00 | -3,500.00 |']);
+  });
+
+  it('reads a line naming the metric in other words only when asked to, for a document naming it in none of the question\'s', () => {
+    expect(fuzzyPieces('公允价值变动损益')).toEqual({ pieces: ['公允', '允价', '价值', '值变', '变动', '动损', '损益'], need: 5 });
+    expect(fuzzyPieces('basic earnings per share').need).toBe(3);
+    // too short to match loosely
+    expect(fuzzyPieces('专项储备').pieces).toEqual([]);
+    expect(fuzzyPieces('net income').pieces).toEqual([]);
+    expect(rowWindows(FILLER[11], ['公允价值变动损益'])).toEqual([]);
+    expect(rowWindows(FILLER[11], ['公允价值变动损益'], true)).toHaveLength(1);
+    const eps = 'Net loss per share:\n| Net loss per share – basic | (0.54) | (0.31) |\n| Weighted average shares | 10,000 | 9,000 |';
+    expect(rowWindows(eps, ['basic earnings per share'], true)).toEqual(['| Net loss per share – basic | (0.54) | (0.31) |']);
+    expect(metricTerms('格力电器的一般风险准备金额是多少（依据其2024年一季度报告）？', ['格力电器'])).toEqual(['一般风险准备']);
+  });
+
+  it('gives the loosely named line of a filing that never uses the question\'s words', async () => {
+    const rows = await rowExcerpts(store, '英力特的公允价值变动损益是多少？', [await chunkOf('ylt-q1-0')], { names: ['英力特'] });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].content).toContain('144,480.00');
   });
 
   it('matches a metric written with its parts apart', () => {
