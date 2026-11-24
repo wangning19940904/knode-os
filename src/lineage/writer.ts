@@ -13,6 +13,7 @@ import {
   slugify,
 } from '../graph/store.js';
 import type { PlannedCitation } from '../graph/citations.js';
+import type { TableFact } from '../tables/parse.js';
 import { entityTypeIds, loadOntology, normalizePredicate, Ontology, relationSpec } from '../graph/ontology.js';
 import { codeOf, MentionContext } from '../graph/identity.js';
 import { followNamesake, NamesakeIndex, resolutionMode, resolveEntityId, ResolvedEntity } from '../graph/resolve.js';
@@ -54,6 +55,8 @@ import {
 
 /** Citation rows per INSERT: ten parameters each, well under PostgreSQL's 65,535. */
 const CITATION_BATCH = 500;
+/** Table fact rows per INSERT: 24 parameters each, well under PostgreSQL's 65,535. */
+const TABLE_FACT_BATCH = 500;
 
 export interface DocumentProjection {
   id: string;
@@ -624,6 +627,33 @@ export class ScopeWriter {
       );
     }
     this.stats.citations += rows.length;
+  }
+
+  /**
+   * A document's table facts (src/tables): rows this scope owns, deleted with
+   * it on replace or dispose. Batched, because a report has hundreds of cells.
+   */
+  async tableFacts(document: { id: string; path: string; subject: string | null; docPeriod: string | null }, rows: TableFact[]): Promise<void> {
+    const cols = 24;
+    for (let i = 0; i < rows.length; i += TABLE_FACT_BATCH) {
+      const params: unknown[] = [];
+      const tuples = rows.slice(i, i + TABLE_FACT_BATCH).map((f) => {
+        const at = params.push(
+          this.scope.id, document.id, document.path, document.subject, document.docPeriod, f.tableNo, f.tableLine, f.tableTitle,
+          f.line, f.col, f.section, f.label, f.labelKey, f.period, f.periodKey, f.periodSpan,
+          f.valueNum, f.valueText, f.unit, f.scale, f.scaleFactor, f.parser, f.confidence, this.txTime,
+        ) - cols;
+        return `(${Array.from({ length: cols - 1 }, (_, k) => `$${at + k + 1}`).join(', ')}, $${at + cols}::timestamptz)`;
+      });
+      await this.q.query(
+        `INSERT INTO table_facts (scope_id, document_id, source_path, subject, doc_period, table_no, table_line, table_title,
+           line, col, section, label, label_key, period, period_key, period_span,
+           value_num, value_text, unit, scale, scale_factor, parser, confidence, tx_from)
+         VALUES ${tuples.join(', ')}`,
+        params,
+      );
+    }
+    this.stats.tableFacts = (this.stats.tableFacts ?? 0) + rows.length;
   }
 
   /** Queue the document for tier-1 extraction; `segments` is how many extraction calls it will take (progress only). */

@@ -300,6 +300,9 @@ async function disposeTree(
   for (const table of ['capabilities', 'capability_notes', 'locators', 'citations']) {
     await q.query(`UPDATE ${table} SET tx_to = $2::timestamptz WHERE scope_id = $1 AND tx_to IS NULL`, [scopeId, txTime]);
   }
+  // table facts are read from the document's text alone, so they keep no history of their own: the
+  // document's versions are that history, and a re-parse writes them again (src/tables/store.ts)
+  if (scope.kind === 'tables') await q.query(`DELETE FROM table_facts WHERE scope_id = $1`, [scopeId]);
 
   if (documentId && !opts.keepProjection) {
     await q.query(`DELETE FROM chunks WHERE document_id = $1`, [documentId]);

@@ -27,7 +27,8 @@ import { isVirtualPath, readVirtual } from '../compiler/vfs.js';
 import { renderCapabilityDts } from '../capability/dts.js';
 import { listCapabilities, locatorsForEntities } from '../capability/store.js';
 import { claimQueryFromArgs, queryClaims } from '../store/claims.js';
-import { CATALOG_SOURCE, CATALOG_VIEWS, catalogQuery } from '../store/catalog.js';
+import { CATALOG_SOURCE, CATALOG_VIEWS, catalogQuery, OPTIONAL_CATALOG_VIEWS } from '../store/catalog.js';
+import { tableFactsEnabled, tableMatrix } from '../tables/store.js';
 import { resolveScopeFilter, resolveTemporal, SOURCE_KINDS } from '../store/resolver.js';
 import { listDatasets, listSuggestions } from '../store/queries.js';
 import { validateOkfBundle } from '../okf/index.js';
@@ -99,6 +100,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
   const server = narrowed(target, opts);
   const agent = opts.caller === 'agent';
   const track = opts.track !== false;
+  const tableFacts = ctx.config ? tableFactsEnabled(ctx.config) : false;
   // what a read writes beside its answer when reads are not tracked: nothing
   const quiet = track ? {} : ({ track: false, record: false } as const);
   const forPerson = (what: string) => new Error(`${what} is a person's review, not an agent's: ask them to do it in knode-os (the source's "adopt" in the UI, or \`knode-os trust\`)`);
@@ -939,7 +941,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
           ...ctx.datasources.list().map((d) => ({ id: d.id, kind: d.kind, description: d.description ?? '' })),
           { id: CATALOG_SOURCE, kind: 'catalog', description: 'the knowledge base itself, as read-only SQL views' },
         ],
-        catalog: CATALOG_VIEWS,
+        catalog: tableFacts ? CATALOG_VIEWS : CATALOG_VIEWS.filter((v) => !OPTIONAL_CATALOG_VIEWS.has(v.name)),
         datasets: datasets.map((d) => ({
           id: d.id,
           source: d.source_id,
@@ -960,7 +962,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
     'knode_query',
     {
       title: 'Native query against a live data source',
-      description: `Run a read-only SQL statement (SELECT/SHOW/DESCRIBE/EXPLAIN) directly against a configured source in its native dialect. Returns rows plus an asOf timestamp; results are live, never from the index. source="catalog" queries the knowledge base itself through the v_* views — the tool for lists, counts, rankings and date ranges over what the knowledge base extracted (every claim about X in 2025, how many P1 incidents company-wide, how many documents mention Y) and for who did what (v_relations: every relation of an entity with the sentence stating it, one call per hop of a chain), in one call instead of reading documents one by one.\n${catalogGuide()}`,
+      description: `Run a read-only SQL statement (SELECT/SHOW/DESCRIBE/EXPLAIN) directly against a configured source in its native dialect. Returns rows plus an asOf timestamp; results are live, never from the index. source="catalog" queries the knowledge base itself through the v_* views — the tool for lists, counts, rankings and date ranges over what the knowledge base extracted (every claim about X in 2025, how many P1 incidents company-wide, how many documents mention Y) and for who did what (v_relations: every relation of an entity with the sentence stating it, one call per hop of a chain), in one call instead of reading documents one by one.\n${catalogGuide({ tableFacts })}`,
       inputSchema: {
         source: z.string().describe('Datasource id, e.g. "market-mysql", or "catalog" for the knowledge base itself (see knode_datasources)'),
         sql: z.string().describe('A single read-only SQL statement in the source\'s dialect'),
@@ -972,6 +974,25 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
       return json(await runSourceQuery(ctx.datasources, source, sql, { maxRows }));
     },
   );
+
+  // the statement tables of raw/docs as one matrix (src/tables): offered only where extraction.tableFacts is on
+  if (tableFacts) {
+    server.registerTool(
+      'knode_table',
+      {
+        title: 'Metrics × companies × periods from the statement tables',
+        description: 'One call for numbers that stand in the tables of many reports ("accounts payable of these 12 companies at 2024-03-31", "营业收入 of A, B and C, 2023 and 2024"): returns a matrix with one row per company (document) and metric and one column per period; each cell has the value as written, the unit, the scale (its wording as the table states it, e.g. "单位：万元" or "in thousands", and scaleFactor; valueScaled = value × scaleFactor) and ref = path#Lline to check it with one read. Metrics match a row label as written or its normalized key (营业收入 = revenue, 应付账款 = Accounts payable = accounts_payable; ", net", "(loss)", numbering and 其中：/减： are ignored), then labels containing the metric. Every cell of every table is there, not just headline figures; derived ratios are not computed. `missing` lists the company × metric pairs nothing matched — read those documents. Use knode_query on v_table_facts for shapes this does not give.',
+        inputSchema: {
+          metrics: z.array(z.string()).min(1).max(20).describe('Row labels or keys, e.g. ["Accounts payable", "营业收入", "total_assets"]'),
+          subjects: z.array(z.string()).max(60).optional().describe('Companies (or document names / path parts); none: every company that has the metric'),
+          periods: z.array(z.string()).max(12).optional().describe('e.g. ["2024-03-31", "2023-12-31"], ["2024", "2023"], ["2024-Q1"], ["期末余额"], ["current", "prior"]; none: every period found'),
+          paths: z.array(z.string()).max(20).optional().describe('Restrict to documents under these path prefixes'),
+          contains: z.boolean().optional().describe('false: match a metric by key or exact label only (default true: also labels containing it, where nothing matches exactly)'),
+        },
+      },
+      async ({ metrics, subjects, periods, paths, contains }) => json(await tableMatrix(ctx.store, { metrics, subjects, periods, paths, contains })),
+    );
+  }
 
   server.registerTool(
     'knode_grep',

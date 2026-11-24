@@ -208,13 +208,23 @@ export interface Sidecar {
   usage: SidecarUsage;
 }
 
-export type SidecarPart = 'meta' | 'tier0' | 'tier1' | 'usage';
+export type SidecarPart = 'meta' | 'tier0' | 'tier1' | 'usage' | 'tables';
 
 export interface SidecarParts {
   meta: SidecarMeta;
   tier0: SidecarTier0;
   tier1: SidecarTier1;
   usage: SidecarUsage;
+  tables: SidecarTables;
+}
+
+/**
+ * The table model path's replies (src/tables/llm.ts), by segment text hash: the
+ * rows a call returned that the text bore out. Replayed for free while the
+ * segment's text is unchanged, as tier-1 segments are.
+ */
+export interface SidecarTables {
+  segments: Record<string, { model: string; at: string; rows: { line: number; label: string; column: string; value: string; scale: string | null }[] }>;
 }
 
 const PART_FILES: Record<SidecarPart, string> = {
@@ -222,6 +232,7 @@ const PART_FILES: Record<SidecarPart, string> = {
   tier0: 'tier0.json',
   tier1: 'tier1.json',
   usage: 'usage.json',
+  tables: 'tables.json',
 };
 const CONTENT_FILE = 'content.md';
 const ORIGIN_FILE = 'origin.json';

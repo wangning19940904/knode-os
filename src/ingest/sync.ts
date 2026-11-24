@@ -18,6 +18,7 @@ import { Store } from '../store/db.js';
 import { IngestStats } from '../types.js';
 import { fileCitationRefreshes } from '../research/cited-refresh.js';
 import { reconcileViews } from '../wiki/pages.js';
+import { refreshTableFacts, tableFactsEnabled } from '../tables/store.js';
 import { applyDocScope } from './apply.js';
 import { originalOfTranscript, transcriptPathFor } from './convert.js';
 import { prepareEpisodes } from './episode.js';
@@ -311,6 +312,16 @@ async function syncAll(ctx: SyncContext, opts: SyncOptions): Promise<SyncStats> 
     const ds = await applyDatasourceScopes(ctx, ctx.datasources, { actor, onProgress: progress, at: opts.at });
     stats.datasourceErrors = ds.errors;
     stats.pagesRegenerated += ds.wikiPages;
+  }
+
+  // table facts (extraction.tableFacts): the tables of documents applied above, or whose facts are missing or stale, read
+  // without a model into a child scope of each document's (src/tables/store.ts)
+  if (touchesDocs && tableFactsEnabled(config)) {
+    try {
+      await refreshTableFacts(ctx, { prefixes, onProgress: progress, actor });
+    } catch (err) {
+      progress(`tables failed: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   // views: archive / regenerate dependents, repair drift

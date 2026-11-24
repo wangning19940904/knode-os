@@ -1071,6 +1071,63 @@ INSERT INTO meta (key, value) VALUES ('${RELATION_SOURCES_META}', '{"pending": t
   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 `;
 
+// Table facts (docs/design/38 §3.2 item 1, src/tables): every cell of a
+// statement table, typed — label as written and its key, the column's period,
+// the value, unit and scale (with the scale's wording), the line — written by
+// a `tables` scope, a child of the document's, only while
+// `extraction.tableFacts` is on. Kept apart from `claims`: claims are folded,
+// deduplicated, audited and listed on entity pages, each with a cost and a
+// cap, and a report's few hundred cells would swamp them. Rows are deleted
+// with their scope (a re-parse writes them again), so there is no tx_to.
+// `table_label_keys` maps a label key no synonym group holds onto a canonical
+// one, once per distinct key (as claim_attribute_keys does for claims);
+// v_table_facts reads the key through it. Nothing existing is rewritten.
+const V22_TABLE_FACTS = `
+CREATE TABLE IF NOT EXISTS table_facts (
+  id           BIGSERIAL PRIMARY KEY,
+  scope_id     TEXT NOT NULL,
+  document_id  TEXT NOT NULL,
+  source_path  TEXT NOT NULL,
+  subject      TEXT,
+  doc_period   TEXT,
+  table_no     INTEGER NOT NULL,
+  table_line   INTEGER NOT NULL,
+  table_title  TEXT,
+  line         INTEGER NOT NULL,
+  col          SMALLINT NOT NULL,
+  section      TEXT,
+  label        TEXT NOT NULL,
+  label_key    TEXT NOT NULL,
+  period       TEXT NOT NULL DEFAULT '',
+  period_key   TEXT,
+  period_span  TEXT,
+  value_num    DOUBLE PRECISION,
+  value_text   TEXT NOT NULL,
+  unit         TEXT,
+  scale        TEXT,
+  scale_factor DOUBLE PRECISION NOT NULL DEFAULT 1,
+  parser       TEXT NOT NULL,
+  confidence   REAL NOT NULL DEFAULT 1,
+  tx_from      TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS table_facts_scope_idx ON table_facts (scope_id);
+CREATE INDEX IF NOT EXISTS table_facts_key_idx ON table_facts (label_key);
+CREATE INDEX IF NOT EXISTS table_facts_document_idx ON table_facts (document_id);
+CREATE TABLE IF NOT EXISTS table_label_keys (
+  label_key  TEXT PRIMARY KEY,
+  canonical  TEXT NOT NULL,
+  reason     TEXT NOT NULL DEFAULT '',
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE OR REPLACE VIEW v_table_facts AS
+  SELECT f.id, f.source_path, f.document_id, f.subject, f.doc_period, f.table_no, f.table_line, f.table_title,
+         f.line, f.source_path || '#L' || f.line AS ref, f.col, f.section, f.label,
+         COALESCE(k.canonical, f.label_key) AS label_key, f.period, f.period_key, f.period_span,
+         f.value_num, f.value_text, f.unit, f.scale, f.scale_factor,
+         f.value_num * f.scale_factor AS value_scaled, f.parser, f.confidence, f.tx_from
+  FROM table_facts f LEFT JOIN table_label_keys k ON k.label_key = f.label_key;
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -1110,6 +1167,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 19, name: 'claim-state', up: async (q) => execScript(q, V19_CLAIM_STATE) },
   { version: 20, name: 'relation-source', up: async (q) => execScript(q, V20_RELATION_SOURCE) },
   { version: 21, name: 'claim-rekey', up: async (q) => execScript(q, V21_CLAIM_REKEY) },
+  { version: 22, name: 'table-facts', up: async (q) => execScript(q, V22_TABLE_FACTS) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

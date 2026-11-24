@@ -284,6 +284,18 @@ export interface LlmConnection extends LlmConfig {
   label: string;
 }
 
+/** `extraction.tableFacts` (src/tables). */
+export interface TableFactsConfig {
+  /** Parse tables into facts on sync. Default false. */
+  enabled?: boolean;
+  /**
+   * Replay the table model path's stored replies (the sidecar's `tables`
+   * part) for segments the layout reading could not vouch for. No call is
+   * made on sync either way; the calls are `runTableModelPass`'s. Default false.
+   */
+  model?: boolean;
+}
+
 export interface ExtractionConfig {
   /** Also extract time-bound claims (GraphRAG covariates) in the tier-1 call. */
   claims: boolean;
@@ -370,6 +382,15 @@ export interface ExtractionConfig {
    * does not redo it: the page keeps the links it had (docs/design/14).
    */
   summaryAfterExtraction?: boolean;
+  /**
+   * Table facts (docs/design/38 §3.2 item 1, src/tables): every cell of the
+   * statement tables in raw/docs — Markdown pipe tables and space-aligned text
+   * tables — parsed without a model into typed rows (label, period, value,
+   * unit, scale, line), readable as `v_table_facts` and through `knode_table`.
+   * Absent or `enabled: false` (the default): nothing is parsed or written and
+   * `knode_table` is not offered.
+   */
+  tableFacts?: TableFactsConfig;
   /**
    * The Translate stage (docs/design/17): a document under raw/docs in
    * another language than the workspace's primary one is translated into it,
