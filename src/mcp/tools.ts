@@ -14,6 +14,8 @@ import { forgetSource } from '../lineage/purge.js';
 import { buildContextPack } from '../pack/pack.js';
 import { search } from '../search/search.js';
 import { ask } from '../search/ask.js';
+import { learnConfig } from '../learn/config.js';
+import { writeBack, writeBackAsk } from '../learn/writeback.js';
 import { planOnly, resolve } from '../compiler/resolve.js';
 import { liveAbsences } from '../compiler/absence.js';
 import { distillRecipes } from '../compiler/distill.js';
@@ -199,9 +201,45 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
     },
     async ({ question, mode }) => {
       const res = await ask(ctx.store, ctx.config, ctx.embedder, ctx.llm, question, { mode: mode ?? 'hybrid', track });
-      return json({ answer: res.answer, citations: res.citations, gaps: res.gaps, route: res.route });
+      // learning from use (src/learn): written back when the workspace has it on — never from an untracked read
+      const learn = learnConfig(ctx.config);
+      if (!learn.enabled || !learn.ask || !track) return json({ answer: res.answer, citations: res.citations, gaps: res.gaps, route: res.route });
+      const learned = await writeBackAsk(ctx, question, res).catch((e) => ({ status: 'skipped', reason: e instanceof Error ? e.message : String(e) } as const));
+      return json({ answer: res.answer, citations: res.citations, gaps: res.gaps, route: res.route, learned: { status: learned.status, reason: learned.reason } });
     },
   );
+
+  if (learnConfig(ctx.config).enabled) {
+    server.registerTool(
+      'knode_writeback',
+      {
+        title: 'Keep an answer you checked',
+        description:
+          "After answering from the documents, keep the answer so that the next time this or a nearby question is asked the knowledge base already holds it: the question, the answer, and each value with the line it stands on (raw/docs/<path>#L<n>). Every value is checked against its line (the line exists and states the value; thousands separators, 万/亿/million and a table's declared unit considered). Depending on the workspace, a page whose every check passed takes effect at once or waits for a person; one with a failed check always waits. Give subject, attribute and period with each value when you know them: they become derived facts knode_claims reads.",
+        inputSchema: {
+          question: z.string(),
+          answer: z.string().describe('The answer as you gave it'),
+          citations: z.array(z.string()).optional().describe('Sources the answer rests on: raw/docs/<path>#L<n>, or raw/docs/<path>'),
+          facts: z.array(z.object({
+            value: z.union([z.string(), z.number()]).describe('As written: "1,234.5万元", "12.3%", "$4.2 million"'),
+            source: z.string().optional().describe('raw/docs/<path>#L<n> of the line stating it'),
+            subject: z.string().optional(),
+            attribute: z.string().optional().describe('The measure: 营业收入, total revenue …'),
+            period: z.string().optional().describe('2023, 2024Q1, 2024H1, or a date'),
+            unit: z.string().optional(),
+            quote: z.string().optional().describe("The cited line's text"),
+          })).optional(),
+        },
+      },
+      async ({ question, answer, citations, facts }) => {
+        const r = await writeBack(ctx, { question, answer, citations: citations ?? [], facts, origin: agent ? 'agent' : 'mcp' });
+        return json({
+          status: r.status, reason: r.reason, path: r.path, suggestionId: r.suggestionId, verified: r.verified,
+          checks: r.checks?.map((c) => ({ expect: c.expect, ok: c.ok, reason: c.reason, source: c.source, located: c.located })),
+        });
+      },
+    );
+  }
 
   server.registerTool(
     'knode_ls',

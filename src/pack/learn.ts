@@ -13,6 +13,7 @@ import { Store } from '../store/db.js';
 import { getSuggestion } from '../store/queries.js';
 import { SuggestionRow } from '../types.js';
 import { parsePlaybook } from './playbook.js';
+import { writeAcceptedPage } from '../learn/writeback.js';
 
 /**
  * The pack learning loop — dream's trace analysis, pointed at pack_events:
@@ -161,6 +162,11 @@ export async function applySuggestion(
     if (!p?.entityId || !p?.canonicalId) return { applied: false };
     const r = await applyMerge(store, { entityId: p.entityId, canonicalId: p.canonicalId, reason: p.reason ?? `suggestion ${id}`, actor: 'user' });
     return { applied: true, merged: { entityId: r.entityId, canonicalId: r.canonicalId } };
+  }
+  if (s.kind === 'learn') {
+    // a learned question page that waited for review (src/learn/writeback.ts): accepting writes it, a person's, for the sync to index
+    const written = writeAcceptedPage(dataDir, s.payload as { path?: unknown; content?: unknown } | null);
+    return written ? { applied: true, path: written } : { applied: false };
   }
   const writable = s.kind === 'pack' || s.kind === 'recipe';
   if (!writable || !s.payload?.path || typeof s.payload.content !== 'string') return { applied: false };

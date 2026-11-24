@@ -92,7 +92,7 @@ export interface TraceRow {
 
 export interface SuggestionRow {
   id: string;
-  kind: 'skill' | 'memory' | 'knowledge' | 'pack' | 'recipe' | 'merge' | 'claim-merge' | 'wiki';
+  kind: 'skill' | 'memory' | 'knowledge' | 'pack' | 'recipe' | 'merge' | 'claim-merge' | 'wiki' | 'learn';
   title: string;
   body: string;
   evidence: (string | { kind: string; id?: string; path?: string; text?: string })[];

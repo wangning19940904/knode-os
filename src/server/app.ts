@@ -118,6 +118,8 @@ import { entityDetail, graphInsights, graphOverview, graphSearch } from '../grap
 import { entitiesNamed } from '../graph/resolve.js';
 import { buildContextPack } from '../pack/pack.js';
 import { applySuggestion } from '../pack/learn.js';
+import { learnConfig } from '../learn/config.js';
+import { WritebackResult, writeBackAsk } from '../learn/writeback.js';
 import { canonicalEmbeddingModel, createConfiguredEmbeddingProvider, EmbeddingQuotaLedger, embeddingLimits, validateEmbeddingPool } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
 import { cachedCliToolStatus, listModelsCached, warmModelCache } from '../llm/model-cache.js';
@@ -2486,7 +2488,12 @@ export function createApp(
       if (!['hybrid', 'vector', 'keyword', 'sag'].includes(mode)) {
         return c.json({ error: `unsupported search mode: ${mode}` }, 400);
       }
-      return c.json(await ask(ctx.store, ctx.config, ctx.embedder, ctx.llm, question, { mode }));
+      const res = await ask(ctx.store, ctx.config, ctx.embedder, ctx.llm, question, { mode });
+      // learning from use (src/learn): the answer written back, when the workspace has it on
+      const learn = learnConfig(ctx.config);
+      if (!learn.enabled || !learn.ask) return c.json(res);
+      const learned: WritebackResult = await writeBackAsk(ctx, question, res).catch((e) => ({ status: 'skipped' as const, reason: e instanceof Error ? e.message : String(e), ms: 0 }));
+      return c.json({ ...res, learned: { status: learned.status, path: learned.path, suggestionId: learned.suggestionId, verified: learned.verified, reason: learned.reason } });
     } catch (e) {
       return c.json(err(e), 500);
     }
@@ -2913,9 +2920,11 @@ export function createApp(
     let applied: { applied: boolean; path?: string } = { applied: false };
     if (status === 'accepted') {
       const s = await getSuggestion(ctx.store, id);
-      if (s && (s.kind === 'pack' || s.kind === 'recipe' || s.kind === 'merge' || s.kind === 'claim-merge' || s.kind === 'wiki')) {
+      if (s && (s.kind === 'pack' || s.kind === 'recipe' || s.kind === 'merge' || s.kind === 'claim-merge' || s.kind === 'wiki' || s.kind === 'learn')) {
         try {
           applied = await applySuggestion(ctx.store, ctx.dataDir, id);
+          // an accepted learned page is read from the next answer on (src/learn/writeback.ts)
+          if (s.kind === 'learn' && applied.path) await sync(ctx, { only: [applied.path], llmGraph: false, datasources: false });
         } catch (e) {
           await setSuggestionStatus(ctx.store, id, 'pending');
           return c.json(err(e), 400);
