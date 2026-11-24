@@ -104,11 +104,14 @@ export function parseTsv(text: string): string[][] {
 /** FRAMES's rows with every link each names: its `wikipedia_link_*` columns (the last may hold several) and its `wiki_links` list. */
 export function readFramesRows(tsv: string): FramesRow[] {
   const [head, ...lines] = parseTsv(tsv);
-  const urls = (s: string) => (s.match(/https?:\/\/[^\s'",\]]+/g) ?? []).map((u) => u.trim());
+  // a cell holds one link, or several after ", "; a link may itself hold a comma (Lincoln,_Nebraska) and a note may follow it
+  const urls = (s: string) => s.split(/\s+/).filter((t) => /^https?:\/\//i.test(t)).map((t) => t.replace(/,+$/, ''));
+  // `wiki_links` is a list as Python prints it: each link in quotes
+  const listed = (s: string) => [...s.matchAll(/'([^']*)'|"([^"]*)"/g)].map((m) => (m[1] ?? m[2]).trim()).filter((t) => /^https?:\/\//i.test(t));
   return lines.map((cells) => {
     const row: Record<string, string> = {};
     head.forEach((h, i) => (row[h] = cells[i] ?? ''));
-    const links = [...new Set([...head.filter((h) => h.startsWith('wikipedia_link')).flatMap((h) => urls(row[h])), ...urls(row.wiki_links ?? '')])];
+    const links = [...new Set([...head.filter((h) => h.startsWith('wikipedia_link')).flatMap((h) => urls(row[h])), ...listed(row.wiki_links ?? '')])];
     return { index: (row[''] ?? row['Unnamed: 0'] ?? row.index ?? '').trim(), Prompt: row.Prompt ?? '', Answer: row.Answer ?? '', reasoning_types: row.reasoning_types ?? '', links };
   }).filter((r) => r.Prompt.trim() && r.Answer.trim());
 }
@@ -117,8 +120,10 @@ export function readFramesRows(tsv: string): FramesRow[] {
 export function titleOf(url: string): string | null {
   try {
     const u = new URL(url);
-    if (!/^en(\.m)?\.wikipedia\.org$/.test(u.hostname) || !u.pathname.startsWith('/wiki/')) return null;
-    const title = decodeURIComponent(u.pathname.slice('/wiki/'.length)).replace(/_/g, ' ').trim();
+    if (!/^en(\.m)?\.wikipedia\.org$/.test(u.hostname)) return null;
+    // /wiki/<title>, or /w/index.php?title=<title> (not a search)
+    const named = u.pathname.startsWith('/wiki/') ? decodeURIComponent(u.pathname.slice('/wiki/'.length)) : u.pathname === '/w/index.php' && !u.searchParams.has('search') ? u.searchParams.get('title') ?? '' : '';
+    const title = named.replace(/_/g, ' ').trim();
     return title || null;
   } catch {
     return null;

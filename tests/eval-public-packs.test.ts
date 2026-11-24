@@ -164,10 +164,11 @@ describe('public-frames', () => {
     // a quote inside a cell that does not open with one is text
     expect(parseTsv('the "long" way\tb')).toEqual([['the "long" way', 'b']]);
     const tsv = ['\tPrompt\tAnswer\twikipedia_link_1\twikipedia_link_11+\treasoning_types\twiki_links',
-      '7\t"Who, of ""the two"", was older?"\tA\thttps://en.wikipedia.org/wiki/A\thttps://en.wikipedia.org/wiki/B, https://en.wikipedia.org/wiki/C\tNumerical reasoning | Temporal reasoning\t[\'https://en.wikipedia.org/wiki/A\', \'https://en.wikipedia.org/wiki/D\']'].join('\n');
+      '7\t"Who, of ""the two"", was older?"\tA\thttps://en.wikipedia.org/wiki/Lincoln,_Nebraska (NOT REQUIRED, BUT HELPFUL) \thttps://en.wikipedia.org/wiki/B, https://en.wikipedia.org/wiki/C, \tNumerical reasoning | Temporal reasoning\t[\'https://en.wikipedia.org/wiki/Lincoln,_Nebraska\', "https://en.wikipedia.org/wiki/Rock_\'n\'_Roll", \'https://en.wikipedia.org/wiki/D\']'].join('\n');
     expect(readFramesRows(tsv)).toEqual([{
       index: '7', Prompt: 'Who, of "the two", was older?', Answer: 'A', reasoning_types: 'Numerical reasoning | Temporal reasoning',
-      links: ['https://en.wikipedia.org/wiki/A', 'https://en.wikipedia.org/wiki/B', 'https://en.wikipedia.org/wiki/C', 'https://en.wikipedia.org/wiki/D'],
+      // a comma inside a link is the link's; a note after a link and a comma after the last are not
+      links: ['https://en.wikipedia.org/wiki/Lincoln,_Nebraska', 'https://en.wikipedia.org/wiki/B', 'https://en.wikipedia.org/wiki/C', "https://en.wikipedia.org/wiki/Rock_'n'_Roll", 'https://en.wikipedia.org/wiki/D'],
     }]);
   });
 
@@ -175,6 +176,9 @@ describe('public-frames', () => {
     expect(titleOf('https://en.wikipedia.org/wiki/James_A._Garfield')).toBe('James A. Garfield');
     expect(titleOf('https://en.wikipedia.org/wiki/Beyonc%C3%A9#Early_life')).toBe('Beyoncé');
     expect(titleOf('https://en.m.wikipedia.org/wiki/AC/DC')).toBe('AC/DC');
+    expect(titleOf('https://en.wikipedia.org/wiki/Lincoln,_Nebraska')).toBe('Lincoln, Nebraska');
+    expect(titleOf('https://en.wikipedia.org/w/index.php?title=Bronco&redirect=no')).toBe('Bronco');
+    expect(titleOf('https://en.wikipedia.org/w/index.php?search=Bronco&title=Special:Search')).toBeNull();
     expect(titleOf('https://fr.wikipedia.org/wiki/Paris')).toBeNull();
     expect(titleOf('https://example.org/wiki/Paris')).toBeNull();
   });
