@@ -1,5 +1,5 @@
-import { armBrief, GREP_HAS } from './agents.js';
-import { AGENT_KNODE_FULL_HAS, KNODE_WIKI_SOURCES_HAS, knodeFullGuide } from './knode.js';
+import { armBrief, GREP_CATALOG_HAS, GREP_HAS } from './agents.js';
+import { AGENT_KNODE_FULL_HAS, KNODE_WIKI_FIRST_HAS, KNODE_WIKI_SOURCES_HAS, knodeFullGuide } from './knode.js';
 import { AGENT_RAG_HAS } from './rag.js';
 
 /**
@@ -29,5 +29,29 @@ export function ladderBriefs(): Record<LadderArm, LadderBrief> {
     'agent-rag': brief('B', AGENT_RAG_HAS),
     'agent-knode-wiki-sources': brief('C', KNODE_WIKI_SOURCES_HAS),
     'agent-knode-full': brief('D', AGENT_KNODE_FULL_HAS, knodeFullGuide()),
+  };
+}
+
+/**
+ * Arms that change one thing of a ladder arm (docs/design/38 §5.2), each run only when named: arm A with a catalog
+ * of its documents, arm C with leave to answer from the pages. Their briefs are the ladder's skeleton with their
+ * own sentence of what they have.
+ */
+export const VARIANT_ARMS = ['agent-grep-catalog', 'agent-knode-wiki-first'] as const;
+export type VariantArm = (typeof VARIANT_ARMS)[number];
+
+export interface VariantBrief {
+  /** The ladder arm it varies, and what it changes. */
+  of: LadderArm;
+  changes: string;
+  has: string;
+  text: string;
+}
+
+export function variantBriefs(): Record<VariantArm, VariantBrief> {
+  const brief = (of: LadderArm, changes: string, has: string): VariantBrief => ({ of, changes, has, text: armBrief(has) });
+  return {
+    'agent-grep-catalog': brief('agent-grep', 'a catalog file of the documents: path, title, date', GREP_CATALOG_HAS()),
+    'agent-knode-wiki-first': brief('agent-knode-wiki-sources', 'may answer from a page that states the fact and its source, and cite the page', KNODE_WIKI_FIRST_HAS),
   };
 }

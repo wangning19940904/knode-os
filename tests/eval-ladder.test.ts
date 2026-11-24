@@ -7,9 +7,12 @@ import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { runEval } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
 import { KNODE_FULL_TOOLS } from '../src/eval/systems/knode.js';
-import { LADDER_ARMS, ladderBriefs } from '../src/eval/systems/briefs.js';
+import { LADDER_ARMS, ladderBriefs, VARIANT_ARMS, variantBriefs } from '../src/eval/systems/briefs.js';
 import { taskPrompt } from '../src/eval/prompts.js';
-import { loadPack } from '../src/eval/pack.js';
+import { listFiles, loadPack, stageCorpus, validatePack } from '../src/eval/pack.js';
+import { leakedFiles } from '../src/eval/leak.js';
+import { catalogText } from '../src/eval/systems/agents.js';
+import { citationScores } from '../src/eval/metrics/retrieval.js';
 import { writeReport } from '../src/eval/report.js';
 import { DEFAULT_SYSTEMS, expandSystems, makeSystems, SYSTEM_TRACKS } from '../src/eval/systems/index.js';
 import { Command } from 'commander';
@@ -83,6 +86,14 @@ describe('the ladder track', () => {
     for (const id of expandSystems(['ladder'])) expect(DEFAULT_SYSTEMS, id).toContain(id);
     expect(DEFAULT_SYSTEMS).not.toContain('agent-knode');
     expect(DEFAULT_SYSTEMS).not.toContain('agent-knode-wiki');
+    // the two arms that each change one thing of a ladder arm: run when named, never by default or with the ladder
+    for (const id of VARIANT_ARMS) {
+      expect(DEFAULT_SYSTEMS, id).not.toContain(id);
+      expect(expandSystems(['ladder']), id).not.toContain(id);
+    }
+    expect(makeSystems(['agent-knode-wiki-first', 'agent-grep-catalog']).map((s) => [s.id, s.group, s.kind])).toEqual([
+      ['agent-knode-wiki-first', 'knode', 'agent'], ['agent-grep-catalog', 'agent-grep', 'agent'],
+    ]);
     expect(makeSystems(['agent-knode', 'agent-knode-wiki']).map((s) => s.kind)).toEqual(['agent', 'agent']);
     expect(() => makeSystems(['nope'])).toThrow(/tracks: ladder, single-call/);
   });
@@ -134,5 +145,104 @@ describe('the four arms', () => {
     expect(report.data.knodeTools!['fixture-life']['agent-knode-full'].map((t) => t.tool).sort()).toEqual(['knode_resolve', 'knode_search']);
     const md = fs.readFileSync(report.md, 'utf8');
     expect(md.indexOf('## The ladder')).toBeLessThan(md.indexOf('## Which questions tell the agents apart'));
+  }, 180_000);
+});
+
+describe('the variant arms', () => {
+  it('agent-knode-wiki-first reads arm C\'s folder and may cite a page; agent-grep-catalog reads arm A\'s with a catalog', async () => {
+    const cwdLog = path.join(tmp, 'cwd.jsonl');
+    fs.rmSync(promptLog, { force: true });
+    process.env.FAKE_CODEX_CWD_LOG = cwdLog;
+    process.env.FAKE_CODEX_CITE_PAGE = '1';
+    let runDir: string;
+    try {
+      const res = await runEval({
+        packs: [packDir], systems: ['agent-knode-wiki-first', 'agent-grep-catalog'], runDir: path.join(tmp, 'runs', 'variants'), quota: false, suites: ['usage'], judgeAudit: 0,
+        overrides: { chat: new ScriptedBackend(), judge: scriptedJudge(), embedder },
+      });
+      runDir = res.runDir;
+    } finally {
+      delete process.env.FAKE_CODEX_CWD_LOG;
+      delete process.env.FAKE_CODEX_CITE_PAGE;
+    }
+    const store = new RunStore(runDir);
+    const pack = loadPack(packDir);
+    expect(store.allAnswers().filter((a) => a.error).map((a) => `${a.system} ${a.taskId}: ${a.error}`)).toEqual([]);
+    // wiki-first answers on the shared knode build; the catalog arm builds nothing
+    expect(store.allBuilds().filter((b) => !b.system.includes('@')).map((b) => b.system)).toEqual(['knode']);
+
+    // every session's prompt is its arm's brief, then the question
+    const briefs = variantBriefs();
+    const questions = new Set(pack.tasks.map((t) => taskPrompt(t)));
+    const prompts = fs.readFileSync(promptLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as string);
+    const byArm = new Map<string, number>();
+    for (const p of prompts) {
+      const arm = VARIANT_ARMS.find((a) => p.startsWith(`${briefs[a].text}\n\n`) && questions.has(p.slice(briefs[a].text.length + 2)));
+      expect(arm, p.slice(0, 200)).toBeDefined();
+      byArm.set(arm!, (byArm.get(arm!) ?? 0) + 1);
+    }
+    for (const arm of VARIANT_ARMS) expect(byArm.get(arm), arm).toBe(store.allAnswers().filter((a) => a.system === arm).length);
+
+    // each session's folder
+    const sessions = fs.readFileSync(cwdLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { prompt: string; files: string[]; catalog: string | null });
+    const corpus = pack.docs.map((d) => d.path).sort();
+    const catalogSessions = sessions.filter((x) => x.prompt.includes('CATALOG.md'));
+    const wikiSessions = sessions.filter((x) => !x.prompt.includes('CATALOG.md'));
+    expect(catalogSessions.length).toBe(byArm.get('agent-grep-catalog'));
+    expect(wikiSessions.length).toBe(byArm.get('agent-knode-wiki-first'));
+    for (const x of catalogSessions) {
+      // arm A's folder, the sources and nothing else, plus the catalog
+      expect(x.files).toEqual([...corpus, 'CATALOG.md'].sort());
+      expect(x.catalog).toBe(catalogText(pack.docs));
+    }
+    const catalog = catalogSessions[0].catalog!;
+    for (const d of pack.docs) expect(catalog).toContain(`| ${d.path} |  | ${d.date ?? ''} |`);
+    // nothing of a question or its gold in it
+    for (const t of pack.tasks) {
+      expect(catalog, t.id).not.toContain(t.question);
+      for (const g of [t.answer, ...(t.answers ?? [])].filter((x): x is string => !!x && x.length > 3)) expect(catalog, t.id).not.toContain(g);
+    }
+    for (const x of wikiSessions) {
+      // arm C's folder: the pages and the sources where their links point, no catalog
+      expect(x.catalog).toBeNull();
+      expect(x.files.filter((f) => f.startsWith('raw/docs/')).map((f) => f.slice('raw/docs/'.length))).toEqual(corpus);
+      expect(x.files.filter((f) => !f.startsWith('raw/docs/')).every((f) => f.startsWith('wiki/'))).toBe(true);
+      expect(x.files).toContain('wiki/index.md');
+    }
+
+    // the leak audit holds with the catalog beside the sources, and the pack is still valid
+    const staged = stageCorpus(pack);
+    try {
+      fs.writeFileSync(path.join(staged.dir, 'CATALOG.md'), catalogText(staged.docs));
+      expect(listFiles(staged.dir)).toContain('CATALOG.md');
+      expect(leakedFiles(staged.dir, packDir)).toEqual([]);
+    } finally {
+      staged.cleanup();
+    }
+    expect(validatePack(pack).errors).toEqual([]);
+
+    // a wiki-first answer that cites a page naming the email (the fixture's build has its entity pages) is scored on the
+    // documents the page stands for
+    const q1 = store.allAnswers().find((a) => a.system === 'agent-knode-wiki-first' && a.taskId === 'q1')!;
+    expect(q1.citations).toEqual([]);
+    const [page, index] = q1.pageCitations!;
+    expect(page.page).toMatch(/^wiki\/(sources|entities)\/.+\.md$/);
+    expect(page.docs).toContain('email/2026-03-05.md');
+    expect(index).toEqual({ page: 'wiki/index.md', docs: [] });
+    expect(q1.pageCitations).toHaveLength(2);
+    const score = (system: string, metric: string) => store.allScores().find((r) => r.system === system && r.taskId === 'q1' && r.metric === metric)?.value;
+    const evidence = pack.tasks.find((t) => t.id === 'q1')!.evidence.map((e) => e.doc);
+    expect(evidence).toContain('email/2026-03-05.md');
+    const expected = citationScores(page.docs, evidence);
+    expect(expected.recall).toBeGreaterThan(0);
+    expect(score('agent-knode-wiki-first', 'citation_recall')).toBe(expected.recall);
+    expect(score('agent-knode-wiki-first', 'citation_precision')).toBe(expected.precision);
+    expect(score('agent-knode-wiki-first', 'cited_page')).toBe(1);
+    expect(score('agent-knode-wiki-first', 'unmapped_page_citations')).toBe(1);
+    // the catalog arm cites documents, and records no pages
+    expect(score('agent-grep-catalog', 'citation_recall')).toBe(1 / evidence.length);
+    expect(score('agent-grep-catalog', 'cited_page')).toBeUndefined();
+    const grepAnswer = store.allAnswers().find((a) => a.system === 'agent-grep-catalog' && a.taskId === 'q1')!;
+    expect(grepAnswer.pageCitations).toBeUndefined();
   }, 180_000);
 });

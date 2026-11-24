@@ -271,11 +271,28 @@ export interface Citation {
   quote?: string;
 }
 
+/**
+ * A generated page an answer cited (docs/design/38 §7, E6): `wiki/<page>` as the answer wrote it, and the corpus
+ * documents it stands for — a summary page's `source:`, else what the page declares it was made from, else the
+ * documents its lines cite. Empty: a page that stands for no document (an index, the log, a path the build has no
+ * page at); such a citation counts for nothing, as it did before pages were mapped.
+ */
+export interface PageCitation {
+  page: string;
+  docs: string[];
+}
+
 export interface Answer {
   text: string;
   /** The line after `Final answer:`, or the whole text when there is none. */
   finalAnswer: string;
   citations: Citation[];
+  /**
+   * The wiki pages it cited, each mapped to its documents (`PageCitation`); citation precision and recall count
+   * those documents beside `citations`. Present (if empty) on the answers of an arm that reads knode's pages, from
+   * 2026-11-24 on; absent on every answer before, whose `citations` are what they were scored on.
+   */
+  pageCitations?: PageCitation[];
   /** Documents the system looked at or retrieved, best first (agents: files they read). */
   retrieved: string[];
   toolCalls: number;
