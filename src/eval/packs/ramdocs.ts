@@ -33,6 +33,15 @@ import { PackWriter } from './writer.js';
  * the check does not see is a passage that speaks of the subject under
  * another name.
  *
+ * The passages are cuts of web pages, and about a quarter of the correct ones
+ * never name the subject ("As of the census of 2000, there were 1,791
+ * people …"): handed to the question they need no name, found in a shared
+ * corpus they are about nothing in particular. So a question is also left
+ * out unless each of its valid answers is given by a passage that names the
+ * subject. And 77 of the 500 questions have a valid answer that none of
+ * their passages is marked as giving (the dataset expects it all the same);
+ * a corpus cannot supply it, and they are left out too.
+ *
  * **Task types.** Two or three valid answers: `ambiguous` (`meta.readings`).
  * One valid answer beside misinformation: `conflict`; one and none:
  * `single-hop`. `contradiction` is not used: that type asks for every side of
@@ -45,7 +54,9 @@ import { PackWriter } from './writer.js';
  * one is there and no item names a wrong answer (`list.primary` complete,
  * the wrong answers in `meta.distractors`; `distractor_rate` reports them).
  * The paper reads the whole reply for the answer strings; here the reply's
- * item list is read, each string as a whole term.
+ * item list is read, each string as a whole term. Either way the answer has
+ * to be written as the dataset writes it ("3,559 people", "February 8,
+ * 1900"), which is how its passage writes it: "8 February 1900" is a miss.
  *
  * **Comparable numbers.** The paper's RAMDocs column (its Table 2, exact
  * match over all 500): with every passage of the question in the prompt,
@@ -53,8 +64,9 @@ import { PackWriter } from './writer.js';
  * and 28.0; no documents 5.8, 4.2 and 2.5. Those systems are handed exactly
  * the question's passages. Here a system has to find them among every
  * sampled question's, on a sample (100 by default) that leaves out the
- * questions failing the check above: the metric is the same, the setting is
- * not, and a number here is not a number on their table.
+ * questions failing the checks above, among them the 77 no system could get
+ * right from its passages: the metric is the same, the setting and the
+ * questions are not, and a number here is not a number on their table.
  */
 
 export interface RamdocsRow {
@@ -67,7 +79,7 @@ export interface RamdocsRow {
 
 const REVISION = '9c041bfd158c603b615883d9a931b00cbc141494';
 const URL = `https://huggingface.co/datasets/HanNight/RAMDocs/resolve/${REVISION}/RAMDocs_test.jsonl`;
-const LICENSE = 'MIT (RAMDocs); passages from Wikipedia via AmbigDocs';
+const LICENSE = 'MIT (RAMDocs); its passages are excerpts of Wikipedia and other web pages';
 const INSTRUCTION = 'If the name refers to more than one thing, give the answer for each as its own item, and leave out an answer you judge a source to have wrong.';
 
 const STOP = new Set('a an the of in on at to for from by with and or is are was were be been do does did what which who whom whose when where why how many much that this it its as'.split(' '));
@@ -150,6 +162,12 @@ export function chooseIsolated(rows: RamdocsRow[], want: number, seed: string | 
     }
     const mine = row.documents.map((d) => spaced(d.text));
     const term = ` ${subject} `;
+    // handed to a question, a passage needs no name; found in a shared corpus, it is about the subject only if it says so
+    const findable = (answer: string) => row.documents.some((d, k) => d.type === 'correct' && normalizeAnswer(d.answer) === normalizeAnswer(answer) && mine[k].includes(term));
+    if (!row.gold_answers.every(findable)) {
+      leave('a valid answer given only by passages that do not name the subject');
+      continue;
+    }
     if (taken.some((t) => t.subject === subject || t.texts.some((x) => x.includes(term)) || mine.some((x) => x.includes(` ${t.subject} `)))) {
       leave('a subject another taken question\'s passages name (or the other way round)');
       continue;
@@ -185,7 +203,7 @@ export function ramdocsTask(c: Candidate, pathOf: (text: string) => string): Tas
     evidence, primary: true, closedWorld: { terms: [c.subject], prefixes: [] },
     meta: {
       source: 'ramdocs', datasetIndex: c.index, originalQuestion: row.question.trim(), subject: c.subject, entities: row.disambig_entity,
-      readings, distractors: row.wrong_answers.map((w) => w.trim()).filter(Boolean), documents: { correct: correct.length, misinfo, noise: count('noise') },
+      readings, distractors: [...new Set(row.wrong_answers.map((w) => w.trim()).filter(Boolean))], documents: { correct: correct.length, misinfo, noise: count('noise') },
       stratum: stratumOf(row),
     },
   };

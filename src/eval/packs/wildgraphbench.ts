@@ -28,6 +28,18 @@ import { PackWriter } from './writer.js';
  * its domain's folder, and a question that does not name its topic is asked
  * with it.
  *
+ * A question names its references by URL; `references.jsonl` gives each
+ * URL's title, and a saved page opens with that title (its file name is the
+ * title without its non-ASCII letters, cut at 80 characters). So a URL is
+ * tied to a page by the title, the file name only as a fallback, and to no
+ * page when several references with different URLs claim the same one
+ * (World War II has three titled "Archived" and one such page). The dataset
+ * saved a page for only some of an article's references (49 of 164 for Prime
+ * number), the ones its questions cite. A single- or multi-fact question
+ * with a reference that is tied to no page is left out; a summary with one
+ * is asked but not primary. In the default domains every question is kept
+ * and one summary is short of a reference.
+ *
  * **Scoring, and where it differs from the benchmark's.**
  * - Single-fact and multi-fact questions are usage tasks judged against the
  *   dataset's answer. The benchmark's judge says right or wrong; the suite's
@@ -43,9 +55,9 @@ import { PackWriter } from './writer.js';
  *   its own items (one that packs two facts into an item can match only one
  *   gold statement), and a match is a pair, not a statement against a
  *   paragraph: expect lower recall and precision than the benchmark's for
- *   the same answer. A summary whose references are five pages or more is
- *   typed `profile`; with fewer it is `global` (the profile type requires
- *   five evidence documents), scored the same way.
+ *   the same answer. The type is `global`, not `profile`: a profile needs
+ *   evidence in five documents, and most summaries here cite two or three
+ *   for two to six statements.
  *
  * **Comparable numbers** (the paper's main table, gpt-4o-mini, all twelve
  * domains, one graph each): single-fact accuracy 66.9 for flat RAG and 71.5
@@ -71,8 +83,7 @@ export interface WgbQuestion {
 
 /** The domains a build takes: the option as a list, a comma-separated string or "all". */
 export function domainsOf(option: unknown): string[] {
-  if (option === undefined || option === null) return DEFAULT_DOMAINS;
-  const asked = option === 'all' ? [...WGB_DOMAINS] : (Array.isArray(option) ? option.map(String) : String(option).split(',')).map((d) => d.trim()).filter(Boolean);
+  const asked = option === undefined || option === null ? DEFAULT_DOMAINS : option === 'all' ? [...WGB_DOMAINS] : (Array.isArray(option) ? option.map(String) : String(option).split(',')).map((d) => d.trim()).filter(Boolean);
   const unknown = asked.filter((d) => !(WGB_DOMAINS as readonly string[]).includes(d));
   if (!asked.length || unknown.length) throw new Error(`domains: one or more of ${WGB_DOMAINS.join(', ')}, or "all" (got ${JSON.stringify(option)})`);
   // the benchmark's order, each once
@@ -124,49 +135,68 @@ interface PageDoc {
 }
 
 export interface WgbReference {
-  /** Every URL the reference's record holds (the page's, an archive's). */
+  title: string;
+  /** The reference's URL and its archived copy's. */
   urls: string[];
-  title?: string;
-  /** The reference page it was saved as, by file name, when the record names one that exists. */
+  /** The page it was saved as (its path in the dataset), when exactly one reference claims that page. */
   page?: string;
 }
 
 const stemOf = (file: string) => path.basename(file).replace(/\.txt$/i, '');
-/** A title as a file name keeps it: letters and digits only, lower-cased. */
-const bare = (s: string) => s.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+/** A title as written, for comparing: NFKC, lower case, one space between words. */
+const titleKey = (s: string) => s.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
+/** A title as the dataset's file names keep it: its ASCII letters and digits. */
+const asciiKey = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '');
+/** File names are cut at 80 characters: a stem this long may be the start of a longer title. */
+const CUT = 70;
+
+/** The title a saved page opens with (`# <title>`), or null. */
+export function pageTitle(text: string): string | null {
+  const m = text.match(/^\s*#\s+(.+)/);
+  return m ? m[1].trim() : null;
+}
 
 /**
- * references.jsonl, read for what ties a question's `ref_urls` to a saved
- * page: each record's URLs, its title, and the page file it names — a field
- * holding a file of `reference_pages/`, else the page whose file name is the
- * record's title (the dataset names pages by their titles, shortened).
+ * references.jsonl (`title`, `url`, `archive_url` a line) tied to the saved
+ * pages: a reference's page is the one that opens with its title, else the
+ * one whose file name is the title's ASCII letters and digits (the whole of
+ * it, or its start for a name cut short). A page that references with
+ * different URLs claim is tied to none of them.
  */
-export function readReferences(jsonl: string, pages: string[]): WgbReference[] {
-  const byName = new Map(pages.map((p) => [path.basename(p), p]));
-  const byStem = new Map(pages.map((p) => [bare(stemOf(p)), p]));
-  const out: WgbReference[] = [];
+export function readReferences(jsonl: string, pages: { rel: string; title: string | null }[]): WgbReference[] {
+  const unique = (key: (p: { rel: string; title: string | null }) => string) => {
+    const m = new Map<string, string | null>();
+    for (const p of pages) {
+      const k = key(p);
+      if (k) m.set(k, m.has(k) ? null : p.rel);
+    }
+    return m;
+  };
+  const byTitle = unique((p) => (p.title ? titleKey(p.title) : ''));
+  const byName = unique((p) => asciiKey(stemOf(p.rel)));
+  const cut = pages.filter((p) => stemOf(p.rel).length >= CUT).map((p) => ({ rel: p.rel, key: asciiKey(stemOf(p.rel)) }));
+  const refs: WgbReference[] = [];
   for (const line of jsonl.split('\n')) {
     if (!line.trim()) continue;
-    let rec: Record<string, unknown>;
-    try {
-      rec = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    const strings = Object.entries(rec).flatMap(([k, v]) => (typeof v === 'string' ? [[k, v] as const] : Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').map((x) => [k, x] as const) : []));
-    const urls = [...new Set(strings.filter(([, v]) => /^https?:\/\//i.test(v.trim())).map(([, v]) => v.trim()))];
-    const title = strings.find(([k]) => /title/i.test(k))?.[1];
-    const named = strings.map(([, v]) => byName.get(path.basename(v)) ?? byName.get(`${path.basename(v)}.txt`)).find(Boolean);
-    const page = named ?? (title && bare(title) ? byStem.get(bare(title)) ?? [...byStem].find(([stem]) => stem.length >= 12 && bare(title).startsWith(stem))?.[1] : undefined);
-    if (urls.length) out.push({ urls, ...(title ? { title } : {}), ...(page ? { page } : {}) });
+    const rec = JSON.parse(line) as { title?: unknown; url?: unknown; archive_url?: unknown };
+    const title = typeof rec.title === 'string' ? rec.title.trim() : '';
+    const urls = [rec.url, rec.archive_url].filter((u): u is string => typeof u === 'string' && /^https?:\/\//i.test(u.trim())).map((u) => u.trim());
+    if (!urls.length) continue;
+    const ascii = asciiKey(title);
+    const starts = ascii ? cut.filter((p) => ascii.startsWith(p.key)) : [];
+    const page = (title && byTitle.get(titleKey(title))) || (ascii && byName.get(ascii)) || (starts.length === 1 ? starts[0].rel : undefined) || undefined;
+    refs.push({ title, urls, ...(page ? { page } : {}) });
   }
-  return out;
+  // one page, references with different URLs: which of them it holds cannot be told
+  const claims = new Map<string, Set<string>>();
+  for (const r of refs) if (r.page) (claims.get(r.page) ?? claims.set(r.page, new Set()).get(r.page)!).add(urlKey(r.urls[0]));
+  return refs.map((r) => (r.page && claims.get(r.page)!.size > 1 ? { title: r.title, urls: r.urls } : r));
 }
 
 const TYPES: Record<string, { type: Task['type']; family: Family }> = {
   'single-fact': { type: 'single-hop', family: 'controls' },
   'multi-fact': { type: 'multi-hop', family: 'hops' },
-  summary: { type: 'profile', family: 'aggregates' },
+  summary: { type: 'global', family: 'aggregates' },
 };
 
 /** A domain's questions as tasks; a string says why one is left out. */
@@ -197,7 +227,7 @@ export function wgbTask(q: WgbQuestion, at: { domain: string; topic: string; ind
     if (!statements.length) return 'a summary without gold statements';
     if (statements.length > 55) return 'more gold statements than a list may hold';
     return {
-      ...base, type: docs.length >= 5 ? 'profile' : 'global', scoring: 'set', items: statements.map((label) => ({ label, aliases: [], weight: 1 })),
+      ...base, type: known.type, scoring: 'set', items: statements.map((label) => ({ label, aliases: [], weight: 1 })),
       list: { match: 'judge', ordered: false, maxItems: Math.min(60, Math.max(20, statements.length + 5)), requireDocs: false, primary: 'f1' },
       // a summary missing one of its references is asked, but is not part of the headline
       primary: !missing,
@@ -225,27 +255,30 @@ async function buildWildGraphBench(dir: string, ctx: RecipeContext) {
     const refsFile = listing.files.find((f) => /\/references\.jsonl$/.test(f));
     if (!pages.length || !refsFile) throw new Error(`WildGraphBench: corpus/${domain} holds no reference pages or no references.jsonl`);
     const topic = pages[0].split('/')[2];
-    const refs = await file(refsFile);
-    sources.push({ ...refs.record, note: [refs.record.note, `${domain}: reference metadata`].filter(Boolean).join('; ') });
-    const references = readReferences(fs.readFileSync(refs.file, 'utf8'), pages);
-    const titleOf = new Map(references.filter((r) => r.page && r.title).map((r) => [r.page!, r.title!]));
-
     // a page that cannot be had stops the build: a corpus short of a page is another corpus
     const failed: string[] = [];
     const fetched = await mapLimit(pages, 4, async (rel) => ({ rel, got: await file(rel) }), (err, rel) => failed.push(`${rel}: ${(err as Error).message.slice(0, 160)}`));
     if (failed.length) throw new Error(`WildGraphBench: ${failed.length} reference pages of ${domain} could not be read — ${failed.slice(0, 3).join('; ')}`);
     const pathOf = new Map<string, string>();
+    const titled: { rel: string; title: string | null }[] = [];
     for (const { rel, got } of fetched.filter((f): f is NonNullable<typeof f> => Boolean(f))) {
       sources.push({ ...got.record, note: [got.record.note, `${domain}: reference page`].filter(Boolean).join('; ') });
       const text = fs.readFileSync(got.file, 'utf8').replace(/\r\n?/g, '\n').trim();
       if (!text) continue;
       const p = opaquePath(`pages/${domain}`, rel);
+      const title = pageTitle(text);
       pathOf.set(rel, p);
-      docs.push({ domain, topic, rel, path: p, title: (titleOf.get(rel) ?? stemOf(rel)).trim(), text });
+      titled.push({ rel, title });
+      // a page opens with its title; one that does not gets its file's name
+      docs.push({ domain, topic, rel, path: p, title: title ?? stemOf(rel), text: title ? text : `# ${stemOf(rel)}\n\n${text}` });
     }
-    // a question's reference, by any URL its record holds
+    const refs = await file(refsFile);
+    sources.push({ ...refs.record, note: [refs.record.note, `${domain}: reference metadata`].filter(Boolean).join('; ') });
+    const references = readReferences(fs.readFileSync(refs.file, 'utf8'), titled);
+    // a question's reference, by its URL or its archived copy's
     const byUrl = new Map<string, string>();
-    for (const r of references) if (r.page && pathOf.has(r.page)) for (const u of r.urls) if (!byUrl.has(urlKey(u))) byUrl.set(urlKey(u), pathOf.get(r.page)!);
+    for (const r of references) if (r.page) for (const u of r.urls) if (!byUrl.has(urlKey(u))) byUrl.set(urlKey(u), pathOf.get(r.page)!);
+    const tied = new Set(references.filter((r) => r.page).map((r) => r.page!)).size;
 
     const qs = await file(`QA/${domain}/questions.jsonl`);
     sources.push({ ...qs.record, note: [qs.record.note, `${domain}: questions`].filter(Boolean).join('; ') });
@@ -259,7 +292,7 @@ async function buildWildGraphBench(dir: string, ctx: RecipeContext) {
         kept++;
       }
     });
-    counts.push(`${domain} (${topic}): ${pathOf.size} pages, ${kept} of ${rows.length} questions`);
+    counts.push(`${domain} (${topic}): ${pathOf.size} pages, ${tied} tied to one reference of ${references.length}; ${kept} of ${rows.length} questions`);
   }
   for (const c of counts) ctx.log(`WildGraphBench: ${c}`);
   for (const [why, n] of Object.entries(left)) ctx.log(`WildGraphBench: ${n} questions left out — ${why}`);
@@ -275,7 +308,7 @@ async function buildWildGraphBench(dir: string, ctx: RecipeContext) {
     builder: { recipe: 'real-wildgraphbench', options: { domains } },
   });
   for (const s of sources) writer.addSource(s);
-  for (const d of docs) writer.addDoc({ path: d.path, title: d.title, lang: 'en', source: 'wildgraphbench', kind: 'web-page' }, `# ${d.title}\n\n${d.text}\n`);
+  for (const d of docs) writer.addDoc({ path: d.path, title: d.title, source: 'wildgraphbench', kind: 'web-page' }, `${d.text}\n`);
   return finishRealPack(writer, all, ctx);
 }
 

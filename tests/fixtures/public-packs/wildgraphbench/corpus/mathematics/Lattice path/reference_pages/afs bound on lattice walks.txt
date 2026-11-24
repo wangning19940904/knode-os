@@ -1,0 +1,3 @@
+# Šafář’s bound on lattice walks
+
+The bound proved by Šafář in 1994 is 4n for a walk of n steps.

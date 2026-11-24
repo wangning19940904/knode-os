@@ -9,6 +9,7 @@ import { parseTsv, readFramesRows, titleOf } from '../src/eval/packs/frames.js';
 import { recipe } from '../src/eval/packs/index.js';
 import { chooseIsolated, type RamdocsRow, spaced, subjectOf } from '../src/eval/packs/ramdocs.js';
 import '../src/eval/packs/recipes.js';
+import { domainsOf, pageTitle, readReferences, urlKey, wgbPackId } from '../src/eval/packs/wildgraphbench.js';
 import { taskPrompt } from '../src/eval/prompts.js';
 import type { Task } from '../src/eval/types.js';
 
@@ -48,6 +49,7 @@ beforeAll(async () => {
   };
   await build('ramdocs', 'public-ramdocs', { from: path.join(FIXTURE, 'ramdocs') });
   await build('frames', 'public-frames', { from: path.join(REAL, 'frames'), wikipedia: wiki });
+  await build('wgb', 'real-wildgraphbench', { from: path.join(FIXTURE, 'wildgraphbench'), domains: ['nature', 'mathematics'] });
 });
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -83,6 +85,8 @@ describe('public-ramdocs', () => {
     expect(logs.ramdocs.join('\n')).toMatch(/1 questions left out — a valid answer none of its passages is marked as giving/);
     expect(logs.ramdocs.join('\n')).toMatch(/1 questions left out — a question that does not name what its entities share/);
     expect(logs.ramdocs.join('\n')).toMatch(/2 questions left out — a subject another taken question's passages name/);
+    // handed to its question a passage needs no name; in a shared corpus an answer must stand in one that names the subject
+    expect(logs.ramdocs.join('\n')).toMatch(/1 questions left out — a valid answer given only by passages that do not name the subject/);
   });
 
   it('takes each side of a pair when it comes first, never both', () => {
@@ -173,5 +177,101 @@ describe('public-frames', () => {
     expect(titleOf('https://en.m.wikipedia.org/wiki/AC/DC')).toBe('AC/DC');
     expect(titleOf('https://fr.wikipedia.org/wiki/Paris')).toBeNull();
     expect(titleOf('https://example.org/wiki/Paris')).toBeNull();
+  });
+});
+
+describe('real-wildgraphbench', () => {
+  it('puts the cited pages of the chosen domains in one corpus, never the Wikipedia article', () => {
+    const p = packs.wgb;
+    // the benchmark's order of domains, and the domains in the id when they are not the default three
+    expect(p.manifest.id).toBe('real-wildgraphbench-mathematics-nature');
+    expect(p.manifest.builder.options).toEqual({ domains: ['mathematics', 'nature'] });
+    expect(p.docs).toHaveLength(6);
+    for (const d of p.docs) expect(d.path).toMatch(/^pages\/(mathematics|nature)\/[0-9a-f]{12}\.md$/);
+    expect(p.docs.map((d) => d.title)).not.toContain('Lattice path');
+    expect(p.docs.map((d) => d.title)).toContain('Šafář’s bound on lattice walks');
+    // a page that does not open with its title gets its file's name as one
+    const survey = p.docs.find((d) => d.title?.startsWith('A survey of enumeration'))!;
+    expect(docText(p, survey.path).startsWith('# A survey of enumeration methods for restricted lattice paths in the plane and in\n\nSurvey text')).toBe(true);
+    // every file read is a source with its hash: two question files, two reference lists, six pages
+    expect(p.manifest.sources).toHaveLength(10);
+    for (const s of p.manifest.sources) {
+      expect(s.sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(s.license).toContain('Apache-2.0');
+    }
+    expect(validatePack(p).errors).toEqual([]);
+    expect(lintPack(p).findings).toEqual([]);
+  });
+
+  it('ties a question\'s URLs to pages by the reference\'s title', () => {
+    const p = packs.wgb;
+    const titleOf = (t: Task) => t.evidence.map((e) => p.docs.find((d) => d.path === e.doc)!.title);
+    // by the archived copy's URL; asked with its topic, which it does not name
+    const walks = task(p, (t) => t.id === 'wgb-mathematics-000');
+    expect(walks).toMatchObject({
+      type: 'single-hop', scoring: 'judge', answer: 'Veld counted 132 such walks.', primary: true,
+      question: 'How many six-step walks above the diagonal did Veld count? (Topic: Lattice path.)',
+      meta: { source: 'wildgraphbench', domain: 'mathematics', topic: 'Lattice path', datasetType: 'single-fact', family: 'controls', hops: 1, stratum: 'mathematics-single-fact', originalQuestion: 'How many six-step walks above the diagonal did Veld count?' },
+    });
+    expect(titleOf(walks)).toEqual(['Counting walks on a grid']);
+    // a title the file name lost the letters of, a URL written with www. and a slash; the topic is in the question
+    const bound = task(p, (t) => t.id === 'wgb-mathematics-001');
+    expect(titleOf(bound)).toEqual(['Šafář’s bound on lattice walks']);
+    expect(bound.question).toBe('What bound on a lattice path of n steps did Šafář prove?');
+    expect(bound.meta?.originalQuestion).toBeUndefined();
+    // a title in another script, of which the file name keeps the digits
+    expect(titleOf(task(p, (t) => t.id === 'wgb-nature-000'))).toEqual(['颱風「海燕」登陸 氣象台發出12號警報']);
+    // a file name cut short, a page without a heading: by the start of the title
+    const multi = task(p, (t) => t.id === 'wgb-mathematics-002');
+    expect(multi).toMatchObject({ type: 'multi-hop', scoring: 'judge', meta: { datasetType: 'multi-fact', family: 'hops', hops: 2 } });
+    expect(titleOf(multi)).toEqual(['Counting walks on a grid', 'A survey of enumeration methods for restricted lattice paths in the plane and in']);
+  });
+
+  it('leaves out a question whose page cannot be told, and asks a summary short of one outside the headline', () => {
+    const p = packs.wgb;
+    // two references titled "Archived" and one saved page; a reference the dataset saved nothing for
+    expect(p.tasks.map((t) => t.id)).toEqual(['wgb-mathematics-000', 'wgb-mathematics-001', 'wgb-mathematics-002', 'wgb-mathematics-003', 'wgb-nature-000', 'wgb-nature-001']);
+    expect(logs.wgb.join('\n')).toMatch(/2 questions left out — mathematics: no reference page in the corpus/);
+    expect(logs.wgb.join('\n')).toMatch(/mathematics \(Lattice path\): 4 pages, 3 tied to one reference of 6; 4 of 6 questions/);
+    const methods = task(p, (t) => t.id === 'wgb-mathematics-003');
+    expect(methods).toMatchObject({ type: 'global', scoring: 'set', primary: false, meta: { datasetType: 'summary', missingReferences: 1, references: 2, hops: 1 } });
+  });
+
+  it('scores a summary as a list of facts against the gold statements', () => {
+    const season = task(packs.wgb, (t) => t.id === 'wgb-nature-001');
+    expect(season).toMatchObject({ type: 'global', scoring: 'set', primary: true, list: { match: 'judge', ordered: false, maxItems: 20, primary: 'f1' }, meta: { family: 'aggregates', hops: 2 } });
+    expect(season.items!.map((i) => i.label)).toEqual(['Nine storms were named in the 2031 season.', 'Haiyen was the costliest storm of the season.', 'Haiyen made landfall on 3 July.']);
+    expect(season.question).toBe('Give an overview of the storm season of 2031.');
+    expect(taskPrompt(season)).toContain('one item per distinct fact of the answer');
+  });
+
+  it('reads the domains option and names the pack by it', () => {
+    expect(domainsOf(undefined)).toEqual(['history', 'mathematics', 'nature']);
+    expect(wgbPackId(domainsOf(undefined))).toBe('real-wildgraphbench');
+    expect(domainsOf('people, human_activities')).toEqual(['human_activities', 'people']);
+    expect(wgbPackId(['human_activities', 'people'])).toBe('real-wildgraphbench-human-activities-people');
+    expect(domainsOf('all')).toHaveLength(12);
+    expect(wgbPackId(domainsOf('all'))).toBe('real-wildgraphbench-all');
+    expect(() => domainsOf(['maths'])).toThrow(/domains: one or more of culture/);
+    expect(() => domainsOf([])).toThrow();
+  });
+
+  it('compares URLs and titles as two references to one page write them', () => {
+    expect(urlKey('https://WWW.Example.org/a/B/#top')).toBe('example.org/a/B');
+    expect(urlKey('http://example.org/a/B')).toBe('example.org/a/B');
+    expect(urlKey('https://example.org/a?x=1')).not.toBe(urlKey('https://example.org/a?x=2'));
+    expect(pageTitle('# A title \nbody')).toBe('A title');
+    expect(pageTitle('no heading\n# later')).toBeNull();
+    const pages = [{ rel: 'r/Report.txt', title: 'Report' }, { rel: 'r/2024.txt', title: '二〇二四年报告 2024' }, { rel: 'r/Other.txt', title: null }];
+    const refs = readReferences([
+      { title: 'Report', url: 'https://a.example/1', archive_url: 'https://web.archive.org/web/1/https://a.example/1' },
+      { title: '二〇二四年报告 2024', url: 'https://b.example/2', archive_url: '' },
+      { title: 'Other', url: 'https://c.example/3' },
+      { title: 'Other!', url: 'https://d.example/4' },
+      { title: 'No page', url: 'https://e.example/5' },
+      { title: 'No URL' },
+    ].map((r) => JSON.stringify(r)).join('\n'), pages);
+    expect(refs.map((r) => r.page)).toEqual(['r/Report.txt', 'r/2024.txt', undefined, undefined, undefined]);
+    expect(refs[0].urls).toHaveLength(2);
   });
 });
