@@ -7,7 +7,7 @@ import { entityKeyKinds } from '../src/graph/normalize.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { ChatMessage, LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
-import { enumerateClaims, subjectTimelines } from '../src/search/enumerate.js';
+import { enumerateClaims, fillShares, subjectTimelines } from '../src/search/enumerate.js';
 import { namedEntities } from '../src/search/facts.js';
 import { questionRange } from '../src/search/route.js';
 import { asksForValue, metricParts, metricTerms, rowExcerpts, rowWindows } from '../src/search/rows.js';
@@ -316,6 +316,14 @@ describe('R3: enumerations by relevance and window, timelines folded', () => {
     const status = tl.claims.filter((c) => c.statement === '天弁天梯项目状态为进行中');
     expect(status).toHaveLength(1);
     expect(status[0].repeats?.count).toBe(12);
+  });
+
+  it('shares a timeline\'s limit so a short chronology leaves its room to a long one', () => {
+    expect(fillShares([6, 300, 2], 150)).toEqual([6, 142, 2]);
+    expect(fillShares([100, 100], 150)).toEqual([75, 75]);
+    expect(fillShares([100, 100, 100], 10)).toEqual([3, 3, 4]);
+    expect(fillShares([3, 4], 150)).toEqual([3, 4]);
+    expect(fillShares([], 150)).toEqual([]);
   });
 
   it('answers a timeline question from it', async () => {

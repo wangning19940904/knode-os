@@ -280,11 +280,29 @@ function timelineFact(c: ClaimRecord): EnumeratedClaim {
 }
 
 /**
+ * `limit` shared among lists of these sizes: each list gets an equal share, and what a shorter list leaves goes to
+ * the longer ones (a setting's six changes beside its team's three hundred entries: the six, and the rest to the team).
+ */
+export function fillShares(sizes: number[], limit: number): number[] {
+  const out = sizes.map(() => 0);
+  let left = Math.max(0, limit);
+  const order = sizes.map((n, i) => ({ n, i })).sort((a, b) => a.n - b.n || a.i - b.i);
+  order.forEach(({ n, i }, k) => {
+    const give = Math.min(n, Math.floor(left / (order.length - k)));
+    out[i] = give;
+    left -= give;
+  });
+  // what the floor left over, one each to the lists that can take it, in their order
+  for (let i = 0; left > 0 && i < sizes.length; i++) if (out[i] < sizes[i]) { out[i]++; left--; }
+  return out;
+}
+
+/**
  * The chronology of each subject a timeline question names, as `knode_claims order="timeline" related=true` gives
  * it (store/claims.ts): dated by the claim's own event or validity before its sources' dates, superseded values
  * included, a value restated in later reports folded into the entry where it first appeared, a measurement series
  * one entry with its readings, and the claims about the subject's parts and members and with it as the object.
- * The subjects share `limit` entries; a subject with more than its share lists those matching the question best,
+ * The subjects share `limit` entries (`fillShares`); a subject with more than its share lists those matching the question best,
  * still in date order. Ask's own enumeration dated a restated "still open" by its newest restatement and listed the
  * first 150 claims by that date.
  */
@@ -295,26 +313,29 @@ export async function subjectTimelines(
 ): Promise<SubjectTimelines> {
   const out: SubjectTimelines = { claims: [], matched: 0, entries: 0, subjects: 0, ranked: 0 };
   if (subjects.length === 0) return out;
-  const share = Math.max(1, Math.ceil(opts.limit / subjects.length));
   const eventRange = opts.range ? { from: opts.range.from, to: opts.range.to } : undefined;
   const results = await Promise.all(subjects.map((subject) =>
     queryClaims(store, { subject, related: true, order: 'timeline', eventRange, limit: 500 }).catch(() => null)));
+  // each subject's entries, an entry listed once (a claim about two subjects is the first's)
   const seen = new Set<string>();
-  for (const r of results) {
-    if (!r || r.claims.length === 0) continue;
+  const lists = results.map((r) => {
+    const claims = (r?.claims ?? []).filter((c) => !seen.has(c.id));
+    for (const c of claims) seen.add(c.id);
+    return { r, claims };
+  }).filter((x) => x.r && x.claims.length > 0);
+  const shares = fillShares(lists.map((x) => x.claims.length), opts.limit);
+  for (const [i, { r, claims: all }] of lists.entries()) {
     out.subjects++;
-    out.matched += r.matched;
-    out.entries += r.entries;
-    let claims = r.claims.filter((c) => !seen.has(c.id));
+    out.matched += r!.matched;
+    out.entries += r!.entries;
+    let claims = all;
+    const share = shares[i];
     if (claims.length > share) {
       out.ranked++;
       const picked = new Set(pickRelevant(opts.question, claims.map((c) => ({ ...c, path: c.sourcePath })), share, { named: () => true }).map((c) => c.id));
       claims = claims.filter((c) => picked.has(c.id));
     }
-    for (const c of claims) {
-      seen.add(c.id);
-      out.claims.push(timelineFact(c));
-    }
+    for (const c of claims) out.claims.push(timelineFact(c));
   }
   // one chronology over the subjects, undated last
   out.claims = out.claims.map((c, i) => ({ c, i })).sort((a, b) => {

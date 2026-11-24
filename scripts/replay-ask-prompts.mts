@@ -8,6 +8,9 @@
  *     passages and the sources of its facts (`withFacts`); `all` when every one of them is there;
  *   - for a question with a gold value (`answer` / `answers`), whether the value is in the prompt text
  *     (`value`): a figure written with or without its thousands separators, in the units the gold gives;
+ *   - with --row-terms-from <code dir>: whether one line of the prompt holds both the gold value and the question's
+ *     metric words (that dir's search/rows.ts `metricTerms`, the names being its `namedSubjects`), i.e. the row asked
+ *     for is shown, not only the figure somewhere (`row`);
  *   - the prompt's characters.
  *
  *   npx tsx scripts/replay-ask-prompts.mts --ws <workspace dir as built> --tasks <tasks.jsonl> --vectors <vectors.jsonl>
@@ -83,6 +86,10 @@ const llm = {
 } as unknown as LlmClient;
 
 const config: KnodeConfig = { ...defaultConfig(), database: database ?? defaultConfig().database };
+// the row measure reads the metric words with one version's code, whichever version is replayed
+const rowCode = flag('row-terms-from');
+const rowsMod = rowCode ? await import(`${rowCode}/src/search/rows.ts`) : null;
+const subjectsMod = rowCode ? await import(`${rowCode}/src/search/subjects.ts`) : null;
 const store = await Store.open(WS, dimensions, database, { readOnly: true });
 
 /** The forms a gold value may be written in: as given, without separators, and its number alone. */
@@ -136,11 +143,24 @@ for (const t of picked) {
     const share = (docs: string[]) => (gold.length ? gold.filter((g) => docs.includes(g)).length / gold.length : null);
     const forms = [...(t.answers ?? []), ...(t.answer !== undefined && typeof t.answer !== 'object' ? [t.answer] : [])].flatMap(valueForms);
     const text = flatText(prompt);
+    let rowHit: number | null = null;
+    if (rowsMod && forms.length) {
+      const names = (await subjectsMod.namedSubjects(store, t.question)).filter((x: { concept: boolean }) => !x.concept).map((x: { text: string }) => x.text);
+      const terms: string[] = rowsMod.metricTerms(t.question, names);
+      const holds = (line: string, term: string) => {
+        const l = line.toLowerCase().replace(/\s+/g, ' ');
+        if (l.includes(term)) return true;
+        const parts: string[] = rowsMod.metricParts(term);
+        return parts.length > 0 && parts.every((x) => l.includes(x));
+      };
+      rowHit = terms.length === 0 ? null : prompt.split('\n').some((line) => forms.some((f) => flatText(line).includes(flatText(f))) && terms.some((term) => holds(line, term))) ? 1 : 0;
+    }
     const row = {
       label, id: t.id, type: t.type, gold: gold.length,
       passages: share(passageDocs), withFacts: share([...passageDocs, ...factDocs]),
       all: gold.length ? (gold.every((g) => passageDocs.includes(g)) ? 1 : 0) : null,
       value: forms.length ? (forms.some((f) => text.includes(flatText(f))) ? 1 : 0) : null,
+      row: rowHit,
       chars: prompt.length, passagesN: res.contexts.length, docs: passageDocs.length, facts: res.facts.length,
       kind: res.route.kind, by: res.route.by, ms: Date.now() - t0,
       route: { enumerated: res.route.enumerated, widened: res.route.widened, second: res.route.second ? { chunks: res.route.second.chunks, facts: res.route.second.facts } : undefined, ...(res.route as { subjects?: unknown }).subjects ? { subjects: (res.route as { subjects?: unknown }).subjects } : {}, ...(res.route as { rows?: unknown }).rows ? { rows: (res.route as { rows?: unknown }).rows } : {} },
