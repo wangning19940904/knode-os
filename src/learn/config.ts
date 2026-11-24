@@ -19,9 +19,14 @@ export interface LearnConfig {
   facts: boolean;
   /** Where derived facts go (src/learn/facts.ts `registerFactSink`); default `page-claims`. */
   factSink: string;
+  /**
+   * Where a kind of document keeps a measure (section, row, column, unit), once checked on two documents or more,
+   * proposed for the entity type's playbook (src/learn/methods.ts) — default true.
+   */
+  methods: boolean;
 }
 
-export const DEFAULT_LEARN: LearnConfig = { enabled: false, autoAccept: false, ask: true, facts: true, factSink: 'page-claims' };
+export const DEFAULT_LEARN: LearnConfig = { enabled: false, autoAccept: false, ask: true, facts: true, factSink: 'page-claims', methods: true };
 
 export function learnConfig(config: { learn?: Partial<LearnConfig> | null }): LearnConfig {
   return { ...DEFAULT_LEARN, ...(config.learn ?? {}) };

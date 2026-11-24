@@ -124,7 +124,7 @@ export interface CheckOptions {
 }
 
 /** The header row of the table a line is in (the nearest line above that starts a pipe table), or ''. */
-function tableHeader(lines: string[], i: number): string {
+export function tableHeader(lines: string[], i: number): string {
   for (let k = i - 1; k >= 0 && k >= i - 400; k--) {
     const s = lines[k];
     if (!/^\s*\|/.test(s)) return '';

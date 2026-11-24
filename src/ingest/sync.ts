@@ -17,7 +17,8 @@ import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
 import { IngestStats } from '../types.js';
 import { fileCitationRefreshes } from '../research/cited-refresh.js';
-import { LEARN_WRITER } from '../learn/config.js';
+import { LEARN_WRITER, learnConfig } from '../learn/config.js';
+import { refreshMethodPlaybooks } from '../learn/methods.js';
 import { hasLearnedPages, revalidateLearned } from '../learn/revalidate.js';
 import { reconcileViews } from '../wiki/pages.js';
 import { applyDocScope } from './apply.js';
@@ -116,7 +117,12 @@ async function recheckLearned(ctx: SyncContext, opts: SyncOptions, stats: SyncSt
       prefixes: opts.only,
       resync: (paths) => syncAll(ctx, { only: paths, llmGraph: false, datasources: false, actor: LEARN_WRITER, onProgress: opts.onProgress }),
     });
-    if (r.withdrawn.length || r.moved.length) opts.onProgress?.(`learned pages: ${r.withdrawn.length} withdrawn (a cited value changed), ${r.moved.length} moved to new lines`);
+    if (r.withdrawn.length || r.moved.length) {
+      opts.onProgress?.(`learned pages: ${r.withdrawn.length} withdrawn (a cited value changed), ${r.moved.length} moved to new lines`);
+      // the methods those pages supported follow them (src/learn/methods.ts)
+      const learn = learnConfig(ctx.config);
+      if (learn.methods) await refreshMethodPlaybooks(ctx.store, ctx.dataDir, learn);
+    }
   } catch (err) {
     opts.onProgress?.(`learned pages: re-check failed: ${err instanceof Error ? err.message : err}`);
   }

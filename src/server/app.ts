@@ -119,6 +119,7 @@ import { entitiesNamed } from '../graph/resolve.js';
 import { buildContextPack } from '../pack/pack.js';
 import { applySuggestion } from '../pack/learn.js';
 import { learnConfig } from '../learn/config.js';
+import { refreshMethodPlaybooks } from '../learn/methods.js';
 import { WritebackResult, writeBackAsk } from '../learn/writeback.js';
 import { canonicalEmbeddingModel, createConfiguredEmbeddingProvider, EmbeddingQuotaLedger, embeddingLimits, validateEmbeddingPool } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
@@ -2924,7 +2925,10 @@ export function createApp(
         try {
           applied = await applySuggestion(ctx.store, ctx.dataDir, id);
           // an accepted learned page is read from the next answer on (src/learn/writeback.ts)
-          if (s.kind === 'learn' && applied.path) await sync(ctx, { only: [applied.path], llmGraph: false, datasources: false });
+          if (s.kind === 'learn' && applied.path) {
+            await sync(ctx, { only: [applied.path], llmGraph: false, datasources: false });
+            if (learnConfig(ctx.config).methods) await refreshMethodPlaybooks(ctx.store, ctx.dataDir, learnConfig(ctx.config));
+          }
         } catch (e) {
           await setSuggestionStatus(ctx.store, id, 'pending');
           return c.json(err(e), 400);

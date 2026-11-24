@@ -119,15 +119,20 @@ export function answerFigures(text: string): NumberToken[] {
  * 1 when none is found.
  */
 export function declaredScale(lines: readonly string[], line: number, window = 200): number {
+  return scaleDeclaration(lines, line, window)?.scale ?? 1;
+}
+
+/** The declaration `declaredScale` reads, with its words ("单位：万元", "in thousands") and its line (0-based); null when none. */
+export function scaleDeclaration(lines: readonly string[], line: number, window = 200): { scale: number; words: string; line: number } | null {
   for (let i = line; i >= 0 && i >= line - window; i--) {
     const s = lines[i];
     if (!s) continue;
     const zh = /单位\s*[:：]?\s*(?:人民币|美元|港元)?\s*(万亿|千亿|百亿|千万|百万|亿|万|千)?\s*元/.exec(s) ?? /(?:人民币|美元|港元)\s*(千万|百万|亿|万|千)元/.exec(s);
-    if (zh) return zh[1] ? ZH_SCALE[zh[1]] : 1;
+    if (zh) return { scale: zh[1] ? ZH_SCALE[zh[1]] : 1, words: zh[0].trim(), line: i };
     const en = /\bin\s+(thousands|millions|billions)\b/i.exec(s) ?? /\(\s*(?:\$|USD)?\s*(thousands|millions|billions)\b/i.exec(s);
-    if (en) return EN_SCALE[en[1].toLowerCase()];
+    if (en) return { scale: EN_SCALE[en[1].toLowerCase()], words: en[0].replace(/^\(\s*/, '').trim(), line: i };
   }
-  return 1;
+  return null;
 }
 
 const ZH_SCALE: Record<string, number> = { 万亿: 1e12, 千亿: 1e11, 百亿: 1e10, 千万: 1e7, 百万: 1e6, 亿: 1e8, 万: 1e4, 千: 1e3 };

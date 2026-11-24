@@ -9,6 +9,7 @@ import type { Store } from '../store/db.js';
 import { LEARN_WRITER, learnConfig, LearnConfig } from './config.js';
 import { attributeOf, FactInput, factValue, periodOf, subjectOf, VerifiedFact } from './facts.js';
 import { answerFigures, NumberToken, numbersIn } from './numbers.js';
+import { refreshMethodPlaybooks } from './methods.js';
 import { LearnedPage, learnedPathFor, PageCheck, renderLearnedPage } from './page.js';
 import { checkCitation, CitationCheck, documentLines, Expected, formatSourceRef, parseSourceRef, SourceRef } from './verify.js';
 
@@ -56,6 +57,8 @@ export interface WritebackResult {
   verified?: boolean;
   checks?: PageCheck[];
   facts?: VerifiedFact[];
+  /** Playbooks the learned methods were written to, or the suggestions they wait as (src/learn/methods.ts). */
+  methods?: { written: string[]; suggested: string[] };
   ms: number;
 }
 
@@ -196,7 +199,9 @@ export async function writeBack(ctx: Pick<AppContext, 'store' | 'config' | 'data
     // a page waiting for review is moot once this one took effect
     await ctx.store.query(`UPDATE suggestions SET status = 'stale' WHERE id = $1 AND status = 'pending'`, [id]);
     if (ctx.embedder && ctx.llm) await sync(ctx as AppContext, { only: [rel], llmGraph: false, datasources: false, actor: LEARN_WRITER });
-    return done({ status: 'applied', path: rel, verified, checks, facts });
+    // a fact that took effect may make a method checked on a second document: the playbook follows
+    const methods = cfg.methods && facts.length ? await refreshMethodPlaybooks(ctx.store, ctx.dataDir, cfg) : null;
+    return done({ status: 'applied', path: rel, verified, checks, facts, ...(methods ? { methods: { written: methods.written, suggested: methods.suggested } } : {}) });
   }
   await fileLearnSuggestion(ctx.store, { id, path: rel, content, question, checks, verified, reason: verified ? 'review' : 'failed-check' });
   return done({ status: 'pending', path: rel, suggestionId: id, verified, checks, facts });
