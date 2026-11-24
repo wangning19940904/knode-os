@@ -19,6 +19,7 @@ import { parseLocal, planAgentSample, runEval, scoreRun } from './run.js';
 import { Meter, sumEvents } from './meter.js';
 import { RunStore } from './runstore.js';
 import { DEFAULT_SYSTEMS, expandSystems, SYSTEM_TRACKS, SYSTEMS } from './systems/index.js';
+import { registerLearningCommands } from './learning/cli.js';
 import { EXTERNAL_SYSTEMS, externalPacks, venvPython } from './systems/external.js';
 import { Suite, SUITES, TASK_TYPES, TaskType } from './types.js';
 import { loadConfig, resolveDataDir } from '../config.js';
@@ -364,6 +365,8 @@ export function registerEvalCommands(program: Command): void {
       if (m.lint.answerInFileName.length || m.lint.duplicateQuestionDifferentGold.length) process.exitCode = 1;
     });
 
+  registerLearningCommands(evalCmd, resolvePack);
+
   const systems = evalCmd.command('systems').description('systems under test');
   systems
     .command('list')
@@ -442,6 +445,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--offer-seconds <s>', 'no longer applies: a piece waits until a slot takes it (see --wait-minutes)')
     .option('--wait-minutes <n>', 'stop the run cleanly (non-zero, resumable) when a piece has waited this long while no slot online takes it; 0 = no limit', '30')
     .option('--pool <name>', "every piece of the run requires this pool: only workers started with --pool <name> (default: their token's name) take it, and this run's --local slots, which join it")
+    .option('--learning-order <seed>', 'with --suites learning: the seed its question stream is ordered by (default the run\'s seed); run twice with two seeds to see an order effect')
     .option('--repeat <n>', 'answer each task n times, for run-to-run variance (repeat 1 keeps the usual record keys)', '1')
     .option('--repeat-systems <list>', 'with --repeat: only these systems (default: every system that answers)')
     .option('--judge-list-batch <n>', 'lists the judge matches in one call (default 1: a list\'s verdict depends on that list alone, one call a list; 8 was the earlier behaviour and takes an eighth of the calls)')
@@ -474,6 +478,7 @@ export function registerEvalCommands(program: Command): void {
         waitMinutes: waitMinutesOption(opts),
         pool: poolOption(opts),
         repeat: Number(opts.repeat),
+        ...(opts.learningOrder !== undefined ? { learningOrder: opts.learningOrder } : {}),
         repeatSystems: (() => {
           const ids = csv(opts.repeatSystems);
           return ids && expandSystems(ids);

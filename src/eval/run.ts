@@ -37,6 +37,7 @@ import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
 import { boundedOutputs, boundedTrace } from './trace.js';
 import { SystemEnv, SystemUnderTest, taggedEmbedder } from './systems/types.js';
 import { extractFinalAnswer } from './metrics/text.js';
+import { learningOrder } from './learning/stream.js';
 import { AnswerRecord, BuildRecord, emptyUsage, ScoreRecord, Suite, SUITES, Task, TaskType, Usage } from './types.js';
 
 /**
@@ -197,6 +198,11 @@ export interface RunOptions {
   judgeAudit?: number;
   /** Lists the judge matches in one call (default 1: a list's verdict depends on that list alone; more saves judge calls). */
   judgeListBatch?: number;
+  /**
+   * The learning suite's question order (docs/design/38 §4.3, src/eval/learning): the seed its stream is shuffled
+   * by, cold phase then warm; default the run's seed. Two runs with two orders measure the order effect.
+   */
+  learningOrder?: string | number;
   /** Answer each task this many times, for run-to-run variance (default 1: today's keys). */
   repeat?: number;
   /** The systems answered `repeat` times (default: every system that answers). */
@@ -662,6 +668,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     // a system answers as wide as the slots online that could take its work, at most --answer-concurrency (docs/design/32 §3)
     const cap = answerCap(opts, placement);
     const concurrencyFor = (s: SystemUnderTest, leaves: boolean) => () => {
+      // a system that carries something from one answer to the next answers one question at a time
+      if (s.sequential) return 1;
       const scope = new PackScope(remote, leaves, leaves && callsLeave ? 'any' : 'local');
       const width = isAgent(s) ? scope.sessionSlots(leaves && Boolean(opts.model) && !opts.agentChain ? 'any' : 'local') : scope.callSlots();
       return Math.max(1, Math.min(cap ?? Infinity, width));
@@ -759,7 +767,10 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       // the agent sample: round-robin over types, or by the run's allocation (and what its records saw of each question)
       const plan = planAgentSample(pack, staged.tasks, { suites, types: opts.types, strata: opts.strata, limit: opts.limit, agentLimit, seed, allocation });
       const { typed, allTasks, agentTasks } = plan;
-      const updateTasks = suites.has('update') ? typed.filter((t) => t.afterUpdate) : [];
+      // the learning suite (src/eval/learning): its stream, every question for every system, in one order, one at a time
+      const learning = suites.has('learning') ? learningOrder(typed.filter((t) => t.suite === 'learning'), opts.learningOrder ?? seed) : null;
+      if (learning) store.log('learning order', { pack: pack.manifest.id, order: String(opts.learningOrder ?? seed), first: learning.before.slice(0, 5).map((t) => t.id) });
+      const updateTasks = suites.has('update') || learning ? typed.filter((t) => t.afterUpdate && (t.suite !== 'learning' || learning)) : [];
       // the update tasks agents answer: all, or a seeded sample stratified by type (`--agent-update-limit`)
       const agentUpdates = agentUpdateLimit === null ? null : new Set(selectTasks(updateTasks, suites, agentUpdateLimit, seed).map((t) => t.id));
       meta.agentSample!.byPack[pack.manifest.id] = plan.byType;
@@ -793,8 +804,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
         }
         for (const s of members) {
           for (const other of members) if (other !== s) await other.release?.(env);
-          const tasks = isAgent(s) ? agentTasks : allTasks;
+          const tasks = (isAgent(s) ? agentTasks : allTasks).filter((t) => t.suite !== 'learning');
           for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, repeatedTasks(tasks, r, repeatSample), fraction, seed, concurrencyFor(s, leaves), progress, undefined, r, stop.signal);
+          if (learning) await answerAll(store, meter, env, s, learning.before, fraction, seed, () => 1, progress, undefined, 1, stop.signal);
           await retrieveAll(store, env, s, allTasks, fraction, seed, stop.signal);
         }
         // generated knowledge, once per build
@@ -853,8 +865,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           }
           const batchSample = repeatSampleOf(tasks, opts.repeatSample, seed);
           for (const s of members) {
-            const own = isAgent(s) && agentUpdates ? tasks.filter((t) => agentUpdates.has(t.id)) : tasks;
+            const own = (isAgent(s) && agentUpdates ? tasks.filter((t) => agentUpdates.has(t.id)) : tasks).filter((t) => t.suite !== 'learning');
             for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, repeatedTasks(own, r, batchSample), fraction, seed, concurrencyFor(s, leaves), progress, batch, r, stop.signal);
+            if (learning) await answerAll(store, meter, env, s, learning.byBatch.get(batch) ?? [], fraction, seed, () => 1, progress, batch, 1, stop.signal);
           }
           for (const s of members) await s.release?.(env);
         }

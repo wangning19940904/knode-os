@@ -2,6 +2,7 @@ import { agentGrep } from './agents.js';
 import { LADDER_ARMS } from './briefs.js';
 import { externalSystem, EXTERNAL_SYSTEMS } from './external.js';
 import { agentKnode, agentKnodeFull, agentKnodeWiki, agentKnodeWikiSources, knodeAsk, knodeAskHops, knodeSag } from './knode.js';
+import { agentGrepNotes, agentKnodeLearn, knodeAskLearn, knodeAskLearnReview } from './learning.js';
 import { llmWiki, llmWikiSources } from './llm-wiki.js';
 import { agentRag, ragBm25, ragHybrid, ragVector } from './rag.js';
 import { closedBook, longContext } from './refs.js';
@@ -23,10 +24,17 @@ export const SYSTEMS: Record<string, () => SystemUnderTest> = {
   'rag-hybrid': ragHybrid,
   'rag-bm25': ragBm25,
   'rag-vector': ragVector,
+  'knode-ask-learn': knodeAskLearn,
+  'knode-ask-learn-review': knodeAskLearnReview,
+  'agent-knode-learn': agentKnodeLearn,
+  'agent-grep-notes': agentGrepNotes,
   'closed-book': closedBook,
   'long-context': longContext,
   ...Object.fromEntries(EXTERNAL_SYSTEMS.map((id) => [id, () => externalSystem(id)])),
 };
+
+/** The learning suite's systems: each a build of its own, so a run takes them only when named. */
+export const LEARNING_SYSTEMS = ['knode-ask-learn', 'knode-ask-learn-review', 'agent-knode-learn', 'agent-grep-notes'] as const;
 
 /**
  * Named sets of systems `--systems` takes beside system ids (docs/design/33
@@ -37,6 +45,8 @@ export const SYSTEMS: Record<string, () => SystemUnderTest> = {
 export const SYSTEM_TRACKS: Record<string, readonly string[]> = {
   ladder: [...LADDER_ARMS, 'knode-ask', 'rag-hybrid'],
   'single-call': ['knode-ask', 'rag-hybrid'],
+  // the learning suite (docs/design/38 §4.3): the systems that learn, the notes baseline, and two that do not as controls
+  learning: [...LEARNING_SYSTEMS, 'agent-grep', 'knode-ask'],
 };
 
 /**
@@ -50,8 +60,8 @@ export function expandSystems(ids: readonly string[]): string[] {
   return [...new Set(ids.flatMap((id) => SYSTEM_TRACKS[id] ?? [id]))];
 }
 
-/** A run with no `--systems`: every native system but the diagnostics. */
-export const DEFAULT_SYSTEMS = Object.keys(SYSTEMS).filter((id) => !EXTERNAL_SYSTEMS.includes(id as (typeof EXTERNAL_SYSTEMS)[number]) && !(DIAGNOSTIC_SYSTEMS as readonly string[]).includes(id));
+/** A run with no `--systems`: every native system but the diagnostics and the learning suite's. */
+export const DEFAULT_SYSTEMS = Object.keys(SYSTEMS).filter((id) => !EXTERNAL_SYSTEMS.includes(id as (typeof EXTERNAL_SYSTEMS)[number]) && !(DIAGNOSTIC_SYSTEMS as readonly string[]).includes(id) && !(LEARNING_SYSTEMS as readonly string[]).includes(id));
 
 export function makeSystems(ids: string[]): SystemUnderTest[] {
   return expandSystems(ids).map((id) => {

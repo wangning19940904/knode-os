@@ -76,6 +76,11 @@ export interface SystemUnderTest {
    * options, and `knode-ask-hops`'s retrieval switches over the same build.
    */
   settings?: Record<string, unknown>;
+  /**
+   * It answers one question at a time, in the order the run gives them: it carries something from one answer to
+   * the next (a learning system's write-backs, a notes file), so two at once would race (src/eval/systems/learning.ts).
+   */
+  sequential?: boolean;
   /** Do its answers cite corpus documents (false: they cite records of its own, and citation scores do not apply). */
   cites?: boolean;
   /** Can it run on this pack at all (a staged corpus too large for long context, an external system off this pack). */

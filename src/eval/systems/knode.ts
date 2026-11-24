@@ -19,7 +19,7 @@ import { formatTag } from '../meter.js';
 import { currentRemote } from '../placement.js';
 import { listFiles } from '../pack.js';
 import { citationsIn } from '../prompts.js';
-import type { Citation, KnowledgeUnit } from '../types.js';
+import type { Citation, KnowledgeUnit, Task } from '../types.js';
 import { AGENT_BRIEF, agentMaxSteps, armBrief } from './agents.js';
 import { catalogGuide } from '../../mcp/catalog-guide.js';
 import { questionKindGuide } from '../../mcp/question-kinds.js';
@@ -537,10 +537,12 @@ async function reviewLikeServe(ctx: AppContext, env: SystemEnv): Promise<Reconci
 }
 
 function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], answers: boolean, extra: Partial<SystemUnderTest>): SystemUnderTest {
+  // the shared build, or one of the system's own (src/eval/systems/learning.ts): its model calls are tagged with it
+  const group = extra.group ?? 'knode';
   return {
     id,
     label,
-    group: 'knode',
+    group,
     kind,
     answers,
     resumable(env) {
@@ -549,7 +551,7 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
     async build(env) {
       const s = stateFor(env);
       try {
-        const built = await buildWorkspace(s, env);
+        const built = await buildWorkspace(s, env, group);
         setState(s, (e) => ({ ...withoutError(e), state: 'built' }));
         return built;
       } catch (err) {
@@ -563,7 +565,7 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
       if (!fs.existsSync(path.join(s.ws, 'knode.config.json'))) throw new Error(`no knode workspace to reopen at ${s.ws}`);
       assertOwnWorkspace(s);
       // the shim's port changed since the build: repoint the workspace at this run's shim (and its database)
-      const config = evalWorkspaceConfig(env);
+      const config = evalWorkspaceConfig(env, group);
       fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(config, null, 2));
       await adoptIndex(s, env, config);
       readPageSources(s);
@@ -583,10 +585,10 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
 }
 
 /** Build (or continue building) a run's knode workspace: in its evaluation root, or in the run directory for a run made before. */
-async function buildWorkspace(s: KnodeState, env: SystemEnv): Promise<{ notes?: Record<string, unknown>; kbDir?: string }> {
+async function buildWorkspace(s: KnodeState, env: SystemEnv, group = 'knode'): Promise<{ notes?: Record<string, unknown>; kbDir?: string }> {
       await close(s);
       const prior = resumableProgress(s, env);
-      const config = evalWorkspaceConfig(env);
+      const config = evalWorkspaceConfig(env, group);
       if (prior) {
         assertOwnWorkspace(s);
         setState(s, (e) => ({ ...withoutError(e), state: 'building' }));
@@ -690,10 +692,14 @@ export function askOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): { compu
 }
 
 /** What one Ask system answers with beyond the workspace's config: `ask`'s options, and retrieval settings over the build's. */
-interface AskTuning {
+export interface AskTuning {
   options: { computed?: boolean; now?: string };
   /** Over the workspace's `retrieval.sag`, for every search this system's answers make. */
   sag?: Partial<SagSearchConfig>;
+  /** A build of its own rather than the shared `knode` one (a learning system's, src/eval/systems/learning.ts). */
+  group?: string;
+  /** Run after each answer, on the build it was answered from (a learning system's write-back). */
+  after?: (ctx: AppContext, task: Task, res: AskResult, env: SystemEnv) => Promise<void>;
 }
 
 /**
@@ -729,10 +735,11 @@ export function knodeAskHops(env: NodeJS.ProcessEnv = process.env): SystemUnderT
   });
 }
 
-function askSystem(id: string, label: string, tuning: AskTuning): SystemUnderTest {
+export function askSystem(id: string, label: string, tuning: AskTuning): SystemUnderTest {
   const { options } = tuning;
   // as wide as the run's answer concurrency: every answer shares the one open context (docs/design/31 D2)
   return knodeSystem(id, label, 'kb', true, {
+    ...(tuning.group ? { group: tuning.group } : {}),
     settings: { askOptions: options, ...(tuning.sag ? { sag: tuning.sag } : {}) },
     async answer(task, prompt, env) {
       const s = stateFor(env);
@@ -746,6 +753,7 @@ function askSystem(id: string, label: string, tuning: AskTuning): SystemUnderTes
       // answer wrote under the shared output rules
       const docs = new Set(env.staged.docs.map((d) => d.path));
       const citations: Citation[] = [...new Set([...citedDocuments(s, res, docs), ...citationsIn(res.answer, docs).map((c) => c.doc)])].map((doc) => ({ doc }));
+      if (tuning.after) await tuning.after(ctx, task, res, env);
       return { text: res.answer, citations, retrieved: sentDocuments(s, res, docs) };
     },
     /**
@@ -794,6 +802,11 @@ export function knodeSag(): SystemUnderTest {
       return [...new Set(hits.flatMap((h) => rankedDocument(s, h.path)))].slice(0, k);
     },
   });
+}
+
+/** The open context of a run's knode build (the one `env` names), opened once. */
+export function knodeContext(env: SystemEnv): Promise<AppContext> {
+  return open(stateFor(env));
 }
 
 /** Close every knode workspace a run holds open under `dir` (a run that ends, or is cancelled, mid-pack). */
@@ -950,8 +963,19 @@ export function knodeFullGuide(): string {
 ${catalog}`;
 }
 
-export function agentKnodeFull(): SystemUnderTest {
-  return knodeSystem('agent-knode-full', 'Codex agent reading the knode wiki and the sources, with knode retrieval tools', 'agent', true, {
+/** What a variant of arm D changes (src/eval/systems/learning.ts): its id and build, a sentence more in its brief, a step after each answer. */
+export interface ArmDVariant {
+  id: string;
+  label: string;
+  group: string;
+  has?: string;
+  after?: (ctx: AppContext, task: Task, answer: { text: string }, env: SystemEnv) => Promise<void>;
+}
+
+export function agentKnodeFull(variant?: ArmDVariant): SystemUnderTest {
+  const id = variant?.id ?? 'agent-knode-full';
+  return knodeSystem(id, variant?.label ?? 'Codex agent reading the knode wiki and the sources, with knode retrieval tools', 'agent', true, {
+    ...(variant ? { group: variant.group } : {}),
     async answer(task, prompt, env) {
       const s = stateFor(env);
       const host = await toolHost(s, KNODE_FULL_TOOLS);
@@ -965,10 +989,11 @@ export function agentKnodeFull(): SystemUnderTest {
           model: env.models.model,
           effort: env.models.answerEffort,
           maxSteps: agentMaxSteps(),
-          prompt: `${armBrief(AGENT_KNODE_FULL_HAS, knodeFullGuide())}\n\n${prompt}`,
+          prompt: `${armBrief(variant?.has ? `${AGENT_KNODE_FULL_HAS} ${variant.has}` : AGENT_KNODE_FULL_HAS, knodeFullGuide())}\n\n${prompt}`,
           mcp: { name: 'knode', url: host.url, token: host.secret, enabledTools: KNODE_FULL_TOOLS },
         });
-        recordAgent(env.meter, { system: 'agent-knode-full', stage: 'agent', task: task.id }, env.models.model, r);
+        recordAgent(env.meter, { system: id, stage: 'agent', task: task.id }, env.models.model, r);
+        if (variant?.after && !r.error) await variant.after(await open(s), task, { text: r.text }, env);
         const docs = new Set(env.staged.docs.map((d) => d.path));
         const citations = [...new Set([
           ...citationsIn(r.text, docs).map((c) => c.doc),
