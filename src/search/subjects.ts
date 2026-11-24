@@ -34,6 +34,8 @@ export const SUBJECT_MIN_CHARS = 500;
 const PASSAGE_CHARS = 1500;
 /** Documents of one subject read: its own (the most mentions), and one more as near to that. */
 const DOCS_PER_SUBJECT = 2;
+/** Years a question names that its subjects' documents are taken by, at most ("from 2022 to 2024" is three). */
+const YEARS_MAX = 5;
 /** A document is the subject's own when it mentions it at least this share as often as its most-mentioning document. */
 const OWN_SHARE = 0.5;
 /** Things a question names, read as subjects at most: a pasted paragraph is not a question naming a hundred companies. */
@@ -70,12 +72,31 @@ export async function namedSubjects(store: Store, question: string): Promise<Sub
   return Promise.all(spans.map(async ({ inside, ...s }) => ({ ...s, concept: inside || isConceptWord(s.text), ids: await expandGroups(store, [s.id]).catch(() => [s.id]) })));
 }
 
-interface DocRow { subject: number; document_id: string; n: number }
+interface DocRow { subject: number; document_id: string; n: number; title: string | null; path: string; doc_date: string | Date | null }
+
+/**
+ * The years a question names, a span between two of them filled in: "2024年财报" → 2024; "从2022年到2024年",
+ * "from 2022 to 2024" → 2022, 2023, 2024. A filing workspace holds a company's reports of many years, and the one
+ * mentioning it most is not the one asked about.
+ */
+export function questionYears(question: string): string[] {
+  const years = [...new Set([...question.matchAll(/(?<!\d)((?:19|20)\d{2})(?!\d)/g)].map((m) => m[1]))];
+  if (years.length === 2) {
+    const [a, b] = years.map(Number).sort((x, y) => x - y);
+    const between = new RegExp(`${a}.{0,12}?(?:到|至|—|-|~|\\bto\\b|\\bthrough\\b|\\buntil\\b).{0,12}?${b}|${b}.{0,12}?(?:到|至|—|-|~|\\bto\\b).{0,12}?${a}`, 'i');
+    if (between.test(question) && b - a < YEARS_MAX) return Array.from({ length: b - a + 1 }, (_, i) => String(a + i));
+  }
+  return years.slice(0, YEARS_MAX);
+}
+
+/** Whether a document is of a year: its title or path names it, or its date is in it. */
+const ofYear = (d: { title: string | null; path: string; doc_date: string | Date | null }, year: string) =>
+  (d.title ?? '').includes(year) || d.path.includes(year) || (toDateString(d.doc_date) ?? '').startsWith(year);
 interface ChunkRow { id: string; document_id: string; seq: number; content: string; path: string; title: string | null; doc_date: string | Date | null; lex: number; sim: number | null }
 
 export interface SubjectPassages {
   passages: SearchResult[];
-  /** Subjects named, those the prompt already held a document of, those given a passage, and the concepts left out. */
+  /** Subjects named, those the prompt already held every document asked of, the passages added (one per subject, or per subject and year asked), and the concepts left out. */
   named: number;
   covered: number;
   added: number;
@@ -84,8 +105,10 @@ export interface SubjectPassages {
 }
 
 /**
- * A passage for each subject whose documents `contexts` has none of: the
- * chunk of the subject's own documents that best matches the question.
+ * A passage for each subject whose documents `contexts` has none of: the chunk of the subject's own documents that
+ * best matches the question. A question naming years takes each subject's document of each year it names (the most
+ * mentioning one of that year), and a question naming one subject and several years ("from 2022 to 2024") is
+ * expanded by those documents alone.
  */
 export async function subjectPassages(
   store: Store,
@@ -95,9 +118,11 @@ export async function subjectPassages(
   opts: { queryVector?: number[]; model?: string; budget?: number } = {},
 ): Promise<SubjectPassages> {
   const concepts = subjects.filter((s) => s.concept).length;
-  const none: SubjectPassages = { passages: [], named: subjects.length - concepts, covered: 0, added: 0, concepts, chars: 0 };
+  const named = subjects.length - concepts;
+  const none: SubjectPassages = { passages: [], named, covered: 0, added: 0, concepts, chars: 0 };
   const budget = opts.budget ?? SUBJECT_CHARS;
-  if (subjects.length - concepts < 2 || budget <= 0) return none;
+  const years = questionYears(question);
+  if (budget <= 0 || named === 0 || (named < 2 && years.length < 2)) return none;
 
   const p = new Params();
   const ids = subjects.flatMap((s, i) => (s.concept ? [] : s.ids.map((id) => ({ id, i }))));
@@ -109,24 +134,29 @@ export async function subjectPassages(
        JOIN documents d ON d.id = m.document_id
        WHERE ${docLiveAt('d', p)} AND d.root <> 'wiki'
        GROUP BY 1, 2)
-     SELECT m.subject, m.document_id, m.n FROM m`,
+     SELECT m.subject, m.document_id, m.n, d.title, d.path, d.doc_date FROM m JOIN documents d ON d.id = m.document_id`,
     p.list,
   );
   const bySubject = new Map<number, DocRow[]>();
   for (const r of docRows) (bySubject.get(r.subject) ?? bySubject.set(r.subject, []).get(r.subject)!).push(r);
-  const own = new Map<number, string[]>();
-  for (const [i, rows] of bySubject) {
+  // the units a passage is given for: a subject's own documents, or its document of each year asked about
+  const units: { subject: number; docs: string[] }[] = [];
+  for (const [i, rows] of [...bySubject].sort((a, b) => a[0] - b[0])) {
     rows.sort((a, b) => b.n - a.n || (a.document_id < b.document_id ? -1 : 1));
-    own.set(i, rows.filter((r) => r.n >= OWN_SHARE * rows[0].n).slice(0, DOCS_PER_SUBJECT).map((r) => r.document_id));
+    const dated = years.map((y) => rows.find((r) => ofYear(r, y))).filter((r): r is DocRow => !!r);
+    if (dated.length) for (const r of new Set(dated)) units.push({ subject: i, docs: [r.document_id] });
+    else units.push({ subject: i, docs: rows.filter((r) => r.n >= OWN_SHARE * rows[0].n).slice(0, DOCS_PER_SUBJECT).map((r) => r.document_id) });
   }
   const held = new Set(contexts.filter((c) => !c.excerpt).map((c) => c.documentId));
-  const wanted = subjects.map((_, i) => i).filter((i) => own.has(i) && !own.get(i)!.some((d) => held.has(d)));
-  const covered = [...own.keys()].length - wanted.length;
+  const wanted = units.filter((u) => !u.docs.some((d) => held.has(d)));
+  const coveredSubjects = new Set(units.map((u) => u.subject));
+  for (const u of wanted) coveredSubjects.delete(u.subject);
+  const covered = coveredSubjects.size;
   if (wanted.length === 0) return { ...none, covered };
 
-  // the chunks of each wanted subject's documents matching the question best: its metric words and other terms
-  // (the names out), then its embedding
-  const names = subjects.filter((s) => !s.concept).map((s) => s.text);
+  // the chunks of each wanted document matching the question best: its metric words and other terms (the names
+  // out), then its embedding
+  const names = subjects.filter((x) => !x.concept).map((x) => x.text);
   const metrics = metricTerms(question, names);
   const lowerNames = names.map((n) => n.toLowerCase());
   const terms = keywordTerms(question).filter((t) => !lowerNames.some((n) => n.includes(t)) && !metrics.includes(t));
@@ -134,7 +164,7 @@ export async function subjectPassages(
   const text = `regexp_replace(lower(c.content), '\\s+', ' ', 'g')`;
   const weighted = [...metrics.map((t) => [t, 4] as const), ...terms.map((t) => [t, 1] as const)];
   const lex = weighted.length ? weighted.map(([t, w]) => `(CASE WHEN strpos(${text}, ${q.add(t)}) > 0 THEN ${w} ELSE 0 END)`).join(' + ') : '0';
-  const docs = [...new Set(wanted.flatMap((i) => own.get(i)!))];
+  const docs = [...new Set(wanted.flatMap((u) => u.docs))];
   const sim = opts.queryVector && opts.model
     ? `(SELECT 1 - (e.embedding <=> ${q.add(toVectorLiteral(opts.queryVector))}::${VECTOR_TYPE}) FROM embeddings e WHERE e.chunk_id = c.id AND e.model = ${q.add(opts.model)})`
     : 'NULL::float';
@@ -149,15 +179,15 @@ export async function subjectPassages(
   );
   const best = new Map(chunks.map((c) => [c.document_id, c]));
 
-  // one turn each, the budget shared: a subject's passage is its best chunk, cut around its metric when the share is short
+  // one turn each, the budget shared: a unit's passage is its best chunk, cut around its metric when the share is short
   const share = Math.max(SUBJECT_MIN_CHARS, Math.min(PASSAGE_CHARS, Math.floor(budget / wanted.length)));
   const passages: SearchResult[] = [];
   let chars = 0;
-  for (const i of wanted) {
-    const pick = own.get(i)!.map((d) => best.get(d)).filter((c): c is ChunkRow => !!c)
+  for (const u of wanted) {
+    const pick = u.docs.map((d) => best.get(d)).filter((c): c is ChunkRow => !!c)
       .sort((a, b) => b.lex - a.lex || (b.sim ?? 0) - (a.sim ?? 0))[0];
     if (!pick) continue;
-    // past the budget's last full share, what is left of it; a subject it cannot give the shortest passage waits
+    // past the budget's last full share, what is left of it; a unit it cannot give the shortest passage waits
     const room = Math.min(share, budget - chars);
     if (room < SUBJECT_MIN_CHARS) break;
     const content = around(pick.content, metrics, room);

@@ -11,7 +11,7 @@ import { enumerateClaims, fillShares, subjectTimelines } from '../src/search/enu
 import { namedEntities } from '../src/search/facts.js';
 import { questionRange } from '../src/search/route.js';
 import { asksForValue, fuzzyPieces, metricParts, metricTerms, rowExcerpts, rowWindows } from '../src/search/rows.js';
-import { around, isConceptWord, namedSubjects, SUBJECT_MIN_CHARS, subjectPassages } from '../src/search/subjects.js';
+import { around, isConceptWord, namedSubjects, questionYears, SUBJECT_MIN_CHARS, subjectPassages } from '../src/search/subjects.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 import type { SearchResult } from '../src/types.js';
 
@@ -111,6 +111,14 @@ beforeAll(async () => {
   // a document about financial assets in general, which a search of the whole question finds first
   await addDoc('primer', ['交易性金融资产是指企业为了近期内出售而持有的金融资产。交易性金融资产最高的公司通常是哪一个？考虑以下公司的2024年财报。'], '金融资产入门');
 
+  // one company's reports of several years: the oldest mentions it most
+  await addEntity('gree', '格力电器');
+  for (const [year, mentions] of [['2015', 6], ['2022', 2], ['2023', 2], ['2024', 2]] as const) {
+    const chunks = Array.from({ length: mentions }, (_, i) => i === mentions - 1 ? `格力电器 合并利润表\n| 营业收入 | ${year}0000.00 |` : `格力电器${year}年第一季度报告 第${i}节。${'经营稳健。'.repeat(20)}`);
+    await addDoc(`gree-${year}`, chunks, `格力电器${year}年第一季度报告`, `${year}-04-30`);
+    for (let seq = 0; seq < mentions; seq++) await mention('gree', `gree-${year}`, seq);
+  }
+
   await addEntity('ylt', '英力特');
   await addDoc('ylt-q1', FILLER, '英力特2024年第一季度报告');
   for (const seq of [0, 1, 2]) await mention('ylt', 'ylt-q1', seq);
@@ -187,6 +195,27 @@ describe('R1: every subject a question names gets its share', () => {
     // a subject the passages hold a document of has its share already
     const held = await subjectPassages(store, question, subjects, [await chunkOf('filing-0-0')]);
     expect(held).toMatchObject({ covered: 1, added: COMPANIES.length - 1 });
+  });
+
+  it('reads the years a question names, a span filled in', () => {
+    expect(questionYears('考虑以下公司的2024年财报：A、B。')).toEqual(['2024']);
+    expect(questionYears('根据格力电器2022年、2023年和2024年一季度的财报信息')).toEqual(['2022', '2023', '2024']);
+    expect(questionYears('What is the trend of X from 2022 to 2024?')).toEqual(['2022', '2023', '2024']);
+    expect(questionYears('从2023年到2024年，‘一年内到期的非流动负债’呈现什么样的变化趋势？')).toEqual(['2023', '2024']);
+    expect(questionYears('X的专项储备是多少？')).toEqual([]);
+  });
+
+  it('takes a subject\'s document of each year asked, not the one mentioning it most, and expands one subject by its years', async () => {
+    const question = '根据格力电器2022年、2023年和2024年一季度的财报信息，营业收入呈现了什么样的发展趋势？';
+    const subjects = await namedSubjects(store, question);
+    const res = await subjectPassages(store, question, subjects, []);
+    expect(res.passages.map((p) => p.documentId)).toEqual(['gree-2022', 'gree-2023', 'gree-2024']);
+    expect(res.passages.every((p) => p.content.includes('营业收入'))).toBe(true);
+    // the year the passages hold already is not added again
+    const held = await subjectPassages(store, question, subjects, [await chunkOf('gree-2023-0')]);
+    expect(held.passages.map((p) => p.documentId)).toEqual(['gree-2022', 'gree-2024']);
+    // one subject and no years: nothing to expand
+    expect((await subjectPassages(store, '格力电器的营业收入是多少？', subjects, [])).added).toBe(0);
   });
 
   it('without the subjects step, a search of the whole question leaves companies out', async () => {

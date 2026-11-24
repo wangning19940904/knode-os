@@ -58,7 +58,7 @@ export interface AskRoute {
   widened?: { documents: number; chars: number };
   /** For a question asking for the latest state: the newest sources about what it names, put first (search/newest.ts). */
   newest?: { path: string; date: string | null }[];
-  /** For a question naming several things: how many it names, how many the passages held a document of, and the passages added for the rest (search/subjects.ts). */
+  /** For a question naming several things, or one in several years: how many it names, how many the passages held every document asked of, and the passages added for the rest (search/subjects.ts). */
   subjects?: { named: number; covered: number; added: number; concepts: number; chars: number };
   /** For a question asking for a value: the documents whose lines naming its metric were added, and their characters (search/rows.ts). */
   rows?: { documents: number; chars: number; terms: string[] };
@@ -506,8 +506,9 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
       routed = { ...routed, newest: newest.map((c) => ({ path: c.path, date: c.docDate ?? null })) };
     }
   }
-  // a question naming several things: a passage of each one's own documents the passages hold none of
-  if (env.opts.subjects !== false && env.subjects.length > 1) {
+  // a question naming several things, or one thing in several years: a passage of each one's own documents (of each
+  // year asked) the passages hold none of
+  if (env.opts.subjects !== false && env.subjects.length > 0) {
     const own = await subjectPassages(env.store, question, env.subjects, contexts, { queryVector: env.queryVector, model: env.embedder.model }).catch(() => null);
     if (own) {
       if (own.passages.length) {
@@ -515,7 +516,7 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
         const at = firstExcerpt < 0 ? contexts.length : firstExcerpt;
         contexts = [...contexts.slice(0, at), ...own.passages, ...contexts.slice(at)];
       }
-      if (own.named > 1) routed = { ...routed, subjects: { named: own.named, covered: own.covered, added: own.added, concepts: own.concepts, chars: own.chars } };
+      if (own.named > 1 || own.added > 0) routed = { ...routed, subjects: { named: own.named, covered: own.covered, added: own.added, concepts: own.concepts, chars: own.chars } };
     }
   }
   if (!computed && routedFirst.kind !== 'timeline' && (env.opts.second ?? env.router.secondRound !== false)) {

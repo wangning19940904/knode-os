@@ -62,7 +62,7 @@ const EN_STOP = new Set([
   'consider', 'following', 'please', 'answer', 'listed', 'above', 'highest', 'lowest', 'largest', 'smallest', 'most', 'least', 'between', 'into', 'groups', 'group',
   'categorize', 'categorise', 'category', 'categories', 'compare', 'trend', 'change', 'observed', 'value', 'amount', 'thousands', 'millions', 'dollars', 'usd',
   'inc', 'corp', 'ltd', 'llc', 'co', 'plc', 'year', 'fiscal', 'period', 'reported', 'according', 'based', 'financial', 'statements', 'statement', 'filing', 'filings', 'form',
-  'over', 'under', 'above', 'below', 'and', 'each', 'all', 'list', 'order', 'increasing', 'decreasing', 'ascending', 'descending', 'there', 'than', 'what\'s', 'one', 'two', 'three',
+  'over', 'under', 'above', 'below', 'and', 'each', 'all', 'list', 'order', 'been', 'being', 'based', 'increasing', 'decreasing', 'ascending', 'descending', 'there', 'than', 'what\'s', 'one', 'two', 'three',
 ]);
 
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
