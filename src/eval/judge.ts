@@ -40,6 +40,11 @@ export interface JudgeOptions {
   width?: () => number;
   /** How often the width is read again while calls wait (default 1 s). */
   widthCheckMs?: number;
+  /**
+   * Told the model that answered each call, as its reply names it (null: it names none), before the reply is
+   * used or cached: throwing refuses the reply, and the batch fails with that error (src/eval/judge-identity.ts).
+   */
+  served?: (model: string | null) => void;
 }
 
 /**
@@ -303,7 +308,17 @@ export class Judge {
       try {
         if ('error' in r && r.error !== undefined) throw r.error;
         reply = r.value!;
-        this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: true, replayed: false, usage, ...where });
+        const served = (usage as CallUsage | null)?.model ?? null;
+        // the model that answered, checked before its verdicts are used or cached; a refusal is final, never asked again in halves
+        if (this.opts.served) {
+          try {
+            this.opts.served(served);
+          } catch (err) {
+            failed = true;
+            throw Object.assign(err instanceof Error ? err : new Error(String(err)), { final: true });
+          }
+        }
+        this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: true, replayed: false, usage, ...where, ...(served ? { served } : {}) });
       } catch (err) {
         this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: false, replayed: false, usage, ...where });
         if (!unparsable(err)) throw err;
@@ -331,7 +346,22 @@ export class Judge {
 
   /* --------------------------------- grading -------------------------------- */
 
+  private decoys: { items: GradeItem[]; record: (item: GradeItem, verdict: GradeVerdict) => void } | null = null;
+
+  /**
+   * Answers known to be wrong (src/eval/decoys.ts) to mix into the next grading pass that has answers of its
+   * own: each at a seeded place among them, so they share its batches; their verdicts go to `record` and are
+   * left out of what the pass returns.
+   */
+  mixDecoys(items: GradeItem[], record: (item: GradeItem, verdict: GradeVerdict) => void): this {
+    this.decoys = items.length ? { items, record } : null;
+    return this;
+  }
+
   async gradeAnswers(items: GradeItem[]): Promise<Verdicts<GradeVerdict>> {
+    const mix = items.length ? this.decoys : null;
+    if (mix) this.decoys = null;
+    const asked = mix ? mixIn(items, mix.items) : items;
     const render = (i: GradeItem) => ({
       question: i.question,
       ...(i.expectAbstain ? { expectAbstain: true } : { reference: i.reference }),
@@ -342,7 +372,12 @@ export class Judge {
       for (const [id, v] of raw) raw.set(id, { ...v, score: clampScore(v.score), keypoints: Array.isArray(v.keypoints) ? v.keypoints.map(Number).filter(Number.isInteger) : [] });
       return raw;
     };
-    const raw = clamp(await this.batch<GradeItem, GradeVerdict>('grade', GRADE_SYSTEM, items, render));
+    const raw = clamp(await this.batch<GradeItem, GradeVerdict>('grade', GRADE_SYSTEM, asked, render));
+    for (const d of mix?.items ?? []) {
+      const v = raw.get(d.id);
+      raw.delete(d.id);
+      if (v !== undefined) mix!.record(d, v);
+    }
     // two grades agree on the score; the second is clamped as the first was. A key-points answer is scored by the
     // key points the grade names (score/usage.ts), so those are audited too, as the set of points each pass named
     const points = (v: GradeVerdict, i: GradeItem) => [...new Set((Array.isArray(v.keypoints) ? v.keypoints.map(Number) : []).filter((k) => Number.isInteger(k) && k >= 0 && k < (i.keypoints?.length ?? 0)))].sort((x, y) => x - y);
@@ -403,6 +438,18 @@ export class Judge {
     const render = (i: (typeof items)[number]) => ({ a: i.a.slice(0, 800), b: i.b.slice(0, 800) });
     return this.audited('contradict', CONTRADICT_SYSTEM, items, render, await this.batch<(typeof items)[number], { contradict: boolean }>('contradict', CONTRADICT_SYSTEM, items, render), (v) => Boolean(v.contradict));
   }
+}
+
+/** `extra` placed among `items`, each at the place its id hashes to: the order of `items` is kept. */
+export function mixIn<T extends { id: string }>(items: T[], extra: T[]): T[] {
+  const at = extra.map((e) => ({ e, pos: Math.floor(fraction('decoy-place', e.id) * (items.length + 1)) })).sort((a, b) => a.pos - b.pos || a.e.id.localeCompare(b.e.id));
+  const out: T[] = [];
+  let j = 0;
+  for (let i = 0; i <= items.length; i++) {
+    while (j < at.length && at[j].pos === i) out.push(at[j++].e);
+    if (i < items.length) out.push(items[i]);
+  }
+  return out;
 }
 
 export interface GradeItem {

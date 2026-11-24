@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { JudgeAuditRecord } from './judge.js';
+import type { JudgeChange } from './judge-identity.js';
 import type { AgentSample } from './allocation.js';
 import { AnswerRecord, BuildRecord, ScoreRecord } from './types.js';
 
@@ -51,7 +52,13 @@ export interface RunMeta {
   systems: string[];
   suites: string[];
   model: { connection: string; label: string; buildEffort: string; answerEffort: string; agents?: string };
-  judge: { connection: string; label: string };
+  /**
+   * The judge: its connection and label as the command line gave them; `served`, the model its replies name
+   * (src/eval/judge-identity.ts), set by the first that names one; `unnamed`, replies that named none.
+   */
+  judge: { connection: string; label: string; served?: string; unnamed?: number };
+  /** Judge changes a resume or a scoring was allowed to go on with (`--allow-judge-change`), in order. */
+  judgeChanges?: JudgeChange[];
   embedding: string;
   fraction: number;
   seed: string | number;
