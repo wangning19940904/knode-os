@@ -15,8 +15,8 @@ import { PackWriter } from './writer.js';
  * public-frames: FRAMES (Krishna et al., 2024, arXiv 2409.12941; Apache-2.0)
  * in a shared-pool setting — a seeded sample of its 824 questions (100 by
  * default, across reasoning types and numbers of articles), each needing
- * 2–15 Wikipedia articles, and every article of every sampled question as
- * one corpus. A question's articles are other questions' distractors, so a
+ * 2–15 Wikipedia articles by the dataset's card (its links run to 23, 3.25
+ * on average), and every article of every sampled question as one corpus. A question's articles are other questions' distractors, so a
  * system has to find them before it can reason over them. No model is used:
  * questions, answers, links and reasoning types are the dataset's.
  *
