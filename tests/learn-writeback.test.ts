@@ -11,7 +11,7 @@ import { LEARNED_DIR, learnConfig } from '../src/learn/config.js';
 import { attributeOf, periodOf } from '../src/learn/facts.js';
 import { answerFigures, declaredScale, figureOnLine, numbersIn } from '../src/learn/numbers.js';
 import { learnedPathFor, readLearnedPage } from '../src/learn/page.js';
-import { checkCitation, parseSourceRef } from '../src/learn/verify.js';
+import { checkCitation, namesAttribute, parseSourceRef } from '../src/learn/verify.js';
 import { learnSuggestionId, writeBack } from '../src/learn/writeback.js';
 import { readDeps } from '../src/lineage/deps.js';
 import { registerKnodeTools } from '../src/mcp/tools.js';
@@ -148,6 +148,9 @@ describe('the check on the cited line', () => {
     expect(c.lineText).toContain('营业成本');
     // the value is there, under another attribute: not this one
     expect(checkCitation(dataDir, parseSourceRef(REPORT)!, figure('8,001.50万元'), { attribute: '净利润' }).ok).toBe(false);
+    // a long attribute is named by its head (found with a real model's answer: "房子月租" on a line saying 月租)
+    expect(namesAttribute('定了，金鸡湖边的一室户，月租 4800', '房子月租')).toBe(true);
+    expect(namesAttribute('定了，金鸡湖边的一室户，押一付三', '房子月租')).toBe(false);
     // an English 10-K's declared thousands
     expect(checkCitation(dataDir, parseSourceRef(TEN_K)!, figure('$4.2 million'), { attribute: 'total revenue' })).toMatchObject({ ok: true, located: true, scale: 1e3 });
   });

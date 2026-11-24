@@ -86,7 +86,8 @@ const fold = (s: string) => s.normalize('NFKC').toLowerCase().replace(/[\s,，*_
 /**
  * The attribute's words on a line: the whole term (spaces and separators
  * ignored), or for a term of several English words all of them, or for a long
- * CJK term most of its two-character pieces.
+ * CJK term most of its two-character pieces or its head (its last two characters:
+ * "房子月租" is named by a line saying 月租).
  */
 export function namesAttribute(line: string, attribute: string | null | undefined): boolean {
   if (!attribute) return false;
@@ -101,7 +102,8 @@ export function namesAttribute(line: string, attribute: string | null | undefine
     const grams = new Set<string>();
     for (let i = 0; i + 2 <= cjk.length; i++) grams.add(cjk.slice(i, i + 2));
     const hit = [...grams].filter((g) => l.includes(g)).length;
-    return hit / grams.size >= 0.6;
+    // a compound is head-final: its last two characters (月租, 收入, 人数) name what is measured
+    return hit / grams.size >= 0.6 || l.includes(cjk.slice(-2));
   }
   return false;
 }
