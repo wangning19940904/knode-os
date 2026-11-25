@@ -9,7 +9,7 @@ import { z } from 'zod';
  * skips what is done.
  */
 
-export const SUITES = ['generation', 'usage', 'emergence', 'update', 'robustness'] as const;
+export const SUITES = ['generation', 'usage', 'emergence', 'update', 'robustness', 'learning'] as const;
 export type Suite = (typeof SUITES)[number];
 
 export const TASK_TYPES = [

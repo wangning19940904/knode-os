@@ -82,6 +82,15 @@ process.stdin.on('end', async () => {
     emit({ type: 'item.started', item: { type: 'command_execution', command: 'rg -n 林晓 .' } });
     emit({ type: 'item.started', item: { type: 'command_execution', command: `/bin/zsh -lc "rg -l '林晓' . | head -n 5"` } });
   }
+  // a notes file the session may write (agent-grep-notes): FAKE_CODEX_NOTES_LOG gets what it held at the start, and a line is added
+  const notes = /The one file you may write is ([\w.-]+), in the current directory/.exec(prompt);
+  if (notes) {
+    const file = path.join(cwd, notes[1]);
+    const held = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+    if (process.env.FAKE_CODEX_NOTES_LOG) fs.appendFileSync(process.env.FAKE_CODEX_NOTES_LOG, `${JSON.stringify(held)}\n`);
+    emit({ type: 'item.started', item: { type: 'command_execution', command: `cat ${notes[1]}` } });
+    fs.appendFileSync(file, `- note ${held.split('\n').filter(Boolean).length + 1}: 岗位见 email/2026-03-05.md 第 5 行\n`);
+  }
   let answer;
   const ingest = /Ingest these new sources into the wiki now: (.+)\./.exec(prompt);
   if (ingest) {

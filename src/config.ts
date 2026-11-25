@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import type { LearnConfig } from './learn/config.js';
 import os from 'node:os';
 import path from 'node:path';
 import { DEFAULT_LANGUAGES, LanguagesConfig, normalizeLanguagesConfig } from './lang/languages.js';
@@ -1285,6 +1286,11 @@ export interface KnodeConfig {
   processing?: ProcessingConfig;
   /** The chat entry (see src/chat). */
   chat: ChatConfig;
+  /**
+   * Learning from use (src/learn, docs/design/38 §4): answers written back as checked question pages and derived
+   * facts. Absent, or `enabled: false`: nothing is written back.
+   */
+  learn?: Partial<LearnConfig>;
   /** Content languages: the language the knowledge is read in, and what is translated into it (docs/design/17). */
   languages: LanguagesConfig;
   trace: {

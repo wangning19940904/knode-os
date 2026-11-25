@@ -17,6 +17,9 @@ import { LlmClient } from '../llm/client.js';
 import { Store } from '../store/db.js';
 import { IngestStats } from '../types.js';
 import { fileCitationRefreshes } from '../research/cited-refresh.js';
+import { LEARN_WRITER, learnConfig } from '../learn/config.js';
+import { refreshMethodPlaybooks } from '../learn/methods.js';
+import { hasLearnedPages, revalidateLearned } from '../learn/revalidate.js';
 import { reconcileViews } from '../wiki/pages.js';
 import { refreshTableFacts, tableFactsEnabled } from '../tables/store.js';
 import { applyDocScope } from './apply.js';
@@ -94,9 +97,36 @@ export interface SyncStats extends IngestStats {
 let syncChain: Promise<unknown> = Promise.resolve();
 
 export async function sync(ctx: SyncContext, opts: SyncOptions = {}): Promise<SyncStats> {
-  const run = syncChain.then(() => syncAll(ctx, opts));
+  const run = syncChain.then(async () => {
+    const stats = await syncAll(ctx, opts);
+    await recheckLearned(ctx, opts, stats);
+    return stats;
+  });
   syncChain = run.catch(() => {});
   return run;
+}
+
+/**
+ * Learned pages whose cited documents this sync changed are checked again (src/learn/revalidate.ts): kept, moved
+ * to the lines their values now stand on, or withdrawn. Only after a sync that applied or removed something, only
+ * when learned pages exist, and inside the sync chain: the pages it rewrites are re-indexed before the next sync.
+ */
+async function recheckLearned(ctx: SyncContext, opts: SyncOptions, stats: SyncStats): Promise<void> {
+  if (!(stats.applied > 0 || stats.removed > 0) || !hasLearnedPages(ctx.dataDir)) return;
+  try {
+    const r = await revalidateLearned(ctx.store, ctx.dataDir, {
+      prefixes: opts.only,
+      resync: (paths) => syncAll(ctx, { only: paths, llmGraph: false, datasources: false, actor: LEARN_WRITER, onProgress: opts.onProgress }),
+    });
+    if (r.withdrawn.length || r.moved.length) {
+      opts.onProgress?.(`learned pages: ${r.withdrawn.length} withdrawn (a cited value changed), ${r.moved.length} moved to new lines`);
+      // the methods those pages supported follow them (src/learn/methods.ts)
+      const learn = learnConfig(ctx.config);
+      if (learn.methods) await refreshMethodPlaybooks(ctx.store, ctx.dataDir, learn);
+    }
+  } catch (err) {
+    opts.onProgress?.(`learned pages: re-check failed: ${err instanceof Error ? err.message : err}`);
+  }
 }
 
 /** Resolves once every sync started so far has ended, however it ended. */

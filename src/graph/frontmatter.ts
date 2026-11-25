@@ -174,6 +174,10 @@ export function frontmatterExtraction(fm: Record<string, unknown>, opts: Declare
       startDate: dateStr(o.startDate ?? o.start_date ?? o.validFrom ?? o.valid_from),
       endDate: dateStr(o.endDate ?? o.end_date ?? o.validTo ?? o.valid_to),
       eventDate: dateStr(o.eventDate ?? o.event_date ?? o.date),
+      // a measure declared with its parts (a learned page's derived facts, src/learn/facts.ts): the attribute, value and unit as given
+      ...(typeof o.attribute === 'string' && o.attribute.trim() ? { attribute: o.attribute.trim() } : {}),
+      ...(typeof o.value === 'number' || (typeof o.value === 'string' && o.value.trim()) ? { value: o.value as number | string } : {}),
+      ...(typeof o.unit === 'string' && o.unit.trim() ? { unit: o.unit.trim() } : {}),
     });
     // claim subjects must resolve to an extracted entity, so ensure one exists
     addEntity({ name: subject, type: 'concept' });
