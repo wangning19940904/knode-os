@@ -1274,7 +1274,7 @@ async function answerAll(
       rec = {
         key, pack: env.pack.manifest.id, system: s.id, taskId: task.id, ...(batch ? { batch } : {}), at: new Date().toISOString(),
         text: a.text, finalAnswer: extractFinalAnswer(a.text),
-        citations: a.citations ?? citationsIn(a.text, docs), retrieved: a.retrieved ?? [], toolCalls: a.toolCalls ?? 0,
+        citations: a.citations ?? citationsIn(a.text, docs), ...(a.pageCitations ? { pageCitations: a.pageCitations } : {}), retrieved: a.retrieved ?? [], toolCalls: a.toolCalls ?? 0,
         ...(a.commands ? { commands: boundedTrace(a.commands) } : {}),
         // what each command returned, beside it (docs/design/33 D7); absent when the session's events carried none
         ...(a.commands && a.outputs?.some((o) => o) ? { outputs: boundedOutputs(a.outputs.slice(0, a.commands.length)) } : {}),

@@ -1,7 +1,7 @@
-import { agentGrep } from './agents.js';
+import { agentGrep, agentGrepCatalog } from './agents.js';
 import { LADDER_ARMS } from './briefs.js';
 import { externalSystem, EXTERNAL_SYSTEMS } from './external.js';
-import { agentKnode, agentKnodeFull, agentKnodeWiki, agentKnodeWikiSources, knodeAsk, knodeAskHops, knodeSag } from './knode.js';
+import { agentKnode, agentKnodeFull, agentKnodeWiki, agentKnodeWikiFirst, agentKnodeWikiSources, knodeAsk, knodeAskHops, knodeSag } from './knode.js';
 import { llmWiki, llmWikiSources } from './llm-wiki.js';
 import { agentRag, ragBm25, ragHybrid, ragVector } from './rag.js';
 import { closedBook, longContext } from './refs.js';
@@ -15,10 +15,12 @@ export const SYSTEMS: Record<string, () => SystemUnderTest> = {
   'agent-knode': agentKnode,
   'agent-knode-wiki': agentKnodeWiki,
   'agent-knode-wiki-sources': agentKnodeWikiSources,
+  'agent-knode-wiki-first': agentKnodeWikiFirst,
   'agent-knode-full': agentKnodeFull,
   'agent-wiki': llmWiki,
   'agent-wiki-sources': llmWikiSources,
   'agent-grep': agentGrep,
+  'agent-grep-catalog': agentGrepCatalog,
   'agent-rag': agentRag,
   'rag-hybrid': ragHybrid,
   'rag-bm25': ragBm25,
@@ -41,9 +43,11 @@ export const SYSTEM_TRACKS: Record<string, readonly string[]> = {
 
 /**
  * Systems a run takes only when named: the diagnostics (docs/design/33 D3) — MCP tools with no files, the wiki
- * with no sources — and Ask's variant with the hop and aggregate retrieval on, answered beside `knode-ask` on its build.
+ * with no sources — Ask's variant with the hop and aggregate retrieval on, answered beside `knode-ask` on its build,
+ * and the two arms that each change one thing of a ladder arm (docs/design/38 §5.2): arm C with leave to answer
+ * from the pages, and arm A with a catalog of its documents.
  */
-export const DIAGNOSTIC_SYSTEMS = ['agent-knode', 'agent-knode-wiki', 'knode-ask-hops'] as const;
+export const DIAGNOSTIC_SYSTEMS = ['agent-knode', 'agent-knode-wiki', 'knode-ask-hops', 'agent-knode-wiki-first', 'agent-grep-catalog'] as const;
 
 /** System ids with every track name replaced by its systems, in order, each once. */
 export function expandSystems(ids: readonly string[]): string[] {

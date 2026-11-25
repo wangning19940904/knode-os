@@ -9,7 +9,7 @@ import type { LoadedPack, StagedCorpus } from '../pack.js';
 import type { QuotaGuard } from '../quota.js';
 import type { Shim } from '../shim.js';
 import type { ToolOutput } from '../trace.js';
-import type { Citation, KnowledgeUnit, Task } from '../types.js';
+import type { Citation, KnowledgeUnit, PageCitation, Task } from '../types.js';
 
 /**
  * What every system under test is given and must provide (docs/design/23 §3).
@@ -50,6 +50,8 @@ export interface SystemEnv {
 export interface SystemAnswer {
   text: string;
   citations?: Citation[];
+  /** Wiki pages the answer cited, mapped to their documents (src/eval/types.ts `PageCitation`). */
+  pageCitations?: PageCitation[];
   retrieved?: string[];
   toolCalls?: number;
   /** An agent's command lines and MCP tool calls, in order (src/eval/trace.ts); bounded when the record is written. */

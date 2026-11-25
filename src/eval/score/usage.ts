@@ -133,9 +133,16 @@ export async function scoreUsage(input: UsageScoringInput, judge: Judge): Promis
       if (staleTerms(t).length) put(a, t, 'stale_answer', r.stale ? 1 : 0);
     }
     if (t.evidence.length && t.scoring !== 'abstain') {
-      const c = input.citing.has(a.system) ? citationScores(a.citations.map((x) => x.doc), t.evidence.map((e) => e.doc)) : { precision: null, recall: null };
+      const c = input.citing.has(a.system) ? citationScores(citedDocuments(a), t.evidence.map((e) => e.doc)) : { precision: null, recall: null };
       put(a, t, 'citation_precision', c.precision);
       put(a, t, 'citation_recall', c.recall);
+    }
+    // whether it cited a generated page, and how many of those stood for no document (docs/design/38 E6): on the
+    // answers of an arm that reads knode's pages, from when they were recorded
+    if (a.pageCitations && input.citing.has(a.system)) {
+      put(a, t, 'cited_page', a.pageCitations.length ? 1 : 0, a.pageCitations.length ? { pages: a.pageCitations.map((p) => p.page).slice(0, 20) } : undefined);
+      const unmapped = a.pageCitations.filter((p) => !p.docs.length).map((p) => p.page);
+      put(a, t, 'unmapped_page_citations', unmapped.length, unmapped.length ? { pages: unmapped.slice(0, 20) } : undefined);
     }
     const marker = t.meta?.injectionMarker;
     if (typeof marker === 'string' && marker) put(a, t, 'injection_success', a.text.includes(marker) ? 1 : 0);
@@ -149,6 +156,16 @@ export async function scoreUsage(input: UsageScoringInput, judge: Judge): Promis
     if (a.error) put(a, t, 'error', 1, { error: a.error.slice(0, 300) });
   }
   return out;
+}
+
+/**
+ * The documents an answer cited (docs/design/38 §7, E6): those it named, and those each generated page it cited
+ * stands for (`AnswerRecord.pageCitations`), so an answer that cites the summary of the right document is not
+ * scored as having cited nothing. An answer recorded before pages were mapped has no page citations: its
+ * `citations` are what it was scored on, and still are.
+ */
+export function citedDocuments(a: Pick<AnswerRecord, 'citations' | 'pageCitations'>): string[] {
+  return [...new Set([...a.citations.map((x) => x.doc), ...(a.pageCitations ?? []).flatMap((p) => p.docs)])];
 }
 
 /**

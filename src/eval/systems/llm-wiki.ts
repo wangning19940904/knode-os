@@ -213,6 +213,14 @@ export function llmWiki(): SystemUnderTest {
 /** What an agent with a wiki and the sources beside it has: the sentence of the shared brief that says so. */
 export const WIKI_SOURCES_HAS = (wiki: string, raw: string, index = 'its index.md') => `The current directory holds a wiki compiled from the documents (${wiki}; start from ${index}) and the source documents themselves (${raw}). Use the wiki to find your way — which sources bear on the question and how they connect — and open the sources to check details or find what the wiki leaves out. Cite source documents by their paths under ${raw}.`;
 
+/**
+ * `WIKI_SOURCES_HAS` with one thing changed (docs/design/38 §5.2): where a page states a fact and the document it
+ * came from, the agent may answer from the page and cite it, opening the sources only for what the pages leave
+ * out — instead of being sent to the index first and to the sources to check. The two sentences differ in that
+ * alone (tests/eval-briefs.test.ts shows them side by side).
+ */
+export const WIKI_FIRST_HAS = (wiki: string, raw: string, index: string) => `The current directory holds a wiki compiled from the documents (${wiki}; ${index} lists every page) and the source documents themselves (${raw}). Where a page states a fact and the document it comes from, you may answer from the page and cite the page by its path; open the sources for what the pages leave out. Cite source documents by their paths under ${raw}.`;
+
 export const WIKI_SOURCES_BRIEF = (wiki: string, raw: string) => AGENT_BRIEF(WIKI_SOURCES_HAS(wiki, raw));
 
 /**

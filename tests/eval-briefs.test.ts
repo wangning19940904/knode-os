@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { AGENT_BRIEF } from '../src/eval/systems/agents.js';
-import { LADDER_ARMS, ladderBriefs } from '../src/eval/systems/briefs.js';
+import { LADDER_ARMS, ladderBriefs, VARIANT_ARMS, variantBriefs } from '../src/eval/systems/briefs.js';
 import { KNODE_FULL_TOOLS } from '../src/eval/systems/knode.js';
 
 /**
@@ -24,6 +24,14 @@ const HAS = {
   'agent-knode-full': 'The current directory holds a wiki compiled from the documents (wiki/, generated pages; wiki/sources/ holds one summary per document; start from wiki/index.md) and the source documents themselves (raw/docs/). Use the wiki to find your way — which sources bear on the question and how they connect — and open the sources to check details or find what the wiki leaves out. Cite source documents by their paths under raw/docs/. You also have knode\'s retrieval tools (on the MCP server knode) over an index built from the same documents: knode_search, knode_graph_search, knode_claims, knode_query, knode_resolve, knode_survey. Their results name documents as raw/docs/<path> and pages as wiki/<page>, the paths of the current directory. A tool call counts against the budget as a command does.',
 } as const;
 
+/** The arms that change one thing of a ladder arm (docs/design/38 §5.2), beside the arm each changes. */
+const VARIANT_HAS = {
+  // A, plus a catalog of the documents: one sentence more
+  'agent-grep-catalog': 'The current directory holds the source documents. CATALOG.md lists every document, one per line, with its path, title and date (taken from the collection\'s metadata).',
+  // C's folder; instead of "start from the index, find your way, check in the sources": answer from a page that states the fact and its source
+  'agent-knode-wiki-first': 'The current directory holds a wiki compiled from the documents (wiki/, generated pages; wiki/sources/ holds one summary per document; wiki/index.md lists every page) and the source documents themselves (raw/docs/). Where a page states a fact and the document it comes from, you may answer from the page and cite the page by its path; open the sources for what the pages leave out. Cite source documents by their paths under raw/docs/.',
+} as const;
+
 describe('the ladder\'s briefs', () => {
   const briefs = ladderBriefs();
 
@@ -44,6 +52,26 @@ describe('the ladder\'s briefs', () => {
     expect(briefs['agent-grep'].guide).toBeUndefined();
     expect(briefs['agent-rag'].guide).toBeUndefined();
     expect(briefs['agent-knode-wiki-sources'].guide).toBeUndefined();
+  });
+
+  it('have two variants, each the skeleton with one arm\'s sentence changed', () => {
+    const variants = variantBriefs();
+    expect(Object.keys(variants)).toEqual([...VARIANT_ARMS]);
+    for (const arm of VARIANT_ARMS) {
+      expect(variants[arm].has, arm).toBe(VARIANT_HAS[arm]);
+      expect(variants[arm].text, arm).toBe(SKELETON.replace('<HAS>', VARIANT_HAS[arm]));
+    }
+    expect(variants['agent-grep-catalog'].of).toBe('agent-grep');
+    expect(variants['agent-knode-wiki-first'].of).toBe('agent-knode-wiki-sources');
+    // the catalog arm adds one sentence to arm A's
+    expect(VARIANT_HAS['agent-grep-catalog'].startsWith(`${HAS['agent-grep']} `)).toBe(true);
+    // the wiki-first arm names arm C's folder the same way and differs in how it may use the pages alone
+    const c = HAS['agent-knode-wiki-sources'];
+    const first = VARIANT_HAS['agent-knode-wiki-first'];
+    expect(first.slice(0, first.indexOf(';', first.indexOf('summary')))).toBe(c.slice(0, c.indexOf(';', c.indexOf('summary'))));
+    expect(first.endsWith('Cite source documents by their paths under raw/docs/.')).toBe(true);
+    expect(c).toContain('start from wiki/index.md');
+    expect(first).not.toContain('start from');
   });
 
   it('give arm D the question-kind guide with shell wording, and name only its tools', () => {

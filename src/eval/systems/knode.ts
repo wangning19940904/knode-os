@@ -19,11 +19,11 @@ import { formatTag } from '../meter.js';
 import { currentRemote } from '../placement.js';
 import { listFiles } from '../pack.js';
 import { citationsIn } from '../prompts.js';
-import type { Citation, KnowledgeUnit } from '../types.js';
+import type { Citation, KnowledgeUnit, PageCitation } from '../types.js';
 import { AGENT_BRIEF, agentMaxSteps, armBrief } from './agents.js';
 import { catalogGuide } from '../../mcp/catalog-guide.js';
 import { questionKindGuide } from '../../mcp/question-kinds.js';
-import { WIKI_SOURCES_HAS, wikiWithSources } from './llm-wiki.js';
+import { WIKI_FIRST_HAS, WIKI_SOURCES_HAS, wikiWithSources } from './llm-wiki.js';
 import { recordAgent, shimClient, SystemEnv, SystemUnderTest } from './types.js';
 import { evalTempDir } from '../tmp.js';
 import { startToolHost, ToolHost } from '../toolhost.js';
@@ -69,6 +69,8 @@ interface KnodeState {
   hosts: Map<string, Promise<ToolHost>>;
   /** wiki page path → the corpus documents it was generated from. */
   pageSources: Map<string, string[]>;
+  /** wiki page path → the documents a citation of it stands for (`pageCitationDocuments`). */
+  pageCited: Map<string, string[]>;
 }
 
 const states = new Map<string, KnodeState>();
@@ -140,7 +142,7 @@ function workspaceOf(env: SystemEnv): string {
 function stateFor(env: SystemEnv): KnodeState {
   let s = states.get(env.workDir);
   if (!s) {
-    s = { ws: workspaceOf(env), placement: env.evalRoot ?? null, workDir: env.workDir, ctx: null, closing: null, hosts: new Map(), pageSources: new Map() };
+    s = { ws: workspaceOf(env), placement: env.evalRoot ?? null, workDir: env.workDir, ctx: null, closing: null, hosts: new Map(), pageSources: new Map(), pageCited: new Map() };
     states.set(env.workDir, s);
   }
   return s;
@@ -420,6 +422,7 @@ function withoutModel(client: LlmClient): LlmClient {
 
 function readPageSources(s: KnodeState): void {
   s.pageSources.clear();
+  s.pageCited.clear();
   const wiki = path.join(s.ws, 'wiki');
   for (const rel of listFiles(wiki).filter((f) => f.endsWith('.md'))) {
     const raw = fs.readFileSync(path.join(wiki, rel), 'utf8');
@@ -429,7 +432,37 @@ function readPageSources(s: KnodeState): void {
     const cited = [...raw.matchAll(/raw\/docs\/[^\s)\]'"`，。]+/g)].map((m) => m[0]);
     const docs = [...new Set([...declared, ...cited].filter((p) => p.startsWith('raw/docs/')).map((p) => p.slice('raw/docs/'.length)))];
     s.pageSources.set(`wiki/${rel}`, docs);
+    s.pageCited.set(`wiki/${rel}`, pageCitationDocuments(`wiki/${rel}`, declared, cited));
   }
+}
+
+const inCorpus = (paths: readonly string[]) => [...new Set(paths.filter((p) => p.startsWith('raw/docs/')).map((p) => p.slice('raw/docs/'.length)))];
+
+/**
+ * The documents a citation of a generated page stands for (docs/design/38 §7, E6), from the page's frontmatter and
+ * lines: what it declares it was made from — a summary page's `source:`, the `knode.inputs.documents` of its
+ * frontmatter — else, for a page that declares none (an entity page's inputs are the entity, its claims and
+ * relations, its deps in the build), the documents its lines cite, each line naming the document its claim came
+ * from. A navigation page (an index, the log, the overview) stands for none: it lists documents without stating
+ * anything from them.
+ */
+export function pageCitationDocuments(page: string, declared: readonly string[], cited: readonly string[]): string[] {
+  if (NAVIGATION_PAGE.test(page)) return [];
+  const made = inCorpus(declared);
+  return made.length ? made : inCorpus(cited);
+}
+
+/** A `wiki/<page>.md` path in an answer, where it is not part of a longer path (`raw/docs/wiki/…` is a document). */
+const PAGE_PATH = /(?<![\w./-])wiki\/[^\s)\]'"`，。,;；、]+?\.md(?![\w.-])/gu;
+
+/**
+ * The wiki pages an answer cites — in `[doc: …]` or as bare paths, as `citationsIn` reads documents — each with
+ * the corpus documents it stands for (`pageCited`, from `pageCitationDocuments`), kept to the documents of the
+ * corpus (`known`). A page the build does not have stands for none.
+ */
+export function pageCitationsIn(text: string, pageCited: ReadonlyMap<string, readonly string[]>, known: ReadonlySet<string>): PageCitation[] {
+  const pages = [...new Set([...text.matchAll(PAGE_PATH)].map((m) => m[0]))];
+  return pages.map((page) => ({ page, docs: (pageCited.get(page) ?? []).filter((d) => known.has(d)) }));
 }
 
 /**
@@ -835,11 +868,8 @@ export function agentKnode(): SystemUnderTest {
         });
         recordAgent(env.meter, { system: 'agent-knode', stage: 'agent', task: task.id }, env.models.model, r);
         const docs = new Set(env.staged.docs.map((d) => d.path));
-        const citations = [...new Set([
-          ...citationsIn(r.text, docs).map((c) => c.doc),
-          ...[...r.text.matchAll(/wiki\/[^\s)\]'"`，。]+\.md/g)].flatMap((m) => toCorpus(s, m[0])),
-        ])].map((doc) => ({ doc }));
-        return { text: r.text, citations, toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, closing: r.closing, leaked: r.leaked, error: r.error };
+        // the pages its tools named, each by the documents it stands for (docs/design/38 E6)
+        return { text: r.text, citations: citationsIn(r.text, docs), pageCitations: pageCitationsIn(r.text, s.pageCited, docs), toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, closing: r.closing, leaked: r.leaked, error: r.error };
       } finally {
         tmp.cleanup();
       }
@@ -883,7 +913,20 @@ export function agentKnodeWiki(): SystemUnderTest {
 }
 
 export function agentKnodeWikiSources(): SystemUnderTest {
-  return knodeSystem('agent-knode-wiki-sources', 'Codex agent reading the knode-generated wiki and the sources', 'agent', true, {
+  return wikiAndSourcesArm('agent-knode-wiki-sources', 'Codex agent reading the knode-generated wiki and the sources', KNODE_WIKI_SOURCES_HAS);
+}
+
+/**
+ * `agent-knode-wiki-first` (docs/design/38 §5.2): arm C's folder, build and brief, but for the sentence saying what
+ * it has (`KNODE_WIKI_FIRST_HAS`), which lets it answer from a page that states the fact and its source and cite
+ * the page. The two arms' difference is that permission alone. Run only when named.
+ */
+export function agentKnodeWikiFirst(): SystemUnderTest {
+  return wikiAndSourcesArm('agent-knode-wiki-first', 'Codex agent answering from the knode-generated wiki where it can, with the sources beside it', KNODE_WIKI_FIRST_HAS);
+}
+
+function wikiAndSourcesArm(id: string, label: string, has: string): SystemUnderTest {
+  return knodeSystem(id, label, 'agent', true, {
     async answer(task, prompt, env) {
       const s = stateFor(env);
       await env.quota.wait();
@@ -896,13 +939,15 @@ export function agentKnodeWikiSources(): SystemUnderTest {
           model: env.models.model,
           effort: env.models.answerEffort,
           maxSteps: agentMaxSteps(),
-          prompt: `${armBrief(KNODE_WIKI_SOURCES_HAS)}\n\n${prompt}`,
+          prompt: `${armBrief(has)}\n\n${prompt}`,
         });
-        recordAgent(env.meter, { system: 'agent-knode-wiki-sources', stage: 'agent', task: task.id }, env.models.model, r);
+        recordAgent(env.meter, { system: id, stage: 'agent', task: task.id }, env.models.model, r);
         const docs = new Set(env.staged.docs.map((d) => d.path));
         return {
           text: r.text,
           citations: citationsIn(r.text, docs),
+          // the pages it cited, each by the documents it stands for (docs/design/38 E6)
+          pageCitations: pageCitationsIn(r.text, s.pageCited, docs),
           retrieved: [...new Set(r.filesTouched.flatMap((f) => toCorpus(s, f)))],
           toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs,
           capped: r.capped,
@@ -933,6 +978,9 @@ export const KNODE_FULL_TOOLS = ['knode_search', 'knode_graph_search', 'knode_cl
  * same, at the same cost).
  */
 export const KNODE_WIKI_SOURCES_HAS = WIKI_SOURCES_HAS('wiki/, generated pages; wiki/sources/ holds one summary per document', 'raw/docs/', 'wiki/index.md');
+
+/** `agent-knode-wiki-first`'s sentence: arm C's folder, named the same way, with leave to answer from the pages. */
+export const KNODE_WIKI_FIRST_HAS = WIKI_FIRST_HAS('wiki/, generated pages; wiki/sources/ holds one summary per document', 'raw/docs/', 'wiki/index.md');
 
 export const AGENT_KNODE_FULL_HAS = `${KNODE_WIKI_SOURCES_HAS} You also have knode's retrieval tools (on the MCP server knode) over an index built from the same documents: ${KNODE_FULL_TOOLS.join(', ')}. Their results name documents as raw/docs/<path> and pages as wiki/<page>, the paths of the current directory. A tool call counts against the budget as a command does.`;
 
@@ -970,13 +1018,12 @@ export function agentKnodeFull(): SystemUnderTest {
         });
         recordAgent(env.meter, { system: 'agent-knode-full', stage: 'agent', task: task.id }, env.models.model, r);
         const docs = new Set(env.staged.docs.map((d) => d.path));
-        const citations = [...new Set([
-          ...citationsIn(r.text, docs).map((c) => c.doc),
-          ...[...r.text.matchAll(/wiki\/[^\s)\]'"`，。]+\.md/g)].flatMap((m) => toCorpus(s, m[0])),
-        ])].map((doc) => ({ doc }));
         return {
           text: r.text,
-          citations,
+          citations: citationsIn(r.text, docs),
+          // the pages it cited, each by the documents it stands for (docs/design/38 E6); before 2026-11-24 they were
+          // folded into `citations`, each as every document it names
+          pageCitations: pageCitationsIn(r.text, s.pageCited, docs),
           retrieved: [...new Set(r.filesTouched.flatMap((f) => toCorpus(s, f)))],
           toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs,
           capped: r.capped,

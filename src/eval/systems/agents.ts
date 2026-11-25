@@ -1,6 +1,8 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { isolatedCopy, runAgent } from '../agent.js';
 import type { StagedCorpus } from '../pack.js';
+import type { CorpusDoc } from '../types.js';
 import { recordAgent, SystemEnv, SystemUnderTest } from './types.js';
 
 /**
@@ -66,10 +68,50 @@ export function stagedRepository(staged: Pick<StagedCorpus, 'docs'>): string | n
 /** Arm A's sentence on a repository: the session's working tree is the repository at its base commit. */
 export const GREP_HAS_REPOSITORY = (name: string) => `The current directory is the code repository ${name}: its files as of one commit, without git history.`;
 
+/**
+ * The catalog `agent-grep-catalog` finds beside the sources (docs/design/38 §5.2): one line per staged document — its
+ * path, and the title and date the pack's corpus metadata (`corpus.jsonl`) gives it, blank where it gives none.
+ * Written from that metadata alone, never by a model, and from nothing of the pack's gold, holdout or tasks: what
+ * it adds to arm A is a table of contents, so that an arm whose files have hashed names
+ * (`real-mudabench`'s `reports/en/88ee6102cbb1.md`) can find a company's report without knode's compiled pages.
+ */
+export function catalogText(docs: readonly Pick<CorpusDoc, 'path' | 'title' | 'date'>[]): string {
+  const cell = (s: string | undefined) => (s ?? '').replace(/\s+/g, ' ').replace(/\|/g, '\\|').trim();
+  const rows = [...docs].sort((a, b) => a.path.localeCompare(b.path)).map((d) => `| ${cell(d.path)} | ${cell(d.title)} | ${cell(d.date)} |`);
+  return ['# Catalog of the source documents', '', '| path | title | date |', '| --- | --- | --- |', ...rows, ''].join('\n');
+}
+
+/** The catalog's file name: `CATALOG.md`, unless the corpus has a document of that name at its root. */
+export function catalogFile(docs: readonly Pick<CorpusDoc, 'path'>[]): string {
+  const taken = new Set(docs.map((d) => d.path));
+  let name = 'CATALOG.md';
+  for (let i = 2; taken.has(name); i++) name = `CATALOG-${i}.md`;
+  return name;
+}
+
+/** `agent-grep-catalog`'s sentence: arm A's, and one more saying what the catalog is. */
+export const GREP_CATALOG_HAS = (file = 'CATALOG.md') => `${GREP_HAS} ${file} lists every document, one per line, with its path, title and date (taken from the collection's metadata).`;
+
 export function agentGrep(): SystemUnderTest {
+  return grepArm('agent-grep', 'Codex agent with grep over the sources', false);
+}
+
+/**
+ * `agent-grep-catalog` (docs/design/38 §5.2): arm A's folder and brief, and a catalog file beside the sources
+ * (`catalogText`), so that what a wiki adds as a table of contents is told apart from what it adds as compiled
+ * knowledge. Not on a repository: its catalog would be its file list. Run only when named.
+ */
+export function agentGrepCatalog(): SystemUnderTest {
   return {
-    id: 'agent-grep',
-    label: 'Codex agent with grep over the sources',
+    ...grepArm('agent-grep-catalog', 'Codex agent with grep over the sources and a catalog of them', true),
+    applicable: (_pack, staged) => !staged || stagedRepository(staged) === null,
+  };
+}
+
+function grepArm(id: 'agent-grep' | 'agent-grep-catalog', label: string, catalog: boolean): SystemUnderTest {
+  return {
+    id,
+    label,
     group: 'agent-grep',
     kind: 'agent',
     answers: true,
@@ -78,18 +120,24 @@ export function agentGrep(): SystemUnderTest {
       // a fresh copy per question: nothing one session leaves behind reaches the next
       const copy = isolatedCopy(env.staged.dir, 'corpus');
       // a repository is the session's working tree, as it is for a coding agent (docs/design/37 §3)
-      const repo = stagedRepository(env.staged);
+      const repo = catalog ? null : stagedRepository(env.staged);
+      // the catalog of the documents staged now: an update batch's among them once it is applied
+      const file = catalog ? catalogFile(env.staged.docs) : null;
       try {
+        if (file) fs.writeFileSync(path.join(copy.dir, file), catalogText(env.staged.docs));
+        const has = file ? GREP_CATALOG_HAS(file) : repo ? GREP_HAS_REPOSITORY(repo) : GREP_HAS;
         const r = await runAgent({
           cwd: repo ? path.join(copy.dir, 'codebase', repo) : copy.dir,
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
           maxSteps: agentMaxSteps(),
-          prompt: `${armBrief(repo ? GREP_HAS_REPOSITORY(repo) : GREP_HAS)}\n\n${prompt}`,
+          prompt: `${armBrief(has)}\n\n${prompt}`,
         });
-        recordAgent(env.meter, { system: 'agent-grep', stage: 'agent', task: task.id }, env.models.model, r);
-        return { text: r.text, retrieved: repo ? r.filesTouched.map((f) => `codebase/${repo}/${f}`) : r.filesTouched, toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, closing: r.closing, leaked: r.leaked, error: r.error };
+        recordAgent(env.meter, { system: id, stage: 'agent', task: task.id }, env.models.model, r);
+        // the catalog is no document read
+        const touched = r.filesTouched.filter((f) => f !== file);
+        return { text: r.text, retrieved: repo ? touched.map((f) => `codebase/${repo}/${f}`) : touched, toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, closing: r.closing, leaked: r.leaked, error: r.error };
       } finally {
         copy.cleanup();
       }

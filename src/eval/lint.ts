@@ -310,7 +310,7 @@ export function abstainInCorpus(pack: LoadedPack, threshold = ABSENT_COVERAGE): 
 /* ------------------------------ checks against a run ------------------------------ */
 
 /** What a check against a run reads of an answer record (answers.jsonl). */
-export interface RunAnswer { system: string; taskId: string; text?: string; finalAnswer?: string; citations?: { doc: string }[] }
+export interface RunAnswer { system: string; taskId: string; text?: string; finalAnswer?: string; citations?: { doc: string }[]; pageCitations?: { docs: string[] }[] }
 /** What it reads of a score record (scores.jsonl). */
 export interface RunScore { system: string; taskId: string; metric: string; value: number | null }
 
@@ -349,7 +349,8 @@ export function abstainAnswered(pack: LoadedPack, answers: RunAnswer[], scores: 
       return v !== undefined ? v === 0 : !declines(a.finalAnswer ?? extractFinalAnswer(a.text ?? ''));
     });
     const cites = new Map<string, Set<string>>();
-    for (const a of answered) for (const c of a.citations ?? []) (cites.get(c.doc) ?? cites.set(c.doc, new Set()).get(c.doc)!).add(a.system);
+    // the documents it named and those the pages it cited stand for (docs/design/38 E6), as citation scores count them
+    for (const a of answered) for (const doc of new Set([...(a.citations ?? []).map((c) => c.doc), ...(a.pageCitations ?? []).flatMap((p) => p.docs)])) (cites.get(doc) ?? cites.set(doc, new Set()).get(doc)!).add(a.system);
     const top = [...cites].sort((x, y) => y[1].size - x[1].size || x[0].localeCompare(y[0]))[0];
     if (!top || top[1].size < minSystems) continue;
     const systems = [...new Set(list.map((a) => a.system))].sort();

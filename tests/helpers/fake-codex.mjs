@@ -99,6 +99,29 @@ process.stdin.on('end', async () => {
     answer = `updated ${files.length} source pages`;
   } else {
     answer = '林晓在澜舟科技担任高级数据工程师 [doc: email/2026-03-05.md]。\nFinal answer: 高级数据工程师';
+    // FAKE_CODEX_CITE_PAGE: a session told it may answer from the pages cites a page that names the email instead
+    // (its summary, else an entity page), and mentions the index
+    if (process.env.FAKE_CODEX_CITE_PAGE && prompt.includes('you may answer from the page')) {
+      const page = ['sources', 'entities'].flatMap((d) => {
+        const dir = path.join(cwd, 'wiki', d);
+        return fs.existsSync(dir) ? fs.readdirSync(dir).sort().filter((f) => f !== 'index.md' && fs.readFileSync(path.join(dir, f), 'utf8').includes('email/2026-03-05.md')).map((f) => `wiki/${d}/${f}`) : [];
+      })[0];
+      if (page) answer = `林晓在澜舟科技担任高级数据工程师 [doc: ${page}]（索引见 wiki/index.md）。\nFinal answer: 高级数据工程师`;
+    }
+  }
+  // FAKE_CODEX_CWD_LOG: each session's folder as one JSON line — its files, and its catalog when it has one
+  if (process.env.FAKE_CODEX_CWD_LOG && !ingest) {
+    const files = [];
+    const walk = (rel) => {
+      for (const e of fs.readdirSync(path.join(cwd, rel), { withFileTypes: true })) {
+        const r = rel ? `${rel}/${e.name}` : e.name;
+        if (e.isDirectory()) walk(r);
+        else files.push(r);
+      }
+    };
+    if (fs.existsSync(cwd)) walk('');
+    const catalog = path.join(cwd, 'CATALOG.md');
+    fs.appendFileSync(process.env.FAKE_CODEX_CWD_LOG, `${JSON.stringify({ prompt: prompt.slice(0, 120), files: files.sort(), catalog: fs.existsSync(catalog) ? fs.readFileSync(catalog, 'utf8') : null })}\n`);
   }
   emit({ type: 'item.completed', item: { type: 'agent_message', text: answer } });
   emit({ type: 'turn.completed', usage: { input_tokens: 1200, cached_input_tokens: 800, output_tokens: 60, reasoning_output_tokens: 10 } });
