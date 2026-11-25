@@ -291,8 +291,18 @@ const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 
 export function questionRange(question: string): QuestionRoute['range'] {
   const q = question;
   const monthOf = (name: string) => String(MONTHS.indexOf(name.toLowerCase()) + 1).padStart(2, '0');
+  const day = (y: string, mo: string, d: string) => `${y}-${mo.padStart(2, '0')}-${d.padStart(2, '0')}`;
+  // a day bounding the window, before the month forms read its month as the window: "从启动到2026年5月1日为止" is
+  // everything up to that day, not May 2026 (which left the timeline questions of the reports packs with no claim)
+  const ZH_DAY = String.raw`(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]`;
+  let m = new RegExp(`${ZH_DAY}\\s*(?:至|到|-|—|~)\\s*${ZH_DAY}`).exec(q);
+  if (m) return parse(`${day(m[1], m[2], m[3])}..${day(m[4], m[5], m[6])}`, m[0]);
+  m = new RegExp(`(?:截至|截止(?:到|至)?|到|至|直到|为止)\\s*${ZH_DAY}|${ZH_DAY}\\s*(?:为止|之前|以前|前)`).exec(q);
+  if (m) return parse(`..${m[1] ? day(m[1], m[2], m[3]) : day(m[4], m[5], m[6])}`, m[0]);
+  m = new RegExp(`(?:自|从)\\s*${ZH_DAY}\\s*(?:以来|起|开始)|${ZH_DAY}\\s*(?:以来|之后|以后|起)`).exec(q);
+  if (m) return parse(`${m[1] ? day(m[1], m[2], m[3]) : day(m[4], m[5], m[6])}..`, m[0]);
   // Chinese forms first: they carry their own markers
-  let m = /(\d{4})\s*年\s*(\d{1,2})\s*月?\s*(?:至|到|-|—|~)\s*(\d{4})\s*年\s*(\d{1,2})\s*月/.exec(q);
+  m = /(\d{4})\s*年\s*(\d{1,2})\s*月?\s*(?:至|到|-|—|~)\s*(\d{4})\s*年\s*(\d{1,2})\s*月/.exec(q);
   if (m) return parse(`${m[1]}-${m[2].padStart(2, '0')}..${m[3]}-${m[4].padStart(2, '0')}`, m[0]);
   m = /(\d{4})\s*年?\s*(?:至|到|-|—|~)\s*(\d{4})\s*年/.exec(q);
   if (m) return parse(`${m[1]}..${m[2]}`, m[0]);
@@ -308,6 +318,12 @@ export function questionRange(question: string): QuestionRoute['range'] {
     return parse(token, m[0]);
   }
   // English
+  const EN_DAY = `(${MONTHS.join('|')})\\s+(\\d{1,2})(?:st|nd|rd|th)?,?\\s+(\\d{4})|(\\d{4})-(\\d{2})-(\\d{2})`;
+  const enDay = (x: RegExpExecArray, at: number) => (x[at] ? day(x[at + 2], monthOf(x[at]), x[at + 1]) : day(x[at + 3], x[at + 4], x[at + 5]));
+  m = new RegExp(`\\b(?:until|through|as of|up to|by|before)\\s+(?:${EN_DAY})`, 'i').exec(q);
+  if (m) return parse(`..${enDay(m, 1)}`, m[0]);
+  m = new RegExp(`\\b(?:since|after|from)\\s+(?:${EN_DAY})`, 'i').exec(q);
+  if (m && !/\b(?:to|until|through)\s+\w/i.test(q.slice(m.index + m[0].length, m.index + m[0].length + 12))) return parse(`${enDay(m, 1)}..`, m[0]);
   m = /\bbetween\s+(\d{4})(?:-(\d{2}))?\s+and\s+(\d{4})(?:-(\d{2}))?\b/i.exec(q);
   if (m) return parse(`${m[1]}${m[2] ? `-${m[2]}` : ''}..${m[3]}${m[4] ? `-${m[4]}` : ''}`, m[0]);
   m = /\bfrom\s+(\d{4})\s+(?:to|until|through)\s+(\d{4})\b/i.exec(q);

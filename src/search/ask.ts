@@ -7,7 +7,9 @@ import { graphSearch } from '../graph/query.js';
 import { EXCERPT_CHARS, excerptsForQuestion, isListQuestion } from './excerpts.js';
 import { factsForQuestion, namedEntities, namedSurface, QuestionFact } from './facts.js';
 import { search, SearchMode } from './search.js';
-import { EnumeratedClaim, Enumeration, enumerateClaims, typesInQuestion } from './enumerate.js';
+import { EnumeratedClaim, Enumeration, enumerateClaims, subjectTimelines, typesInQuestion } from './enumerate.js';
+import { asksForValue, metricTerms, rowExcerpts } from './rows.js';
+import { namedSubjects, Subject, subjectPassages } from './subjects.js';
 import { ComputedSet, computeClaimSet, SET_BUDGET_MS } from './claimset.js';
 import { secondRound } from './second.js';
 import { asksLatest, newestSources } from './newest.js';
@@ -56,6 +58,12 @@ export interface AskRoute {
   widened?: { documents: number; chars: number };
   /** For a question asking for the latest state: the newest sources about what it names, put first (search/newest.ts). */
   newest?: { path: string; date: string | null }[];
+  /** For a question naming several things, or one in several years: how many it names, how many the passages held every document asked of, and the passages added for the rest (search/subjects.ts). */
+  subjects?: { named: number; covered: number; added: number; concepts: number; chars: number };
+  /** For a question asking for a value: the documents whose lines naming its metric were added, and their characters (search/rows.ts). */
+  rows?: { documents: number; chars: number; terms: string[] };
+  /** For a timeline: the subjects' folded chronologies (claims matched, entries, entries listed, subjects whose entries were ranked to fit). */
+  timeline?: { subjects: number; matched: number; entries: number; listed: number; ranked: number };
 }
 
 const ASK_SYSTEM = `You answer questions from a personal knowledge base. You are given retrieved context chunks, each tagged [n] with its path and, when known, its source's date — one marked "excerpt" holds only the lines of its document that name what the question asks about, one marked "widened" holds more of its document than the search returned (the parts are in document order; "[…]" marks a gap) — and optionally a "Known facts" list: claims extracted from the whole knowledge base, each tagged [n] too, with its date and the document it comes from. The facts reach documents the chunks do not; a question that asks for every case, a list or a history is answered from both.
@@ -211,6 +219,10 @@ export async function ask(
     widen?: boolean;
     /** false: no newest sources for a question asking for the latest state (search/newest.ts). */
     newest?: boolean;
+    /** false: no passage for each subject a question names that the passages hold no document of (search/subjects.ts). */
+    subjects?: boolean;
+    /** false: no lines naming the metric of a question asking for a value (search/rows.ts). */
+    rows?: boolean;
   } = {},
 ): Promise<AskResult> {
   const router = { ...defaultAskRouterConfig(), ...config.retrieval.router };
@@ -228,13 +240,13 @@ export async function ask(
     ? { kind: opts.route, range: questionRange(question), by: 'caller' }
     : await routeQuestion(question, { classifier: router.classifier, llm });
   // a set, a count or a value as of a date is computed from the claims, whichever route answers the rest
-  const named = await namedEntities(store, question);
+  const [named, subjects] = await Promise.all([namedEntities(store, question), namedSubjects(store, question).catch(() => [] as Subject[])]);
   const computing = opts.computed ?? router.computedSets === true;
   const spent: SpentBudget = {};
   const computed = computing && (routed.kind === 'list' || routed.kind === 'aggregate' || routed.kind === 'lookup')
     ? await computeSet(store, question, routed, named, opts.now, router, spent)
     : null;
-  const env: RouteEnv = { store, config, embedder, llm, question, opts, queryVector, router, routed, named, computed, spent };
+  const env: RouteEnv = { store, config, embedder, llm, question, opts, queryVector, router, routed, named, subjects, computed, spent };
 
   if (routed.kind === 'list' || routed.kind === 'aggregate' || routed.kind === 'timeline') {
     const enumerated = await enumeratedAnswer(env);
@@ -251,12 +263,14 @@ interface RouteEnv {
   embedder: EmbeddingProvider;
   llm: LlmClient;
   question: string;
-  opts: { k?: number; mode?: SearchMode; facts?: number; excerpts?: number; track?: boolean; second?: boolean; computed?: boolean; now?: string; widen?: boolean; newest?: boolean };
+  opts: { k?: number; mode?: SearchMode; facts?: number; excerpts?: number; track?: boolean; second?: boolean; computed?: boolean; now?: string; widen?: boolean; newest?: boolean; subjects?: boolean; rows?: boolean };
   queryVector: number[] | undefined;
   router: ReturnType<typeof defaultAskRouterConfig>;
   routed: QuestionRoute;
   /** The entities the question names (`namedEntities`). */
   named: string[];
+  /** The things it names, in its order, each with the entities merged into it (`namedSubjects`). */
+  subjects: Subject[];
   /** The set the claims gave, when the question asks for one. */
   computed: ComputedSet | null;
   /** Filled when a set was asked for and its time budget ran out. */
@@ -305,15 +319,24 @@ async function enumeratedAnswer(env: RouteEnv): Promise<AskResult | null> {
   const limit = Math.max(1, router.enumerateLimit);
   // a timeline lists the subject's changes: a value restated in later reports is one fact with its dates, not a
   // fact per report, so the limit holds the history rather than its first weeks (graph/claim-timeline.ts)
-  const query = { entities: named, types, range: routed.range, includeSuperseded: timeline, order: 'timeline' as const, limit, fold: timeline };
-  let enumeration = await enumerateClaims(store, query);
+  // a list or a count lists the claims matching the question best (in date order), not the first by date
+  const rank = timeline ? undefined : { question, queryVector, model: embedder.model };
+  const query = { entities: named, types, range: routed.range, includeSuperseded: timeline, order: 'timeline' as const, limit, fold: timeline, rank };
+  // a timeline lists each named subject's folded chronology (knode_claims order=timeline), the subjects sharing the limit
+  const subjectIds = env.subjects.filter((s) => !s.concept).map((s) => s.id);
+  const [first, chronology] = await Promise.all([
+    enumerateClaims(store, query),
+    timeline && subjectIds.length ? subjectTimelines(store, subjectIds, { range: routed.range, limit, question }).catch(() => null) : Promise.resolve(null),
+  ]);
+  let enumeration = first;
   let usedTypes = types;
   // a type the question seems to name, but no claim of it about these entities: every type
   if (enumeration.matched === 0 && types.length > 0 && named.length > 0) {
     enumeration = await enumerateClaims(store, { ...query, types: [] });
     usedTypes = [];
   }
-  if (enumeration.matched === 0) return null;
+  const folded = chronology && chronology.claims.length > 0 ? chronology : null;
+  if (enumeration.matched === 0 && !folded) return null;
 
   // the passages: a short search, not the top eight, and the lines of the named entities' other documents
   const k = Math.min(opts.k ?? 8, 4);
@@ -331,14 +354,15 @@ async function enumeratedAnswer(env: RouteEnv): Promise<AskResult | null> {
     return (!routed.range.from || d >= routed.range.from.slice(0, 10)) && (!routed.range.to || d <= routed.range.to.slice(0, 10));
   };
   const relevant = ranked.filter(inRange);
-  const enumerated = new Set(enumeration.claims.map((c) => c.id));
+  const listedClaims = folded ? folded.claims : enumeration.claims;
+  const enumerated = new Set(listedClaims.map((c) => c.id));
 
   let facts: PromptFact[];
   if (timeline) {
     // one chronology: the enumerated claims and the ranked facts the enumeration does not hold, oldest first
     const dateOf = (f: PromptFact) => f.date ?? f.eventDate ?? f.startDate ?? null;
     const extra = relevant.filter((f) => !enumerated.has(f.id)).slice(0, Math.ceil(limit / 4));
-    facts = [...enumeration.claims, ...extra]
+    facts = [...listedClaims, ...extra]
       .map((f, i) => ({ f, i }))
       .sort((a, b) => {
         const da = dateOf(a.f);
@@ -356,14 +380,18 @@ async function enumeratedAnswer(env: RouteEnv): Promise<AskResult | null> {
     const tail = relevant.slice(head.length).filter((f) => !enumerated.has(f.id));
     facts = [...head, ...rest, ...tail].slice(0, limit);
   }
-  const byId = new Map<string, EnumeratedClaim>(enumeration.claims.map((c) => [c.id, c]));
+  const byId = new Map<string, EnumeratedClaim>(listedClaims.map((c) => [c.id, c]));
   facts = facts.map((f) => byId.get(f.id) ?? f);
 
   const contexts = [...retrieved, ...excerpts];
   const listed = facts.filter((f) => enumerated.has(f.id)).length;
-  const heading = `Known facts (enumerated: ${listed} of ${enumeration.capped ? 'at least ' : ''}${enumeration.matched} matching claims listed${routed.range ? `, ${routed.range.text}` : ''})`;
-  return compose(env, contexts, [...facts, ...currentFacts(contexts, facts)], renderCounts(enumeration, routed.kind), routeOf(routed, {
+  const heading = folded
+    ? `Known facts (enumerated: the timeline of ${folded.subjects === 1 ? 'what the question names' : `the ${folded.subjects} things the question names`}, ${listed} of ${folded.entries} entries listed, from ${folded.matched} matching claims; a value restated in later reports is one entry${routed.range ? `, ${routed.range.text}` : ''})`
+    : `Known facts (enumerated: ${listed} of ${enumeration.capped ? 'at least ' : ''}${enumeration.matched} matching claims listed${routed.range ? `, ${routed.range.text}` : ''})`;
+  const counts = enumeration.matched > 0 ? renderCounts(enumeration, routed.kind) : '';
+  return compose(env, contexts, [...facts, ...currentFacts(contexts, facts)], counts, routeOf(routed, {
     enumerated: { matched: enumeration.matched, listed, documents: enumeration.documents, capped: enumeration.capped, types: usedTypes, entities: named.length },
+    ...(chronology ? { timeline: { subjects: chronology.subjects, matched: chronology.matched, entries: chronology.entries, listed: folded ? listed : 0, ranked: chronology.ranked } } : {}),
   }), heading);
 }
 
@@ -448,6 +476,9 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
   }));
 }
 
+/** What of a passage the prompt shows: the first `ASK_CONTEXT_CHARS`, a widened passage up to its cap. */
+const shownOf = (c: SearchResult) => c.content.slice(0, c.widened ? PASSAGE_MAX + 1 : ASK_CONTEXT_CHARS);
+
 /** A passage's header in the prompt: its path, its source's date, and what it is (newest, excerpt, widened). */
 export function passageLabel(c: SearchResult): string {
   const parts = [c.path];
@@ -475,6 +506,19 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
       routed = { ...routed, newest: newest.map((c) => ({ path: c.path, date: c.docDate ?? null })) };
     }
   }
+  // a question naming several things, or one thing in several years: a passage of each one's own documents (of each
+  // year asked) the passages hold none of
+  if (env.opts.subjects !== false && env.subjects.length > 0) {
+    const own = await subjectPassages(env.store, question, env.subjects, contexts, { queryVector: env.queryVector, model: env.embedder.model }).catch(() => null);
+    if (own) {
+      if (own.passages.length) {
+        const firstExcerpt = contexts.findIndex((c) => c.excerpt);
+        const at = firstExcerpt < 0 ? contexts.length : firstExcerpt;
+        contexts = [...contexts.slice(0, at), ...own.passages, ...contexts.slice(at)];
+      }
+      if (own.named > 1 || own.added > 0) routed = { ...routed, subjects: { named: own.named, covered: own.covered, added: own.added, concepts: own.concepts, chars: own.chars } };
+    }
+  }
   if (!computed && routedFirst.kind !== 'timeline' && (env.opts.second ?? env.router.secondRound !== false)) {
     const more = await secondRound(env.store, question, {
       named: env.named, contexts, facts: ranked, chain: routedFirst.kind === 'multihop' || isChainQuestion(question),
@@ -492,6 +536,16 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
     if (wide && wide.documents > 0) {
       contexts = wide.contexts;
       routed = { ...routed, widened: { documents: wide.documents, chars: wide.chars } };
+    }
+  }
+  // a question asking for a value: the lines of the documents in hand that name its metric (a filing is 87,000
+  // characters, a passage 1,500, and the passage the search returned was the heading or the other period's table)
+  if (env.opts.rows !== false && asksForValue(question)) {
+    const names = env.subjects.filter((s) => !s.concept).map((s) => s.text);
+    const rows = await rowExcerpts(env.store, question, contexts, { names, visible: shownOf }).catch(() => []);
+    if (rows.length) {
+      contexts = [...contexts, ...rows];
+      routed = { ...routed, rows: { documents: rows.length, chars: rows.reduce((n, r) => n + r.content.length, 0), terms: metricTerms(question, names) } };
     }
   }
   // the computed set's rows lead the facts; what else was ranked follows, without repeating them
@@ -525,7 +579,7 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
     };
   }
 
-  const contextBlock = contexts.map((c, i) => `[${i + 1}] (${passageLabel(c)})\n${c.content.slice(0, c.widened ? PASSAGE_MAX + 1 : ASK_CONTEXT_CHARS)}`).join('\n\n');
+  const contextBlock = contexts.map((c, i) => `[${i + 1}] (${passageLabel(c)})\n${shownOf(c)}`).join('\n\n');
   const raw = await llm.complete([
     { role: 'system', content: system },
     { role: 'user', content: `# Context\n${contextBlock}${renderFacts(facts, contexts.length + 1, heading)}${extra}\n\n# Question\n${question}` },

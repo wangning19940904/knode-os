@@ -1,8 +1,8 @@
-import { Store } from '../store/db.js';
+import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { Params, toDateString } from '../store/temporal.js';
-import { sourcesOf } from '../store/claims.js';
+import { ClaimRecord, queryClaims, sourcesOf } from '../store/claims.js';
 import { foldTimeline } from '../graph/claim-timeline.js';
-import { QuestionFact } from './facts.js';
+import { pickRelevant, QuestionFact } from './facts.js';
 
 /**
  * Every claim matching a question's entities, claim types and time window
@@ -82,6 +82,13 @@ export interface EnumerateQuery {
    * claim carries `repeats`. The counts still cover every match.
    */
   fold?: boolean;
+  /**
+   * List the claims that match the question best rather than the oldest: every match is read (up to `SCAN_CAP`),
+   * ranked by the question's terms and, where a claim has an embedding of the question's model, by its nearness
+   * (facts.ts `pickRelevant`, a few per source in turn), and the `limit` best are listed in date order. Without it
+   * a hub entity's list was its first 150 claims by date, whatever the question asked about. Not with `fold`.
+   */
+  rank?: { question: string; queryVector?: number[]; model?: string };
 }
 
 export interface EnumeratedClaim extends QuestionFact {
@@ -178,7 +185,7 @@ interface Row {
   id: string; subject: string; object: string | null; type: string; statement: string; status: string; kind: string;
   valid_from: string | Date | null; valid_to: string | Date | null; event_at: string | Date | null; path: string | null;
   evidence_count: number; chunk_id: string | null; superseded_by: string | null; eff: string | Date | null;
-  attribute: string | null; value: string | null; unit: string | null;
+  attribute: string | null; value: string | null; unit: string | null; sim?: number | null;
 }
 
 export async function enumerateClaims(store: Store, q: EnumerateQuery): Promise<Enumeration> {
@@ -188,8 +195,15 @@ export async function enumerateClaims(store: Store, q: EnumerateQuery): Promise<
   const limit = Math.min(Math.max(q.limit ?? 150, 1), 1000);
   const order = q.order === 'recent' ? 'eff DESC NULLS LAST, id' : 'eff ASC NULLS LAST, id';
   const fold = q.fold === true && q.order !== 'recent';
-  const [scanned, counts] = await Promise.all([
-    store.query<Row>(`WITH ${m.sql} SELECT * FROM m ORDER BY ${order} LIMIT ${fold ? SCAN_CAP : limit}`, m.p.list),
+  const rank = !fold && q.rank ? q.rank : null;
+  // the counts read the match's parameters alone; the list adds the question's vector to them
+  const base = [...m.p.list];
+  // the question's nearness, for the ranked list: read off the claims' own embeddings, no call
+  const sim = rank?.queryVector && rank.model
+    ? `(SELECT 1 - (ce.embedding <=> ${m.p.add(toVectorLiteral(rank.queryVector))}::${VECTOR_TYPE}) FROM claim_embeddings ce WHERE ce.claim_id = m.id AND ce.model = ${m.p.add(rank.model)})`
+    : 'NULL::float';
+  const [read, counts] = await Promise.all([
+    store.query<Row>(`WITH ${m.sql} SELECT m.*, ${sim} AS sim FROM m ORDER BY ${order} LIMIT ${fold || rank ? SCAN_CAP : limit}`, m.p.list),
     store.query<{ dim: string; label: string | null; n: number }>(
       `WITH ${m.sql}
        SELECT 'month' AS dim, to_char(eff, 'YYYY-MM') AS label, count(*)::int AS n FROM m WHERE eff IS NOT NULL GROUP BY 2
@@ -197,10 +211,16 @@ export async function enumerateClaims(store: Store, q: EnumerateQuery): Promise<
        UNION ALL SELECT 'subject', subject, count(*)::int FROM m GROUP BY 2
        UNION ALL SELECT 'documents', NULL, count(DISTINCT COALESCE(document_id, path))::int FROM m
        UNION ALL SELECT 'total', NULL, count(*)::int FROM m`,
-      m.p.list,
+      base,
     ),
   ]);
-  const total = counts.find((c) => c.dim === 'total')?.n ?? scanned.length;
+  // ranked: the best `limit`, shown in the order asked for (the scan's)
+  let scanned = read;
+  if (rank && read.length > limit) {
+    const picked = new Set(pickRelevant(rank.question, read, limit, { sim: (r) => r.sim, named: () => true }));
+    scanned = read.filter((r) => picked.has(r));
+  }
+  const total = counts.find((c) => c.dim === 'total')?.n ?? read.length;
   const group = (dim: string, byCount: boolean): [string, number][] => counts
     .filter((c) => c.dim === dim && c.label !== null)
     .map((c) => [c.label!, c.n] as [string, number])
@@ -229,4 +249,100 @@ export async function enumerateClaims(store: Store, q: EnumerateQuery): Promise<
     byType: group('type', true),
     bySubject: group('subject', true),
   };
+}
+
+/** Readings of a measurement series shown in its entry at most. */
+const READINGS_SHOWN = 12;
+
+export interface SubjectTimelines {
+  /** The entries listed, oldest first: each a change, a restated value said once, or a series with its readings. */
+  claims: EnumeratedClaim[];
+  /** Claims matched before folding, and the entries they folded into, over every subject. */
+  matched: number;
+  entries: number;
+  /** Subjects read, and those whose entries were more than their share: these list the ones matching the question best. */
+  subjects: number;
+  ranked: number;
+}
+
+/** A timeline entry as a fact the prompt lists: a series carries its readings in its statement. */
+function timelineFact(c: ClaimRecord): EnumeratedClaim {
+  const readings = c.readings?.length
+    ? ` — readings: ${c.readings.slice(0, READINGS_SHOWN).map((r) => `${r.date ?? '?'} ${r.value ?? '?'}`).join('; ')}${c.readings.length > READINGS_SHOWN ? `; … (${c.readings.length} in all)` : ''}`
+    : '';
+  return {
+    id: c.id, subject: c.subject, object: c.object, type: c.type, statement: `${c.statement}${readings}`, status: c.status, kind: c.kind,
+    startDate: toDateString(c.validFrom), endDate: toDateString(c.validTo), eventDate: toDateString(c.eventAt),
+    path: c.sourcePath, evidenceCount: c.evidenceCount, chunkId: null,
+    date: c.date, superseded: c.superseded, sources: c.sources, attribute: c.attribute, value: c.value,
+    ...(c.repeats && c.repeats.count > 1 && !c.readings ? { repeats: c.repeats } : {}),
+  };
+}
+
+/**
+ * `limit` shared among lists of these sizes: each list gets an equal share, and what a shorter list leaves goes to
+ * the longer ones (a setting's six changes beside its team's three hundred entries: the six, and the rest to the team).
+ */
+export function fillShares(sizes: number[], limit: number): number[] {
+  const out = sizes.map(() => 0);
+  let left = Math.max(0, limit);
+  const order = sizes.map((n, i) => ({ n, i })).sort((a, b) => a.n - b.n || a.i - b.i);
+  order.forEach(({ n, i }, k) => {
+    const give = Math.min(n, Math.floor(left / (order.length - k)));
+    out[i] = give;
+    left -= give;
+  });
+  // what the floor left over, one each to the lists that can take it, in their order
+  for (let i = 0; left > 0 && i < sizes.length; i++) if (out[i] < sizes[i]) { out[i]++; left--; }
+  return out;
+}
+
+/**
+ * The chronology of each subject a timeline question names, as `knode_claims order="timeline" related=true` gives
+ * it (store/claims.ts): dated by the claim's own event or validity before its sources' dates, superseded values
+ * included, a value restated in later reports folded into the entry where it first appeared, a measurement series
+ * one entry with its readings, and the claims about the subject's parts and members and with it as the object.
+ * The subjects share `limit` entries (`fillShares`); a subject with more than its share lists those matching the question best,
+ * still in date order. Ask's own enumeration dated a restated "still open" by its newest restatement and listed the
+ * first 150 claims by that date.
+ */
+export async function subjectTimelines(
+  store: Store,
+  subjects: string[],
+  opts: { range?: { from: string | null; to: string | null } | null; limit: number; question: string },
+): Promise<SubjectTimelines> {
+  const out: SubjectTimelines = { claims: [], matched: 0, entries: 0, subjects: 0, ranked: 0 };
+  if (subjects.length === 0) return out;
+  const eventRange = opts.range ? { from: opts.range.from, to: opts.range.to } : undefined;
+  const results = await Promise.all(subjects.map((subject) =>
+    queryClaims(store, { subject, related: true, order: 'timeline', eventRange, limit: 500 }).catch(() => null)));
+  // each subject's entries, an entry listed once (a claim about two subjects is the first's)
+  const seen = new Set<string>();
+  const lists = results.map((r) => {
+    const claims = (r?.claims ?? []).filter((c) => !seen.has(c.id));
+    for (const c of claims) seen.add(c.id);
+    return { r, claims };
+  }).filter((x) => x.r && x.claims.length > 0);
+  const shares = fillShares(lists.map((x) => x.claims.length), opts.limit);
+  for (const [i, { r, claims: all }] of lists.entries()) {
+    out.subjects++;
+    out.matched += r!.matched;
+    out.entries += r!.entries;
+    let claims = all;
+    const share = shares[i];
+    if (claims.length > share) {
+      out.ranked++;
+      const picked = new Set(pickRelevant(opts.question, claims.map((c) => ({ ...c, path: c.sourcePath })), share, { named: () => true }).map((c) => c.id));
+      claims = claims.filter((c) => picked.has(c.id));
+    }
+    for (const c of claims) out.claims.push(timelineFact(c));
+  }
+  // one chronology over the subjects, undated last
+  out.claims = out.claims.map((c, i) => ({ c, i })).sort((a, b) => {
+    const [da, db] = [a.c.date, b.c.date];
+    if (da && db && da !== db) return da < db ? -1 : 1;
+    if (!da !== !db) return da ? -1 : 1;
+    return a.i - b.i;
+  }).map((x) => x.c);
+  return out;
 }

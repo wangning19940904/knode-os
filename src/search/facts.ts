@@ -5,6 +5,7 @@ import { Params, relationSourceSql, toDateString } from '../store/temporal.js';
 import { ClaimItem, SearchResult } from '../types.js';
 import { RECENCY_TERMS } from './newest.js';
 import { entityMatchSql, keywordTerms, termCount } from './search.js';
+import { SUBJECTS_MAX } from './subjects.js';
 
 /**
  * The claims an answer is given beside its retrieved chunks.
@@ -50,10 +51,21 @@ export interface FactOptions {
   named?: string[];
 }
 
-/** Entities named in a question at most: past these it is a paragraph, not a question. */
-const NAMED_MAX = 6;
+/**
+ * Entities named in a question at most: past these it is a pasted paragraph, not a question. Not what bounds a
+ * question naming many things — "these nine companies" names nine — which is what each route's budget does: the
+ * facts' `limit`, the passages' characters (search/subjects.ts). It was six, and a comparison of nine companies
+ * lost three of them before it was asked.
+ */
+const NAMED_MAX = SUBJECTS_MAX;
 /** Claims read per route. A company in a finance workspace has thousands; the newest are the ones asked about. */
 const ROUTE_CAP = 300;
+/**
+ * Claims about one named entity read at least, when the question names several: the route's claims are shared
+ * among them (each its newest `ROUTE_CAP / n`, at least this many), not the newest of all, which one company's
+ * week of filings could fill.
+ */
+const ROUTE_PER_NAMED = 60;
 /** A named entity with at most this many candidate claims is a specific thing the question asks about (`factsForQuestion`). */
 const SPECIFIC_MAX = 30;
 /** Claims taken from one source before every other source has had its turn. */
@@ -125,20 +137,24 @@ export async function factsForQuestion(store: Store, question: string, contexts:
   if (chunkIds.length === 0 && named.length === 0) return [];
 
   const withVector = Boolean(opts.queryVector && opts.model);
-  const params: unknown[] = [named, chunkIds, ROUTE_CAP];
+  // each named entity its share of the route: the newest of them all would be one company's
+  const perNamed = Math.max(Math.ceil(ROUTE_CAP / Math.max(1, named.length)), ROUTE_PER_NAMED);
+  const params: unknown[] = [named, chunkIds, ROUTE_CAP, perNamed];
   let sim = 'NULL::float';
   const vector = withVector ? { literal: toVectorLiteral(opts.queryVector!), model: opts.model! } : null;
   if (vector) {
     params.push(vector.literal, vector.model);
-    sim = simOf('$4', '$5');
+    sim = simOf('$5', '$6');
   }
   // via: 0 named by the question, 1 about an entity a retrieved chunk mentions, 2 extracted from a retrieved chunk
   const [rows, listed] = await Promise.all([
     store.query<Row>(
       `WITH cand AS (
-         (SELECT cl.id, 0 AS via FROM claims cl WHERE cl.subject_id = ANY($1::text[]) AND ${LIVE_CLAIM} ORDER BY cl.tx_from DESC LIMIT $3)
+         (SELECT x.id, 0 AS via FROM unnest($1::text[]) AS n(id)
+          CROSS JOIN LATERAL (SELECT cl.id FROM claims cl WHERE cl.subject_id = n.id AND ${LIVE_CLAIM} ORDER BY cl.tx_from DESC LIMIT $4) x)
          UNION ALL
-         (SELECT cl.id, 0 AS via FROM claims cl WHERE cl.object_id = ANY($1::text[]) AND ${LIVE_CLAIM} ORDER BY cl.tx_from DESC LIMIT $3)
+         (SELECT x.id, 0 AS via FROM unnest($1::text[]) AS n(id)
+          CROSS JOIN LATERAL (SELECT cl.id FROM claims cl WHERE cl.object_id = n.id AND ${LIVE_CLAIM} ORDER BY cl.tx_from DESC LIMIT $4) x)
          UNION ALL
          (SELECT cl.id, 1 AS via FROM claims cl
           WHERE cl.subject_id IN (SELECT DISTINCT m.entity_id FROM entity_mentions m WHERE m.chunk_id = ANY($2::text[])) AND ${LIVE_CLAIM}
