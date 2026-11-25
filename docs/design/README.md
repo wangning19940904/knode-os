@@ -50,6 +50,7 @@ built, which later record replaced parts of it, and what in it is stale.
 | 35 | [Evaluation workspaces: a run's knowledge bases open in the app](35-evaluation-workspaces.md) | Stages 1 and 2 built and merged (396fe1e); stages 3 and 4 not built | §8 |
 | 36 | [Evaluation protocol: what the next run must show, decided before it runs](36-evaluation-protocol.md) | Prepared 2026-11-21; pilot and run not started | §8 |
 | 37 | [Behaviour pages for code, kept true by diffs, and an evaluation that asks where a change lands](37-behaviour-pages-and-localization-eval.md) | Stopped 2026-11-22 at the failed stage-1 gate (grep F1 0.86 on 60 plain codex tasks): stage 0 built, stages 2 and 4 not built, no further pack planned; stage 3 built and reviewed | §8, §5.4 |
+| 39 | [Table facts: every cell of the statement tables, typed and queryable](39-table-facts.md) | Built on its branch behind `extraction.tableFacts` (off by default), not merged; model path stub-tested only | — |
 
 ## Reading order for a newcomer
 

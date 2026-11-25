@@ -7,7 +7,7 @@
 
 import type { TrustTier } from './trust.js';
 
-export type ScopeKind = 'doc' | 'wiki-human' | 'tier1' | 'page' | 'datasource' | 'dataset' | 'dream' | 'absence' | 'merge' | 'claim-merge' | 'lint' | 'backref';
+export type ScopeKind = 'doc' | 'wiki-human' | 'tier1' | 'tables' | 'page' | 'datasource' | 'dataset' | 'dream' | 'absence' | 'merge' | 'claim-merge' | 'lint' | 'backref';
 export type ScopeStatus = 'applying' | 'active' | 'disposed';
 export type DisposeReason = 'removed' | 'replaced' | 'archived' | 'purge';
 
@@ -106,4 +106,6 @@ export interface WriterStats {
   citations: number;
   /** Relation predicates that matched nothing in the ontology and fell back to related_to. */
   unknownPredicates: number;
+  /** Table fact rows written (src/tables, a `tables` scope). */
+  tableFacts?: number;
 }

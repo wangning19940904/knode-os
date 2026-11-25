@@ -14,8 +14,11 @@ describe('schema v7/v8/v10/v11/v12/v13/v14/v15/v16/v17/v18/v19/v20 (wiki researc
     fs.mkdirSync(path.join(tmp, 'ws', '.knode'), { recursive: true });
     const store = await Store.open(path.join(tmp, 'ws'), 3);
     try {
-      expect(SCHEMA_VERSION).toBe(21);
-      expect(store.migration.to).toBe(21);
+      expect(SCHEMA_VERSION).toBe(22);
+      expect(store.migration.to).toBe(22);
+      // v22: table facts and their label keys (src/tables), and the catalog view over them
+      expect(await store.query(`SELECT count(*)::int AS n FROM v_table_facts`)).toEqual([{ n: 0 }]);
+      expect(await store.query(`SELECT count(*)::int AS n FROM table_label_keys`)).toEqual([{ n: 0 }]);
       // every foreign key a disposal fires, the merged-entity lookup of the fold, and the
       // document side of derived co-occurrence (v13) have an index to use
       const indexes = (await store.query<{ indexname: string }>(`SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()`)).map((r) => r.indexname);

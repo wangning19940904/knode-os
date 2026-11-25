@@ -33,6 +33,8 @@ import { Store } from './db.js';
 
 export const CATALOG_SOURCE = 'catalog';
 
+const TABLE_FACTS_VIEW = 'every cell of the statement tables in raw/docs (extraction.tableFacts): source_path, line and ref (path#Lline), subject (the report\'s company), doc_period, table_no / table_title, section, label (as written) and label_key (normalized: revenue, accounts_payable …), period (the column header as written), period_key (an ISO date, a year, 2024-Q1, or current / prior / change), period_span (3M, 12M …), value_num (as written) and value_text, unit, scale (its wording as written: 单位：元, in thousands) and scale_factor, value_scaled = value_num × scale_factor, parser (pipe | text | llm), confidence';
+
 export const CATALOG_VIEWS: { name: string; description: string }[] = [
   { name: 'v_documents', description: 'indexed sources: path, root (docs/skills/wiki), kind (source/view), sha, status' },
   { name: 'v_entities', description: 'currently believed entities with mention and evidence counts' },
@@ -54,7 +56,11 @@ export const CATALOG_VIEWS: { name: string; description: string }[] = [
   { name: 'v_entity_links', description: 'entities merged into a canonical one (same_as), with who decided and why' },
   { name: 'v_claim_links', description: 'claims merged into a representative claim (same_as / contains), with who decided, why and how sure' },
   { name: 'v_research_jobs', description: 'deep-research jobs: what page was requested, which agent ran it, outcome' },
+  { name: 'v_table_facts', description: TABLE_FACTS_VIEW },
 ];
+
+/** Views listed only where their feature is on (an empty view is still readable, so SQL written against it never fails). */
+export const OPTIONAL_CATALOG_VIEWS: ReadonlySet<string> = new Set(['v_table_facts']);
 
 const VIEW_NAMES = new Set(CATALOG_VIEWS.map((v) => v.name));
 const DEFAULT_MAX_ROWS = 200;

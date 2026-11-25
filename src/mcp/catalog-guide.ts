@@ -39,11 +39,16 @@ export const CATALOG_EXAMPLES: { question: string; sql: string }[] = [
   },
 ];
 
+/** The table facts view (src/tables), listed only where `extraction.tableFacts` is on. */
+export const TABLE_FACTS_VIEW_COLUMNS =
+  'v_table_facts(source_path, line, ref, subject, doc_period, table_no, table_title, section, label, label_key, period, period_key, period_span, value_num, value_text, unit, scale, scale_factor, value_scaled, parser, confidence) — every cell of the statement tables in raw/docs: label as written and label_key normalized (revenue, total_assets, accounts_payable …), period the column header as written and period_key an ISO date / year / 2024-Q1 / current / prior, value_num as written with scale (its wording, e.g. 单位：万元, in thousands) and scale_factor; value_scaled = value_num × scale_factor; ref = path#Lline. knode_table reads a metrics × companies × periods matrix from it in one call';
+
 /** The guide as one block of text. */
-export function catalogGuide(): string {
+export function catalogGuide(opts: { tableFacts?: boolean } = {}): string {
   return [
     'Catalog views (source="catalog": Postgres SQL, one SELECT / WITH, read-only, row-capped; knode_datasources lists every view):',
     ...CATALOG_VIEW_COLUMNS.map((v) => `- ${v}`),
+    ...(opts.tableFacts ? [`- ${TABLE_FACTS_VIEW_COLUMNS}`] : []),
     'Join an entity to its claims by v_claims.subject_id (or object_id) = v_entities.id; match names with ILIKE. Examples:',
     ...CATALOG_EXAMPLES.map((e, i) => `${i + 1}. ${e.question}: ${e.sql}`),
   ].join('\n');
