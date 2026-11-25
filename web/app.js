@@ -5235,7 +5235,7 @@ async function loadGraph(q) {
     graphState.query = q;
     graphState.loaded = true;
     $('#graph-q').value = q;
-    g.load(res.nodes, res.edges, { mode: graphState.mode });
+    g.load(res.nodes, res.edges, { mode: graphState.mode, communities: res.communities ?? [] });
     paintGraphLegend(res);
     renderGraphSide(null);
   } catch (e) {
@@ -5243,11 +5243,13 @@ async function loadGraph(q) {
   }
 }
 
-function paintGraphCaption({ nodes, edges }) {
+function paintGraphCaption({ nodes, edges, clusters = 0 }) {
   const what = graphState.mode === 'search'
     ? `local graph · “${graphState.query}” · ${$('#graph-depth').value} hops · ranked by relevance`
     : `overview · top ${graphState.settings.limit} by mentions`;
-  $('#graph-caption').textContent = `${what} · ${nodes} nodes · ${edges} edges`;
+  $('#graph-caption').textContent = `${what} · ${nodes} nodes · ${edges} edges${clusters ? ` · ${clusters} clusters` : ''}`;
+  // the side panel lists the clusters while nothing is selected
+  if (graphState.res && !graphState.graph?.selected && !graphState.graph?.selectedEdge) renderGraphSide(null);
 }
 
 /** A short line in a relation family's colour and pattern, built as SVG nodes (the page allows no inline style). */
@@ -5479,7 +5481,13 @@ function renderGraphSide(node, edge = null) {
       nb.addEventListener('mouseleave', () => g.setHover(null));
     }
   } else {
-    side.innerHTML = res.nodes.slice(0, 30).map((n) => `<div class="entity-card pick" data-id="${esc(n.id)}">
+    // the islands on the canvas, largest first: a click brings one into view
+    const clusters = g.clusters();
+    const clusterRow = clusters.length
+      ? `<p class="eyebrow">clusters</p><div class="legend-row graph-clusters">${clusters.map((c) =>
+        `<button class="chip" data-cluster="${c.id}" title="show this cluster">${esc(c.label.length > 22 ? `${c.label.slice(0, 21)}…` : c.label)} · ${c.size}</button>`).join('')}</div>`
+      : '';
+    side.innerHTML = clusterRow + res.nodes.slice(0, 30).map((n) => `<div class="entity-card pick" data-id="${esc(n.id)}">
         ${pill(n.type)} <span class="ename">${esc(n.name)}</span>
         <div class="hint">${esc((n.description || '').slice(0, 140))}</div>
         <div class="hint mono">${esc(numbers(n))}</div>${facts(n, 3)}
@@ -5489,6 +5497,7 @@ function renderGraphSide(node, edge = null) {
       wireOpenLinks(side);
     }
     for (const card of side.querySelectorAll('.entity-card.pick')) card.addEventListener('click', () => { g.select(card.dataset.id); g.focus(card.dataset.id); });
+    for (const chip of side.querySelectorAll('[data-cluster]')) chip.addEventListener('click', () => g.fitCluster(Number(chip.dataset.cluster)));
   }
   for (const p of side.querySelectorAll('.tpill')) p.style.color = entityColor(p.dataset.type);
 }

@@ -25,6 +25,8 @@ struct GraphSettings: Codable, Equatable {
     var pin = false
     /// Coronas round the nodes, light-blended relations and particles along a focused node's relations.
     var glow = true
+    /// Lay the reply's communities out as islands, each in a disc of its own.
+    var cluster = true
     var center = 0.06
     var repel = 180.0
     var linkDistance = 90.0
@@ -33,7 +35,7 @@ struct GraphSettings: Codable, Equatable {
     static let nodeCounts = [50, 100, 150, 200, 300, 400]
 
     enum CodingKeys: String, CodingKey {
-        case limit, hiddenTypes, hiddenRelations, hideOrphans, cooccur, minWeight, nodeSize, linkWidth, textFade, arrows, pin, glow, center, repel, linkDistance
+        case limit, hiddenTypes, hiddenRelations, hideOrphans, cooccur, minWeight, nodeSize, linkWidth, textFade, arrows, pin, glow, cluster, center, repel, linkDistance
     }
 
     init() {}
@@ -60,6 +62,7 @@ struct GraphSettings: Codable, Equatable {
         arrows = try c.decodeIfPresent(Bool.self, forKey: .arrows) ?? defaults.arrows
         pin = try c.decodeIfPresent(Bool.self, forKey: .pin) ?? defaults.pin
         glow = try c.decodeIfPresent(Bool.self, forKey: .glow) ?? defaults.glow
+        cluster = try c.decodeIfPresent(Bool.self, forKey: .cluster) ?? defaults.cluster
         center = try c.decodeIfPresent(Double.self, forKey: .center) ?? defaults.center
         repel = try c.decodeIfPresent(Double.self, forKey: .repel) ?? defaults.repel
         linkDistance = try c.decodeIfPresent(Double.self, forKey: .linkDistance) ?? defaults.linkDistance
@@ -79,6 +82,11 @@ struct GraphSettings: Codable, Equatable {
         limit != old.limit || (overview && cooccur != old.cooccur)
     }
 
+    /// Changes to where the islands are and how large: whether there are any, and the two settings their discs are sized by.
+    func islandsDiffer(from old: GraphSettings) -> Bool {
+        cluster != old.cluster || linkDistance != old.linkDistance || nodeSize != old.nodeSize
+    }
+
     /// Changes to which nodes and edges the reply shows.
     func filtersDiffer(from old: GraphSettings) -> Bool {
         hiddenTypes != old.hiddenTypes || hiddenRelations != old.hiddenRelations || hideOrphans != old.hideOrphans
@@ -95,6 +103,11 @@ struct GraphSettings: Codable, Equatable {
  * nodes fold into one `Bundle`: one line on the canvas, one edge to click,
  * one neighbour in the side panel; the layout still pulls along every
  * relation (`linkSpecs`).
+ *
+ * With `settings.cluster` the reply's communities in view are `islands`: each
+ * a disc of its own on the plane, placed as the web graph places them
+ * (web/graph.js `placeIslands`, `packIslands`), so both front ends show the
+ * same groups in the same places.
  */
 struct GraphScene {
     struct Neighbour {
@@ -132,9 +145,38 @@ struct GraphScene {
         static func id(_ x: String, _ y: String) -> String { x < y ? "\(x)|\(y)" : "\(y)|\(x)" }
     }
 
+    /**
+     * A community in view, as the layout and the canvas see it: a disc at
+     * `x`, `y` large enough for its nodes at the layout's spacing. The nodes
+     * that belong to no community share one, `id` −1, which is laid out but
+     * not drawn.
+     */
+    struct Island: Identifiable, Equatable {
+        let id: Int
+        /// In the reply's order, so the most mentioned seed the middle.
+        let nodeIDs: [String]
+        /// The member the island is named after; none for the island of nodes in no community.
+        let hub: String?
+        let label: String
+        var radius: Double
+        var x = 0.0
+        var y = 0.0
+
+        /// Drawn as a disc with a title, and listed in the side panel.
+        var isCommunity: Bool { id >= 0 }
+    }
+
+    /// Room between two islands, and how much of an island's disc its nodes' own discs fill.
+    static let islandGap = 44.0
+    static let islandFill = 0.3
+
     private(set) var nodes: [GraphNode] = []
     private(set) var edges: [GraphEdge] = []
     private(set) var byID: [String: GraphNode] = [:]
+    /// Largest first, the nodes of no community last; empty when `cluster` is off or there are not two communities to tell apart.
+    private(set) var islands: [Island] = []
+    /// Node id → index into `islands`.
+    private(set) var islandIndex: [String: Int] = [:]
     /// Position in the service's ranking, what seeds the layout.
     private(set) var rank: [String: Int] = [:]
     /// One per neighbour, strongest first.
@@ -197,9 +239,100 @@ struct GraphScene {
             neighbours[bundle.b, default: []].append(Neighbour(node: a, edge: bundle.primary, outgoing: false, bundle: bundle))
         }
         for key in neighbours.keys { neighbours[key]?.sort { $0.bundle.weight > $1.bundle.weight } }
-        largest = Set(nodes.sorted { degree(of: $0) > degree(of: $1) }.prefix(12).map(\.id))
+        placeIslands(communities: response.communities ?? [], settings: settings)
+        // the twelve largest keep their label however far out the view is; an island's hub is named by the island's title instead
+        let hubs = Set(islands.compactMap(\.hub))
+        largest = Set(nodes.filter { !hubs.contains($0.id) }.sorted { degree(of: $0) > degree(of: $1) }.prefix(12).map(\.id))
         let logs = nodes.map { log1p(Double(degree(of: $0))) }
         if let lo = logs.min(), let hi = logs.max() { logDegrees = lo...hi }
+    }
+
+    /// The communities drawn, largest first.
+    var communities: [Island] { islands.filter(\.isCommunity) }
+
+    func island(of id: String) -> Island? {
+        islandIndex[id].map { islands[$0] }
+    }
+
+    /**
+     * One island per community with a node in view, and one for the nodes of
+     * no community, each sized for its nodes and placed by `packIslands`.
+     */
+    private mutating func placeIslands(communities: [GraphCommunity], settings: GraphSettings) {
+        guard settings.cluster else { return }
+        var groups: [Int: [GraphNode]] = [:]
+        var order: [Int] = []
+        for node in nodes {
+            let id = node.community ?? -1
+            if groups[id] == nil { order.append(id) }
+            groups[id, default: []].append(node)
+        }
+        guard order.filter({ $0 >= 0 }).count >= 2 else { return }
+        let named = Dictionary(communities.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let stretch = (settings.linkDistance / GraphSettings().linkDistance).squareRoot()
+        var made: [Island] = order.map { id in
+            let members = groups[id] ?? []
+            let area = members.reduce(0.0) { sum, node in
+                let spacing = radius(of: node, nodeSize: settings.nodeSize) + 3
+                return sum + spacing * spacing
+            }
+            var hub: GraphNode?
+            if id >= 0 {
+                hub = members.first { $0.id == named[id]?.hub }
+                    ?? members.dropFirst().reduce(members[0]) { best, node in degree(of: node) > degree(of: best) ? node : best }
+            }
+            return Island(id: id, nodeIDs: members.map(\.id), hub: hub?.id, label: hub?.name ?? "", radius: (area / Self.islandFill).squareRoot() * stretch + 12)
+        }
+        // the nodes of no community go last, to the outside
+        made.sort { a, b in
+            if a.isCommunity != b.isCommunity { return a.isCommunity }
+            if a.nodeIDs.count != b.nodeIDs.count { return a.nodeIDs.count > b.nodeIDs.count }
+            return a.id < b.id
+        }
+        Self.packIslands(&made)
+        islands = made
+        for (i, island) in made.enumerated() {
+            for id in island.nodeIDs { islandIndex[id] = i }
+        }
+    }
+
+    /**
+     * Put islands, in the order given, on the plane without overlap: the first
+     * in the middle, every next one at the nearest free spot to the middle,
+     * tried ring by ring from an angle of its own. The plane is squashed to
+     * suit a wide canvas, and the whole is centred on the origin. The same
+     * steps as web/graph.js `packIslands`.
+     */
+    static func packIslands(_ islands: inout [Island], gap: Double = islandGap) {
+        guard !islands.isEmpty else { return }
+        for i in islands.indices {
+            islands[i].x = 0
+            islands[i].y = 0
+            guard i > 0 else { continue }
+            let own = islands[i].radius
+            var ring = 1
+            search: while true {
+                let d = Double(ring) * 14
+                let steps = max(16, Int((d / 8).rounded()))
+                for step in 0..<steps {
+                    let a = Double(i) * 2.39996 + Double(step) / Double(steps) * .pi * 2
+                    let x = cos(a) * d
+                    let y = sin(a) * d * 0.7
+                    if islands[..<i].allSatisfy({ hypot($0.x - x, $0.y - y) >= $0.radius + own + gap }) {
+                        islands[i].x = x
+                        islands[i].y = y
+                        break search
+                    }
+                }
+                ring += 1
+            }
+        }
+        let cx = ((islands.map { $0.x - $0.radius }.min() ?? 0) + (islands.map { $0.x + $0.radius }.max() ?? 0)) / 2
+        let cy = ((islands.map { $0.y - $0.radius }.min() ?? 0) + (islands.map { $0.y + $0.radius }.max() ?? 0)) / 2
+        for i in islands.indices {
+            islands[i].x -= cx
+            islands[i].y -= cy
+        }
     }
 
     func degree(of node: GraphNode) -> Int {
@@ -310,8 +443,13 @@ struct GraphScene {
 
     func nodeSpecs(nodeSize: Double) -> [GraphSimulation.NodeSpec] {
         nodes.map { node in
-            .init(id: node.id, rank: rank[node.id] ?? 0, degree: degree(of: node), radius: radius(of: node, nodeSize: nodeSize))
+            .init(id: node.id, rank: rank[node.id] ?? 0, degree: degree(of: node), radius: radius(of: node, nodeSize: nodeSize), island: islandIndex[node.id])
         }
+    }
+
+    /// The islands as the layout takes them, in `islands`' order: what `NodeSpec.island` indexes.
+    var islandSpecs: [GraphSimulation.IslandSpec] {
+        islands.map { .init(x: $0.x, y: $0.y, radius: $0.radius) }
     }
 
     var linkSpecs: [GraphSimulation.LinkSpec] {

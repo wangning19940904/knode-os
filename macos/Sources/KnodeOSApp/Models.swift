@@ -793,6 +793,18 @@ struct GraphNode: Decodable, Hashable, Identifiable {
     /// Live typed relations across the whole graph, not only the ones in view; absent from older services.
     var degree: Int?
     var wikiPath: String?
+    /// Index into the reply's `communities`; absent for a node linked to nothing in the reply, and from older services.
+    var community: Int? = nil
+}
+
+/// A group of nodes linked to each other more than to the rest of a graph read: what the view draws as an island.
+struct GraphCommunity: Decodable, Hashable, Identifiable {
+    /// Its position in the reply's list: largest first.
+    var id: Int
+    var size: Int
+    /// The member with the most relations: its id, and its name as the community's label.
+    var hub: String
+    var label: String
 }
 
 struct GraphEdge: Decodable, Hashable, Identifiable {
@@ -812,6 +824,8 @@ struct GraphResponse: Decodable {
     var edges: [GraphEdge]
     var chunks: [SearchResult]
     var claims: [Claim]?
+    /// The nodes' communities; absent from older services, which then draw as one layout.
+    var communities: [GraphCommunity]? = nil
 }
 
 struct GraphInsights: Decodable {

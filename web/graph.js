@@ -13,7 +13,13 @@
  * nodes draw as one edge in the colour and line pattern of the most specific
  * one's family, and a click on the edge lists them all; the `glow` setting
  * adds a corona around each node, light-blended edges and particles that flow
- * along a focused node's edges. The Mac app draws the same (GraphRenderer.swift). */
+ * along a focused node's edges. The Mac app draws the same (GraphRenderer.swift).
+ *
+ * With the `cluster` setting the reply's communities (src/graph/communities.ts)
+ * are laid out as islands: each community settles inside a disc of its own,
+ * its hub's name above it, and only the relations inside an island pull, so the view
+ * reads as groups of things that belong together and the lines between them.
+ * The Mac app places and draws the same islands (GraphScene.swift). */
 'use strict';
 
 const GRAPH_FONT = '-apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif';
@@ -30,10 +36,15 @@ class KnodeGraph {
   /** Display preferences, persisted by the app; the keys and the force values are shared with the Mac app. */
   static DEFAULTS = Object.freeze({
     limit: 150, hiddenTypes: [], hiddenRelations: [], hideOrphans: false, cooccur: true, minWeight: 0,
-    nodeSize: 1, linkWidth: 1, textFade: 1, arrows: false, pin: false, glow: true,
+    nodeSize: 1, linkWidth: 1, textFade: 1, arrows: false, pin: false, glow: true, cluster: true,
     center: 0.06, repel: 180, linkDistance: 90,
   });
   static FORCE_KEYS = ['center', 'repel', 'linkDistance'];
+  /** Settings the islands are placed by: they move where every node is headed. */
+  static ISLAND_KEYS = ['cluster', 'linkDistance'];
+  /** Room between two islands, and how much of an island's disc its nodes' own discs fill. */
+  static ISLAND_GAP = 44;
+  static ISLAND_FILL = 0.3;
   static FILTER_KEYS = ['hiddenTypes', 'hiddenRelations', 'hideOrphans', 'cooccur', 'minWeight'];
   static available = typeof d3 !== 'undefined' && d3 !== null;
 
@@ -105,6 +116,42 @@ class KnodeGraph {
     return bundles;
   }
 
+  /**
+   * Put islands (`{ R }`, in the order given: largest first) on the plane
+   * without overlap, each at `x`, `y`: the first in the middle, every next
+   * one at the nearest free spot to the middle, tried ring by ring from an
+   * angle of its own. The plane is squashed to suit a wide canvas, and the
+   * whole is centred on the origin.
+   */
+  static packIslands(islands, gap = KnodeGraph.ISLAND_GAP) {
+    const placed = [];
+    islands.forEach((is, i) => {
+      is.x = 0;
+      is.y = 0;
+      for (let ring = placed.length ? 1 : 0, free = !placed.length; !free; ring++) {
+        const d = ring * 14;
+        const steps = Math.max(16, Math.round(d / 8));
+        for (let step = 0; step < steps && !free; step++) {
+          const a = i * 2.39996 + (step / steps) * Math.PI * 2;
+          const x = Math.cos(a) * d, y = Math.sin(a) * d * 0.7;
+          if (placed.every((p) => Math.hypot(p.x - x, p.y - y) >= p.R + is.R + gap)) {
+            is.x = x;
+            is.y = y;
+            free = true;
+          }
+        }
+      }
+      placed.push(is);
+    });
+    if (!placed.length) return;
+    const cx = (Math.min(...placed.map((p) => p.x - p.R)) + Math.max(...placed.map((p) => p.x + p.R))) / 2;
+    const cy = (Math.min(...placed.map((p) => p.y - p.R)) + Math.max(...placed.map((p) => p.y + p.R))) / 2;
+    for (const p of placed) {
+      p.x -= cx;
+      p.y -= cy;
+    }
+  }
+
   /** A relation's type as it reads in the panel and on the canvas. */
   static relationName(l) {
     return l.co ? 'co-occurs' : l.type.replace(/_/g, ' ');
@@ -125,6 +172,10 @@ class KnodeGraph {
     this.widths = new Map();
 
     this.all = { nodes: [], edges: [] };
+    /** The reply's communities, by id (src/graph/communities.ts). */
+    this.communities = new Map();
+    /** The communities in view as islands, largest first; empty when `cluster` is off or there are not two to tell apart. */
+    this.islands = [];
     /** Every node object this view has ever placed, by id: a refilter keeps positions. */
     this.byId = new Map();
     this.nodes = [];
@@ -154,6 +205,19 @@ class KnodeGraph {
       .force('x', d3.forceX(0))
       .force('y', d3.forceY(0))
       .force('collide', d3.forceCollide().iterations(1))
+      // an island keeps its nodes inside its disc: hubs push the rest out to the rim, the rim holds them
+      .force('island', () => {
+        for (const n of this.nodes) {
+          const is = n.island;
+          if (!is) continue;
+          const dx = n.x + n.vx - is.x, dy = n.y + n.vy - is.y;
+          const d = Math.hypot(dx, dy), reach = Math.max(0, is.R - n.spacing);
+          if (d <= reach || !d) continue;
+          const pull = ((d - reach) / d) * 0.3;
+          n.vx -= dx * pull;
+          n.vy -= dy * pull;
+        }
+      })
       .on('tick', () => this.invalidate())
       .stop();
     this.applyForces();
@@ -251,15 +315,16 @@ class KnodeGraph {
   /* -------------------------------- data -------------------------------- */
 
   /** Show a graph read: nodes as the server ranked them, so hubs seed the centre. */
-  load(nodes, edges, { mode = 'overview' } = {}) {
+  load(nodes, edges, { mode = 'overview', communities = [] } = {}) {
     this.mode = mode;
     this.all = { nodes: nodes.map((n, rank) => ({ ...n, rank })), edges: edges.map((e) => ({ ...e })) };
+    this.communities = new Map(communities.map((c) => [c.id, c]));
     this.byId.clear();
     this.hover = null;
     this.selected = null;
     this.matches = null;
     this.applyFilter(1);
-    this.resetView();
+    this.homeView();
   }
 
   /** The visible subset under the current filters; positions carry over, so a toggle does not scatter the view. */
@@ -284,7 +349,7 @@ class KnodeGraph {
         // a spiral by rank: the most mentioned sit in the middle from the first frame
         const a = n.rank * 2.39996;
         const r = 14 * Math.sqrt(n.rank);
-        o = { ...n, x: Math.cos(a) * r, y: Math.sin(a) * r, vx: 0, vy: 0, fx: null, fy: null };
+        o = { ...n, x: Math.cos(a) * r, y: Math.sin(a) * r, vx: 0, vy: 0, fx: null, fy: null, fresh: true };
         this.byId.set(n.id, o);
       }
       return o;
@@ -320,7 +385,7 @@ class KnodeGraph {
     this.sim.nodes(this.nodes);
     this.sim.force('link').links(this.links);
     this.sim.alpha(alpha).restart();
-    this.emit('stats', { nodes: this.nodes.length, edges: this.links.length });
+    this.emit('stats', this.counts());
   }
 
   /**
@@ -345,18 +410,74 @@ class KnodeGraph {
       o.spacing = scale * Math.min(22, 3 + 2.2 * Math.sqrt(d));
       o.r = scale * (4 + 14 * (hi > lo ? (Math.log1p(d) - lo) / (hi - lo) : 0.5));
     }
-    this.largest = new Set([...this.nodes].sort((a, b) => degree(b) - degree(a)).slice(0, 12).map((o) => o.id));
     this.sim.force('collide').radius((d) => d.spacing + 3);
+    this.placeIslands();
+    // the twelve largest keep their label however far out the view is; an island's hub is named by the island's title instead
+    const hubs = new Set(this.islands.map((is) => is.hub?.id));
+    this.largest = new Set([...this.nodes].filter((o) => !hubs.has(o.id)).sort((a, b) => degree(b) - degree(a)).slice(0, 12).map((o) => o.id));
   }
 
+  /**
+   * The islands of the nodes in view: one per community with a member in
+   * view, and one, undrawn, for the nodes that belong to none. Each is a disc
+   * large enough for its nodes at the layout's spacing, placed by
+   * `packIslands`; a node new to the view starts inside its island. With
+   * `cluster` off, or fewer than two communities in view, there are none and
+   * the layout is the single one it always was.
+   */
+  placeIslands() {
+    const s = this.settings;
+    const degree = (o) => (typeof o.degree === 'number' ? o.degree : o.inDegree);
+    const groups = new Map();
+    for (const o of this.nodes) {
+      const id = typeof o.community === 'number' ? o.community : -1;
+      (groups.get(id) ?? groups.set(id, []).get(id)).push(o);
+    }
+    const communities = [...groups.keys()].filter((id) => id >= 0).length;
+    this.islands = [];
+    if (s.cluster && communities >= 2) {
+      const stretch = Math.sqrt(s.linkDistance / KnodeGraph.DEFAULTS.linkDistance);
+      this.islands = [...groups.entries()]
+        .map(([id, nodes]) => {
+          const area = nodes.reduce((sum, o) => sum + (o.spacing + 3) ** 2, 0);
+          const named = this.communities.get(id);
+          const hub = id < 0 ? null : nodes.find((o) => o.id === named?.hub) ?? nodes.reduce((a, b) => (degree(b) > degree(a) ? b : a));
+          return { id, nodes, hub, label: hub?.name ?? '', R: Math.sqrt(area / KnodeGraph.ISLAND_FILL) * stretch + 12, x: 0, y: 0 };
+        })
+        // the nodes of no community go last, to the outside
+        .sort((a, b) => (a.id < 0) - (b.id < 0) || b.nodes.length - a.nodes.length || a.id - b.id);
+      KnodeGraph.packIslands(this.islands);
+    }
+    for (const o of this.nodes) o.island = null;
+    for (const is of this.islands) {
+      is.nodes.forEach((o, i) => {
+        o.island = is;
+        if (!o.fresh) return;
+        const a = i * 2.39996, r = Math.min(is.R * 0.8, 12 * Math.sqrt(i));
+        o.x = is.x + Math.cos(a) * r;
+        o.y = is.y + Math.sin(a) * r;
+      });
+    }
+    for (const o of this.nodes) o.fresh = false;
+    this.applyForces();
+  }
+
+  /**
+   * The forces by the settings. With islands, a node is drawn to its island's
+   * centre instead of the view's, twice as firmly, and a relation that crosses
+   * between islands barely pulls: it is drawn, but it does not drag two
+   * islands into one.
+   */
   applyForces() {
     const s = this.settings;
+    const islands = this.islands.length > 0;
     this.sim.force('charge').strength(-s.repel);
     this.sim.force('link')
       .distance((l) => s.linkDistance * (l.co ? 1.5 : 1) / (0.6 + 0.4 * Math.min(1, l.weight / 3)))
-      .strength((l) => (l.co ? 0.12 : 0.5) * Math.min(1, l.weight / 2 + 0.25));
-    this.sim.force('x').strength(s.center);
-    this.sim.force('y').strength(s.center);
+      .strength((l) => (l.co ? 0.12 : 0.5) * Math.min(1, l.weight / 2 + 0.25) * (islands && l.source.island !== l.target.island ? 0.03 : 1));
+    const pull = islands ? Math.max(0.02, s.center) * 2 : s.center;
+    this.sim.force('x').x((d) => d.island?.x ?? 0).strength(pull);
+    this.sim.force('y').y((d) => d.island?.y ?? 0).strength(pull);
   }
 
   /** Change preferences; only what changed is recomputed, and only a force change reheats the layout. */
@@ -370,7 +491,13 @@ class KnodeGraph {
       this.sizeNodes();
       this.sim.alpha(0.2).restart();
     }
-    if (KnodeGraph.FORCE_KEYS.some(changed)) {
+    if (KnodeGraph.ISLAND_KEYS.some(changed)) {
+      this.sizeNodes();
+      this.sim.alpha(0.6).restart();
+      this.emit('stats', this.counts());
+      // islands take more room than the single layout: bring them all into view when they appear
+      if (changed('cluster') && this.islands.length) this.fit({ maxScale: 1 });
+    } else if (KnodeGraph.FORCE_KEYS.some(changed)) {
       this.applyForces();
       this.sim.alpha(0.6).restart();
     }
@@ -433,12 +560,19 @@ class KnodeGraph {
   }
 
   counts() {
-    return { nodes: this.nodes.length, edges: this.links.length };
+    return { nodes: this.nodes.length, edges: this.links.length, clusters: this.clusters().length };
+  }
+
+  /** The islands drawn, largest first: each community in view with its hub's name and how many of its nodes are in view. */
+  clusters() {
+    return this.islands.filter((is) => is.id >= 0).map((is) => ({ id: is.id, label: is.label, size: is.nodes.length, hub: is.hub.id }));
   }
 
   clear() {
     this.sim.stop();
     this.all = { nodes: [], edges: [] };
+    this.communities = new Map();
+    this.islands = [];
     this.byId.clear();
     this.nodes = [];
     this.links = [];
@@ -479,7 +613,7 @@ class KnodeGraph {
     c.height = Math.round(h * dpr);
     if (!this.sized) {
       this.sized = true;
-      this.resetView();
+      this.homeView();
     }
     this.invalidate();
   }
@@ -491,9 +625,16 @@ class KnodeGraph {
     this.sel.call(this.zoom.transform, d3.zoomIdentity.translate(c.clientWidth / 2, c.clientHeight / 2));
   }
 
+  /** Where a fresh graph opens: the islands all in view when there are any, else the origin at scale 1. */
+  homeView() {
+    if (this.islands.length) this.fit({ duration: 0, maxScale: 1 });
+    else this.resetView();
+  }
+
   /** Bring the whole visible graph into the canvas. */
-  fit() {
-    if (!this.nodes.length) return;
+  fit({ duration = 400, maxScale = KnodeGraph.ZOOM_EXTENT[1] } = {}) {
+    const c = this.canvas;
+    if (!this.nodes.length || !c.clientWidth || !c.clientHeight) return;
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (const n of this.nodes) {
       x0 = Math.min(x0, n.x - n.r);
@@ -501,9 +642,27 @@ class KnodeGraph {
       x1 = Math.max(x1, n.x + n.r);
       y1 = Math.max(y1, n.y + n.r);
     }
-    const c = this.canvas;
-    const k = Math.max(KnodeGraph.ZOOM_EXTENT[0], Math.min(KnodeGraph.ZOOM_EXTENT[1], 0.9 / Math.max((x1 - x0) / c.clientWidth, (y1 - y0) / c.clientHeight)));
+    // an island's disc is in view with its nodes, wherever in it they have settled so far
+    for (const is of this.islands) {
+      if (is.id < 0) continue;
+      x0 = Math.min(x0, is.x - is.R);
+      y0 = Math.min(y0, is.y - is.R - 18);
+      x1 = Math.max(x1, is.x + is.R);
+      y1 = Math.max(y1, is.y + is.R);
+    }
+    const k = Math.max(KnodeGraph.ZOOM_EXTENT[0], Math.min(maxScale, 0.9 / Math.max((x1 - x0) / c.clientWidth, (y1 - y0) / c.clientHeight)));
     const t = d3.zoomIdentity.translate(c.clientWidth / 2, c.clientHeight / 2).scale(k).translate(-(x0 + x1) / 2, -(y0 + y1) / 2);
+    if (duration) this.sel.transition().duration(duration).call(this.zoom.transform, t);
+    else this.sel.call(this.zoom.transform, t);
+  }
+
+  /** Bring one island into the canvas. */
+  fitCluster(id) {
+    const is = this.islands.find((x) => x.id === id);
+    if (!is) return;
+    const c = this.canvas;
+    const k = Math.max(KnodeGraph.ZOOM_EXTENT[0], Math.min(2.5, 0.8 / Math.max((2 * is.R) / c.clientWidth, (2 * is.R) / c.clientHeight)));
+    const t = d3.zoomIdentity.translate(c.clientWidth / 2, c.clientHeight / 2).scale(k).translate(-is.x, -is.y);
     this.sel.transition().duration(400).call(this.zoom.transform, t);
   }
 
@@ -587,6 +746,7 @@ class KnodeGraph {
     const k = t.k;
     this.drawBackground(w, h, glow);
     if (!this.nodes.length) return;
+    this.drawIslands(w, h, glow);
 
     // screen geometry, and what is on screen: what is not costs nothing
     const pad = 40;
@@ -716,6 +876,23 @@ class KnodeGraph {
     for (let x = ox; x < w; x += step) for (let y = oy; y < h; y += step) ctx.fillRect(x - 0.6, y - 0.6, 1.2, 1.2);
   }
 
+  /** Each island as a faint disc under everything else: the ground its community stands on. */
+  drawIslands(w, h, glow) {
+    const { ctx, t } = this;
+    for (const is of this.islands) {
+      if (is.id < 0) continue;
+      const x = t.applyX(is.x), y = t.applyY(is.y), R = is.R * t.k;
+      if (x + R < 0 || x - R > w || y + R < 0 || y - R > h) continue;
+      ctx.beginPath();
+      ctx.arc(x, y, R, 0, Math.PI * 2);
+      ctx.fillStyle = glow ? 'rgba(120,140,255,.045)' : 'rgba(160,175,200,.04)';
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = glow ? 'rgba(150,165,255,.16)' : 'rgba(160,175,200,.14)';
+      ctx.stroke();
+    }
+  }
+
   strokeBatches(batches) {
     const ctx = this.ctx;
     for (const b of batches.values()) {
@@ -834,6 +1011,39 @@ class KnodeGraph {
     }
   }
 
+  /**
+   * Each island's title above its rim: its hub's name and how many nodes it
+   * holds. The boxes they take, so no node label is written over one.
+   */
+  drawIslandTitles(hi, glow, w, h) {
+    const { ctx, t } = this;
+    const placed = [];
+    const font = `600 11px ${GRAPH_FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineJoin = 'round';
+    ctx.font = font;
+    for (const is of this.islands) {
+      if (is.id < 0) continue;
+      const name = is.label.length > 24 ? `${is.label.slice(0, 23)}…` : is.label;
+      const text = `${name} · ${is.nodes.length}`;
+      const tw = this.textWidth(text, font);
+      const x = t.applyX(is.x), y = t.applyY(is.y) - is.R * t.k - 10;
+      const box = [x - tw / 2 - 3, y - 8, x + tw / 2 + 3, y + 8];
+      if (box[2] < 0 || box[0] > w || box[3] < 0 || box[1] > h) continue;
+      if (placed.some((b) => b[0] < box[2] && b[2] > box[0] && b[1] < box[3] && b[3] > box[1])) continue;
+      placed.push(box);
+      ctx.globalAlpha = hi ? 0.4 : 1;
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = glow ? '#06070c' : this.halo;
+      ctx.strokeText(text, x, y);
+      ctx.fillStyle = glow ? '#aab4e8' : '#9aa5b8';
+      ctx.fillText(text, x, y);
+    }
+    ctx.globalAlpha = 1;
+    return placed;
+  }
+
   /** Whether a label box would cover a node that is not faded out. */
   coversNode(box, pos, ownId, hi) {
     for (const g of pos.values()) {
@@ -866,7 +1076,7 @@ class KnodeGraph {
       const degree = (o) => (typeof o.degree === 'number' ? o.degree : o.inDegree);
       items = shown.filter((g) => this.largest.has(g.n.id) || fade >= 0.05).sort((a, b) => degree(b.n) - degree(a.n));
     }
-    const placed = [];
+    const placed = this.drawIslandTitles(hi, glow, w, h);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.lineJoin = 'round';

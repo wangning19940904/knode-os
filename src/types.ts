@@ -188,6 +188,18 @@ export interface GraphNode {
   /** Live typed relations across the whole graph, not only among the nodes returned. */
   degree?: number;
   wikiPath?: string | null;
+  /** Index into the reply's `communities`, on `/api/graph`; absent for a node linked to nothing in the reply. */
+  community?: number;
+}
+
+/** A group of nodes linked to each other more than to the rest of a graph read (src/graph/communities.ts). */
+export interface GraphCommunity {
+  /** Its position in the reply's list: largest first. */
+  id: number;
+  size: number;
+  /** The member the others link to most: its id, and its name as the community's label. */
+  hub: string;
+  label: string;
 }
 
 export interface GraphEdge {
@@ -206,6 +218,8 @@ export interface GraphSearchResult {
   edges: GraphEdge[];
   chunks: SearchResult[];
   claims?: ClaimItem[];
+  /** The nodes' communities, on `/api/graph` only: an agent's graph search does not carry them. */
+  communities?: GraphCommunity[];
 }
 
 export interface IngestStats {
