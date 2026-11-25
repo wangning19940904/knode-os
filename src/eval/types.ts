@@ -187,7 +187,9 @@ export type GoldItem = z.infer<typeof GoldItemSchema>;
  *              item's evidence ("which sources disagree" is part of the answer)
  * - primary    which set metric is the task's correctness: f1, or recall where the gold
  *              is not exhaustive (a profile drafted from sampled statements), or exact
- *              (structured queries: the whole set or nothing)
+ *              (structured queries: the whole set or nothing), or complete (every gold
+ *              item and no entry naming one of the task's `meta.distractors`: RAMDocs's
+ *              "all valid answers, no wrong one"; other extra entries do not count against it)
  * - fields     (match) every item's `fields` groups must each have a term in the predicted label
  */
 export const ListSpecSchema = z.object({
@@ -195,8 +197,11 @@ export const ListSpecSchema = z.object({
   ordered: z.boolean().default(false),
   maxItems: z.number().int().positive().max(60).default(10),
   requireDocs: z.boolean().default(false),
-  /** exact: correctness is 1 only when the predicted set equals the gold set (structured queries). */
-  primary: z.enum(['f1', 'recall', 'exact']).default('f1'),
+  /**
+   * exact: correctness is 1 only when the predicted set equals the gold set (structured queries).
+   * complete: 1 only when every gold item is matched and no entry names a distractor (`meta.distractors`).
+   */
+  primary: z.enum(['f1', 'recall', 'exact', 'complete']).default('f1'),
 });
 export type ListSpec = z.infer<typeof ListSpecSchema>;
 

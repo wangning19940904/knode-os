@@ -1,0 +1,2 @@
+{"question": "On what date did the typhoon make landfall?", "question_type": ["single-fact"], "answer": "Haiyen made landfall on 3 July.", "ref_urls": ["https://news.example.hk/20310703/haiyen"]}
+{"question": "Give an overview of the storm season of 2031.", "question_type": ["summary"], "gold_statements": ["Nine storms were named in the 2031 season.", "Haiyen was the costliest storm of the season.", "Haiyen made landfall on 3 July."], "ref_urls": ["https://weather.example.org/2031/summary", "https://news.example.hk/20310703/haiyen"]}

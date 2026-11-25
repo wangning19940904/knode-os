@@ -1,0 +1,7 @@
+# Counting walks on a grid
+
+Counting walks on a grid | Notes of a combinatorialist
+===============
+
+In her 1987 note, Marit Veld counted 132 walks of six steps that stay above the diagonal.
+The count was checked by hand by her student Idris Okafor.

@@ -2,7 +2,9 @@ import { seededKey, shortHash as hash, stratified } from '../pack.js';
 import type { CorpusDoc, Task, TaskType } from '../types.js';
 import { finishDocpack } from './docpack.js';
 import { fetchJson } from './fetch.js';
+import { registerFramesRecipe } from './frames.js';
 import { registerRecipe, RecipeContext } from './index.js';
+import { registerRamdocsRecipe } from './ramdocs.js';
 import { PackWriter } from './writer.js';
 
 /**
@@ -19,6 +21,11 @@ import { PackWriter } from './writer.js';
  *   articles from late 2023 and queries whose evidence spans 2–4 of them
  *   (inference, comparison, temporal), plus null queries the corpus cannot
  *   answer. Its evidence sentences are exact quotes: the gold facts.
+ * - public-ramdocs (ramdocs.ts): RAMDocs (Wang et al., 2025, MIT) — questions
+ *   about a shared name over passages that conflict, mislead and distract;
+ *   the dataset's strict exact match.
+ * - public-frames (frames.ts): FRAMES (Krishna et al., 2024, Apache-2.0) — a
+ *   sample of its multi-article questions over all their Wikipedia articles.
  */
 
 type Doc = CorpusDoc & { text: string };
@@ -208,4 +215,6 @@ async function buildMultihopRag(dir: string, ctx: RecipeContext) {
 export function registerPublicRecipes(): void {
   registerRecipe({ id: 'public-musique', title: 'MuSiQue 2–4-hop questions over their Wikipedia paragraphs (HippoRAG 2 release)', domain: 'public', network: true, needsAuthor: false, build: buildMusique });
   registerRecipe({ id: 'public-multihoprag', title: 'MultiHop-RAG news queries: inference, comparison, temporal, null', domain: 'public', network: true, needsAuthor: false, build: buildMultihopRag });
+  registerRamdocsRecipe();
+  registerFramesRecipe();
 }

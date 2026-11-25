@@ -17,7 +17,7 @@ import { buildReportData, renderReport } from '../src/eval/report.js';
 import { Bm25, chunkDocs } from '../src/eval/retrieval.js';
 import { selectTasks } from '../src/eval/run.js';
 import { recordKey, RunStore } from '../src/eval/runstore.js';
-import { matchByFields, scoreLists } from '../src/eval/score/lists.js';
+import { matchByFields, namesDistractor, scoreLists } from '../src/eval/score/lists.js';
 import { scoreKey, scoreUsage } from '../src/eval/score/usage.js';
 import { emptyUsage, STRUCTURED_MIN_DOCS, type AnswerRecord, type ScoreRecord, type Task } from '../src/eval/types.js';
 
@@ -415,6 +415,31 @@ describe('scoring the separation families', () => {
     expect(metric(rs, 'sq', 'set_f1', 1)).toBeCloseTo(0.8, 5);
     expect(metric(rs, 'la', 'distractor_rate')).toBe(0.5);
     expect(metric(rs, 'la', 'stale_answer')).toBe(1);
+  });
+
+  it('scores a complete list: every gold item and no distractor, other extras let pass', async () => {
+    const t: Task = {
+      id: 'born', suite: 'usage', type: 'ambiguous', question: 'In which year was Michael Jordan born?', scoring: 'set', evidence: [],
+      items: [{ label: '1963', aliases: [], weight: 1 }, { label: '1956', aliases: [], weight: 1 }],
+      list: { match: 'alias', ordered: false, maxItems: 10, requireDocs: false, primary: 'complete' }, meta: { distractors: ['1998', '195'] },
+    };
+    const json = (labels: string[]) => `{"items":[${labels.map((l) => `{"label":"${l}","confidence":0.9,"evidence":[]}`).join(',')}]}`;
+    const cases = [
+      ['the basketball player: February 17, 1963', 'the scientist: 1956'], // both, in sentences
+      ['1963', '1956', 'one source gives no year'], // an extra that names no wrong answer
+      ['1963', '1956', '1998'], // a wrong answer beside them
+      ['1963 (one source says 1998)', '1956'], // a wrong answer inside a right entry
+      ['1963'], // one reading missing
+      ['1963, 1956'], // both in one entry
+    ];
+    const rs = await scoreLists({ answers: cases.map((c, i) => answer('born', json(c), i ? { repeat: i } : {})), tasks: new Map([['p|born', t]]), corpusDocs: new Map() }, noJudge);
+    expect(cases.map((_, i) => metric(rs, 'born', 'correctness', i || undefined))).toEqual([1, 1, 0, 0, 0, 1]);
+    expect(metric(rs, 'born', 'distractor_rate', 2)).toBeCloseTo(1 / 3, 5);
+    // a gold name that holds a distractor's ("195" in no year here; "New York" in "New York City") is not the distractor
+    expect(namesDistractor('New York City', [{ label: 'New York City', aliases: [], weight: 1 }], ['New York'])).toBe(false);
+    expect(namesDistractor('New York City, not New York', [{ label: 'New York City', aliases: [], weight: 1 }], ['New York'])).toBe(true);
+    // and a distractor that holds the gold's name is still one
+    expect(namesDistractor('New York City', [{ label: 'New York', aliases: [], weight: 1 }], ['New York City'])).toBe(true);
   });
 
   it('scores entity resolution as B-cubed against the gold alias clusters', () => {

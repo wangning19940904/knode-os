@@ -376,7 +376,15 @@ extraction spot checks.
   (`KNODE_EVAL_HOME`). Recipes build them: synthetic weekly reports (v2 by
   default, v3 with `--options '{"version":3}'`), a life ledger, domain packs
   from real documents, and real-document recipes (Loong, MuDABench, wiki-hops,
-  CRUD news). `code-localization` (design 37) builds a pack from a
+  CRUD news). Published benchmarks with gold from the dataset and no model:
+  `public-musique`, `public-multihoprag`, `public-ramdocs` (RAMDocs: passages
+  that conflict, mislead and distract; questions share one corpus only where
+  no other question's passage names their subject), `public-frames` (FRAMES:
+  a sample of 100 questions over all their Wikipedia articles as one pool) and
+  `real-wildgraphbench` (WildGraphBench: the noisy web pages a Wikipedia
+  article cites, by domain, default mathematics, nature and history). These
+  fetch into `~/knode-eval/sources`, or read a local copy given as `from`, and
+  list every source with its licence and sha256. `code-localization` (design 37) builds a pack from a
   repository's history with no model: the corpus is the tree at one base
   commit under `corpus/codebase/<repo>/`, each task a later commit's message,
   its gold the files the commit touched (set F1 by path), its `meta.stratum`
@@ -396,7 +404,9 @@ extraction spot checks.
   and resume from keyed JSONL.
 - **Scoring.** Model-free `value`, `exact`, `count`, `set`, `label`, `choice`
   and `abstain` scoring where the task allows it, otherwise a blind judge from
-  another model family; `--judge-audit` re-asks a sample and `--repeat-sample`
+  another model family. A set's correctness is its F1, its recall, the exact
+  set, or `complete`: every gold item and no entry naming one of the task's
+  distractors (RAMDocs's strict match); `--judge-audit` re-asks a sample and `--repeat-sample`
   measures repeat variance. Reports carry per-type tables, minimum detectable
   effects and cost-normalised figures.
 - A build that contains a gold, holdout or tasks file fails the leak check, as
