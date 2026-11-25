@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import matter from 'gray-matter';
 import pg from 'pg';
 import { mdTable } from '../bench/util.js';
+import { readMatter } from '../markdown.js';
 import { listFiles, type LoadedPack } from './pack.js';
 import type { Task } from './types.js';
 
@@ -325,8 +325,7 @@ export function readWiki(wikiDir: string, resolve: (ref: string) => string | nul
     let data: Record<string, unknown> = {};
     let body = raw;
     try {
-      // with options: gray-matter caches every page it parsed without them
-      const parsed = matter(raw, {});
+      const parsed = readMatter(raw);
       data = parsed.data as Record<string, unknown>;
       body = parsed.content;
     } catch {
