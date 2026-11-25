@@ -114,6 +114,7 @@ import {
 } from '../ingest/feishu/docs.js';
 import { parseFeishuRef } from '../ingest/feishu/markdown.js';
 import { documentMentions } from '../graph/mentions.js';
+import { withCommunities } from '../graph/communities.js';
 import { entityDetail, graphInsights, graphOverview, graphSearch } from '../graph/query.js';
 import { entitiesNamed } from '../graph/resolve.js';
 import { buildContextPack } from '../pack/pack.js';
@@ -2500,7 +2501,7 @@ export function createApp(
       // nodes to return; each reader clamps it to its own range, and NaN means its default
       const limit = Number(c.req.query('limit'));
       if (q) {
-        return c.json(await graphSearch(ctx.store, q, {
+        return c.json(withCommunities(await graphSearch(ctx.store, q, {
           depth,
           limit,
           heat: ctx.config.heat,
@@ -2510,13 +2511,13 @@ export function createApp(
             validRange: c.req.query('valid_range') || undefined,
           }),
           filter: resolveScopeFilter({ kinds: csv(c.req.query('kinds')), sources: csv(c.req.query('sources')) }),
-        }));
+        })));
       }
-      return c.json(await graphOverview(ctx.store, {
+      return c.json(withCommunities(await graphOverview(ctx.store, {
         limit,
         types: csv(c.req.query('types')),
         edges: c.req.query('edges') === 'typed' ? 'typed' : 'all',
-      }));
+      })));
     } catch (e) {
       return c.json(err(e), status(e));
     }

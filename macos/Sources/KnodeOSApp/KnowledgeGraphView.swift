@@ -15,6 +15,9 @@ private enum GraphMode: Equatable {
  * neighbourhood; the view zooms, pans and lets nodes be dragged; labels fade
  * in with zoom. An empty search is the overview — the top entities by
  * mentions — and a name is the local graph around it, ranked by relevance.
+ * With the clusters setting the reply's communities are laid out as islands
+ * (`GraphScene.islands`), listed in the side panel, where a click brings one
+ * into view.
  */
 struct KnowledgeGraphView: View {
     @EnvironmentObject private var model: AppModel
@@ -37,6 +40,8 @@ struct KnowledgeGraphView: View {
     @State private var generation = 0
     /// Bumped whenever the layout is warmed up again: the canvas resumes ticking.
     @State private var heat = 0
+    /// The island the side panel asked to see; `tick` tells one request from the next for the same island.
+    @State private var shownIsland = IslandRequest(id: -1, tick: 0)
 
     init() {
         _settings = State(initialValue: GraphSettings(json: UserDefaults.standard.string(forKey: GraphSettings.storageKey)))
@@ -65,7 +70,7 @@ struct KnowledgeGraphView: View {
             } else if let response, !response.nodes.isEmpty {
                 HSplitView {
                     ZStack(alignment: .topLeading) {
-                        GraphCanvas(scene: scene, sim: sim, settings: settings, generation: generation, heat: heat, selectedID: $selectedNodeID, selectedEdgeID: $selectedEdgeID) { node in
+                        GraphCanvas(scene: scene, sim: sim, settings: settings, generation: generation, heat: heat, shownIsland: shownIsland, selectedID: $selectedNodeID, selectedEdgeID: $selectedEdgeID) { node in
                             query = node.name
                             Task { await loadGraph() }
                         }
@@ -151,7 +156,11 @@ struct KnowledgeGraphView: View {
         case .overview: L("overview · top %@ by mentions", String(settings.limit))
         case .search(let name): L("local graph · “%@” · %@ · ranked by relevance", name, hops)
         }
-        return Text(L("%@ · %@ nodes · %@ edges", what, scene.nodes.count.formatted(), scene.edges.count.formatted()))
+        let clusters = scene.communities.count
+        let line = clusters > 0
+            ? L("%@ · %@ nodes · %@ edges · %@ clusters", what, scene.nodes.count.formatted(), scene.edges.count.formatted(), clusters.formatted())
+            : L("%@ · %@ nodes · %@ edges", what, scene.nodes.count.formatted(), scene.edges.count.formatted())
+        return Text(line)
             .font(.caption2.monospaced())
             .foregroundStyle(.secondary)
             .padding(.horizontal, 9)
@@ -366,8 +375,36 @@ struct KnowledgeGraphView: View {
         }
     }
 
+    /// The islands on the canvas, largest first: a click brings one into view.
+    @ViewBuilder
+    private var clusterList: some View {
+        let clusters = scene.communities
+        if !clusters.isEmpty {
+            Text(L("Clusters")).font(.headline)
+            FlowLayout(spacing: 6) {
+                ForEach(clusters) { island in
+                    Button { shownIsland = IslandRequest(id: island.id, tick: shownIsland.tick + 1) } label: {
+                        Text("\(island.label.count > 22 ? String(island.label.prefix(21)) + "…" : island.label) · \(island.nodeIDs.count)")
+                            .font(.caption)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(Color.white.opacity(0.04), in: Capsule())
+                            .overlay { Capsule().stroke(Color.white.opacity(0.1)) }
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help(L("Show this cluster"))
+                }
+            }
+            Divider().padding(.vertical, 4)
+        }
+    }
+
     @ViewBuilder
     private func topList(_ response: GraphResponse) -> some View {
+        clusterList
         HStack {
             Text(L("Entities")).font(.headline)
             Spacer()
@@ -437,8 +474,14 @@ struct KnowledgeGraphView: View {
             Task { await loadGraph() }
             return
         }
+        // islands are sized by the node size and the link distance: a change to either, or to whether there are any, places them again
+        let islandsMove = new.islandsDiffer(from: old) && (new.cluster != old.cluster || !scene.islands.isEmpty)
         if new.filtersDiffer(from: old) {
             rebuildScene(alpha: 0.3)
+        } else if islandsMove {
+            rebuildScene(alpha: new.cluster != old.cluster || new.linkDistance != old.linkDistance ? 0.6 : 0.2)
+            // islands take more room than the single layout: bring them all into view when they appear
+            if new.cluster && !old.cluster && !scene.islands.isEmpty { generation += 1 }
         } else if new.nodeSize != old.nodeSize {
             let scene = scene
             sim.resize { node in scene.byID[node.id].map { scene.radius(of: $0, nodeSize: new.nodeSize) } ?? node.r }
@@ -456,7 +499,7 @@ struct KnowledgeGraphView: View {
     private func rebuildScene(alpha: Double) {
         guard let response else { return }
         scene = GraphScene(response: response, settings: settings)
-        sim.load(nodes: scene.nodeSpecs(nodeSize: settings.nodeSize), links: scene.linkSpecs, alpha: alpha)
+        sim.load(nodes: scene.nodeSpecs(nodeSize: settings.nodeSize), links: scene.linkSpecs, islands: scene.islandSpecs, alpha: alpha)
         if let selectedNodeID, scene.byID[selectedNodeID] == nil { self.selectedNodeID = nil }
         // a selected edge stays while its pair still has a relation in view, showing what is left of it
         if let selectedEdgeID, scene.bundle(selectedEdgeID) == nil { self.selectedEdgeID = nil }
@@ -507,6 +550,12 @@ struct KnowledgeGraphView: View {
     }
 }
 
+/// A request to bring one island into view.
+private struct IslandRequest: Equatable {
+    var id: Int
+    var tick: Int
+}
+
 /* ================================ canvas ================================ */
 
 /**
@@ -515,7 +564,8 @@ struct KnowledgeGraphView: View {
  * a drag, a filter or a slider resumes it, and so does a focused node or
  * edge while glow is on, whose lines carry moving particles. `GraphRenderer`
  * draws each frame in screen points. The pointer finds a node first, on its
- * disc or just round it, and otherwise the nearest edge.
+ * disc or just round it, and otherwise the nearest edge. A fresh graph
+ * opens at the origin at scale 1, or, with islands, with all of them in view.
  */
 private struct GraphCanvas: View {
     let scene: GraphScene
@@ -523,6 +573,7 @@ private struct GraphCanvas: View {
     let settings: GraphSettings
     let generation: Int
     let heat: Int
+    let shownIsland: IslandRequest
     @Binding var selectedID: String?
     /// A bundle id: the relations between one pair of nodes.
     @Binding var selectedEdgeID: String?
@@ -563,6 +614,14 @@ private struct GraphCanvas: View {
                 }
             }
             .background(ScrollWheelCatcher { event in handleScroll(event, size: size) })
+            .onAppear { home(size) }
+            .onChange(of: generation) {
+                home(size)
+                hoveredID = nil
+                hoveredEdgeID = nil
+                paused = false
+            }
+            .onChange(of: shownIsland) { _, request in show(island: request.id, size: size) }
             .contentShape(Rectangle())
             .gesture(dragGesture(size: size))
             .simultaneousGesture(magnifyGesture(size: size))
@@ -580,15 +639,42 @@ private struct GraphCanvas: View {
             }
         }
         .background(GraphRenderer.background)
-        .onChange(of: generation) {
-            scale = 1
-            pan = .zero
-            hoveredID = nil
-            hoveredEdgeID = nil
-            paused = false
-        }
         .onChange(of: heat) { paused = false }
         .onChange(of: flowing) { _, now in if now { paused = false } }
+    }
+
+    /// Where a fresh graph opens: the islands all in view when there are any, else the origin at scale 1.
+    private func home(_ size: CGSize) {
+        let discs = scene.communities
+        guard !discs.isEmpty, size.width > 0, size.height > 0 else {
+            scale = 1
+            pan = .zero
+            return
+        }
+        // an island's title sits above its rim: leave room for it
+        var x0 = discs.map { $0.x - $0.radius }.min() ?? 0
+        var x1 = discs.map { $0.x + $0.radius }.max() ?? 0
+        var y0 = discs.map { $0.y - $0.radius - 18 }.min() ?? 0
+        var y1 = discs.map { $0.y + $0.radius }.max() ?? 0
+        for node in sim.nodes {
+            x0 = min(x0, node.x - node.r)
+            x1 = max(x1, node.x + node.r)
+            y0 = min(y0, node.y - node.r)
+            y1 = max(y1, node.y + node.r)
+        }
+        let fit = 0.9 / max((x1 - x0) / size.width, (y1 - y0) / size.height)
+        scale = min(max(fit, Self.zoomRange.lowerBound), 1)
+        pan = CGSize(width: -(x0 + x1) / 2 * scale, height: -(y0 + y1) / 2 * scale)
+    }
+
+    /// Bring one island into the canvas.
+    private func show(island id: Int, size: CGSize) {
+        guard let island = scene.islands.first(where: { $0.id == id }), size.width > 0, size.height > 0 else { return }
+        let fit = 0.8 / max(2 * island.radius / size.width, 2 * island.radius / size.height)
+        withAnimation(.easeInOut(duration: 0.4)) {
+            scale = min(max(fit, Self.zoomRange.lowerBound), 2.5)
+            pan = CGSize(width: -island.x * scale, height: -island.y * scale)
+        }
     }
 
     /// One tick a frame while there is heat; the frame after it settles, pause, unless particles are flowing.
@@ -814,6 +900,7 @@ private struct GraphSettingsPanel: View {
             SettingSlider(label: L("Min edge weight"), value: $settings.minWeight, range: 0...5, step: 0.1, digits: 1)
             Divider()
             Eyebrow(text: L("Display"), color: .knodeViolet)
+            Toggle(L("Clusters as islands"), isOn: $settings.cluster)
             Toggle(L("Glow"), isOn: $settings.glow)
             SettingSlider(label: L("Node size"), value: $settings.nodeSize, range: 0.5...2, step: 0.05, digits: 2)
             SettingSlider(label: L("Link thickness"), value: $settings.linkWidth, range: 0.5...3, step: 0.1, digits: 1)

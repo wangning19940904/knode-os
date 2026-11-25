@@ -220,4 +220,87 @@ final class GraphSceneTests: XCTestCase {
         XCTAssertFalse(new.filtersDiffer(from: old))
         XCTAssertNotEqual(new.forces, old.forces)
     }
+
+    /// Three communities of 6, 4 and 2, a node in none, and the reply's own list of them.
+    private var clustered: GraphResponse {
+        var nodes: [GraphNode] = []
+        var edges: [GraphEdge] = []
+        for (c, n) in [6, 4, 2].enumerated() {
+            for i in 0..<n {
+                var member = node("c\(c)n\(i)", "concept", degree: i == 1 ? 9 : 1)
+                member.community = c
+                nodes.append(member)
+                if i > 0 { edges.append(edge("c\(c)n\(i)", "c\(c)n0")) }
+            }
+        }
+        nodes.append(node("lone", "person", degree: 0))
+        edges.append(edge("c0n0", "c1n0", "partner_of"))
+        return GraphResponse(
+            nodes: nodes, edges: edges, chunks: [], claims: nil,
+            communities: [6, 4, 2].enumerated().map { GraphCommunity(id: $0.offset, size: $0.element, hub: "c\($0.offset)n1", label: "C\($0.offset)N1") }
+        )
+    }
+
+    func testCommunitiesInViewBecomeIslandsLargestFirstWithTheRestLast() {
+        let scene = GraphScene(response: clustered, settings: GraphSettings())
+        XCTAssertEqual(scene.islands.map(\.id), [0, 1, 2, -1])
+        XCTAssertEqual(scene.islands.map(\.nodeIDs.count), [6, 4, 2, 1])
+        XCTAssertEqual(scene.communities.map(\.label), ["C0N1", "C1N1", "C2N1"])
+        XCTAssertEqual(scene.island(of: "c1n3")?.id, 1)
+        XCTAssertEqual(scene.island(of: "lone")?.id, -1)
+        // no two discs nearer than the gap, and a larger community has the larger disc
+        for (i, a) in scene.islands.enumerated() {
+            for b in scene.islands[(i + 1)...] {
+                XCTAssertGreaterThanOrEqual(hypot(a.x - b.x, a.y - b.y), a.radius + b.radius + GraphScene.islandGap - 1e-6)
+            }
+        }
+        XCTAssertGreaterThan(scene.islands[0].radius, scene.islands[1].radius)
+        // a hub is named by its island's title, so it is not one of the nodes that always keep a label
+        XCTAssertFalse(scene.largest.contains("c0n1"))
+        XCTAssertEqual(scene.nodeSpecs(nodeSize: 1).first { $0.id == "c2n0" }?.island, 2)
+        XCTAssertEqual(scene.islandSpecs.count, 4)
+    }
+
+    func testNoIslandsWithTheSettingOffOrFewerThanTwoCommunitiesInView() {
+        var settings = GraphSettings()
+        settings.cluster = false
+        let flat = GraphScene(response: clustered, settings: settings)
+        XCTAssertTrue(flat.islands.isEmpty)
+        XCTAssertTrue(flat.nodeSpecs(nodeSize: 1).allSatisfy { $0.island == nil })
+        var one = clustered
+        one.nodes = one.nodes.filter { $0.community == 0 || $0.community == nil }
+        XCTAssertTrue(GraphScene(response: one, settings: GraphSettings()).islands.isEmpty)
+        // a service that sends no communities draws as it always has
+        XCTAssertTrue(GraphScene(response: reply, settings: GraphSettings()).islands.isEmpty)
+    }
+
+    func testAHubTheFiltersHideGivesWayToTheLargestMemberLeft() {
+        var response = clustered
+        response.nodes = response.nodes.map { node in
+            var node = node
+            if node.id == "c0n1" { node.type = "event" }
+            if node.id == "c0n4" { node.degree = 5 }
+            return node
+        }
+        var settings = GraphSettings()
+        settings.hiddenTypes = ["event"]
+        let scene = GraphScene(response: response, settings: settings)
+        XCTAssertEqual(scene.islands.first { $0.id == 0 }?.hub, "c0n4")
+        XCTAssertEqual(scene.islands.first { $0.id == 0 }?.label, "C0N4")
+    }
+
+    func testClustersAreOnByDefaultAndMoveTheIslandsNotTheFilters() {
+        XCTAssertTrue(GraphSettings(json: #"{"glow":false}"#).cluster)
+        XCTAssertFalse(GraphSettings(json: #"{"cluster":false}"#).cluster)
+        let old = GraphSettings()
+        var new = old
+        new.cluster = false
+        XCTAssertTrue(new.islandsDiffer(from: old))
+        XCTAssertFalse(new.filtersDiffer(from: old))
+        XCTAssertFalse(new.needsRefetch(from: old, overview: true))
+        XCTAssertEqual(GraphSettings(json: new.json), new)
+        new = old
+        new.glow = false
+        XCTAssertFalse(new.islandsDiffer(from: old))
+    }
 }

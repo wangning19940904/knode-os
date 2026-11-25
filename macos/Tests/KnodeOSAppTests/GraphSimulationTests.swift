@@ -121,4 +121,54 @@ final class GraphSimulationTests: XCTestCase {
         XCTAssertEqual(sim.node(at: CGPoint(x: b.x + 15, y: b.y), hit: 3)?.id, "b")
         XCTAssertNil(sim.node(at: CGPoint(x: 400, y: 400), hit: 18))
     }
+
+    /// Two islands of twelve nodes, each a hub with spokes, and one relation between the hubs.
+    @MainActor
+    private func islands() -> (sim: GraphSimulation, discs: [GraphSimulation.IslandSpec]) {
+        let discs: [GraphSimulation.IslandSpec] = [.init(x: -150, y: 0, radius: 90), .init(x: 150, y: 20, radius: 90)]
+        var nodes: [GraphSimulation.NodeSpec] = []
+        var links: [GraphSimulation.LinkSpec] = []
+        for i in 0..<24 {
+            nodes.append(.init(id: "n\(i)", rank: i, degree: i < 2 ? 11 : 1, radius: i < 2 ? 12 : 5, island: i % 2))
+            if i >= 2 { links.append(.init(source: "n\(i)", target: "n\(i % 2)", weight: 1, coOccurs: false)) }
+        }
+        links.append(.init(source: "n0", target: "n1", weight: 1, coOccurs: false))
+        let sim = GraphSimulation()
+        sim.load(nodes: nodes, links: links, islands: discs, alpha: 1)
+        return (sim, discs)
+    }
+
+    @MainActor
+    func testWithIslandsEveryNodeStartsAndSettlesInsideItsOwn() {
+        let (sim, discs) = islands()
+        for node in sim.nodes {
+            let home = discs[node.island!]
+            XCTAssertLessThanOrEqual(hypot(node.x - home.x, node.y - home.y), home.radius, node.id)
+        }
+        XCTAssertEqual(sim.settle(maxTicks: 600), 273)
+        for node in sim.nodes {
+            let home = discs[node.island!]
+            // the rim holds a node's whole disc, give or take the last tick's push
+            XCTAssertLessThan(hypot(node.x - home.x, node.y - home.y) + node.r, home.radius + 6, node.id)
+        }
+    }
+
+    @MainActor
+    func testARelationBetweenIslandsBarelyPulls() {
+        let (sim, _) = islands()
+        let inside = sim.links[0]
+        let across = sim.links.last!
+        XCTAssertEqual(inside.strength, 0.5 * 0.75, accuracy: 0.001)
+        XCTAssertEqual(across.strength, 0.5 * 0.75 * 0.03, accuracy: 0.0001)
+        XCTAssertEqual(across.distance, inside.distance, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testWithoutIslandsALoadIsTheSingleLayout() {
+        let (sim, _) = islands()
+        sim.load(nodes: (0..<24).map { .init(id: "n\($0)", rank: $0, degree: 1, radius: 5) }, links: [.init(source: "n0", target: "n1", weight: 1, coOccurs: false)], alpha: 0.3)
+        XCTAssertTrue(sim.islands.isEmpty)
+        XCTAssertTrue(sim.nodes.allSatisfy { $0.island == nil })
+        XCTAssertEqual(sim.links[0].strength, 0.5 * 0.75, accuracy: 0.001)
+    }
 }

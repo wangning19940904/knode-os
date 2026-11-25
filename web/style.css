@@ -498,6 +498,7 @@ main { flex: 1; min-height: 0; overflow: hidden; display: flex; }
 #graph-legend { position: absolute; left: 10px; bottom: 10px; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; max-width: 65%; }
 #graph-legend .legend-row { display: flex; flex-wrap: wrap; gap: 6px; }
 #graph-legend .legend-row:empty { display: none; }
+#graph-side .graph-clusters { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 12px; }
 .chip {
   display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; padding: 3px 9px; white-space: nowrap;
   border-radius: 12px; background: rgba(15, 17, 21, 0.78); border: 1px solid var(--border); color: var(--fg); cursor: pointer;

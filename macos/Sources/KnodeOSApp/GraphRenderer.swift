@@ -41,7 +41,9 @@ private enum TypeSymbols {
  * fit; a selected edge lies on a soft band of its colour. `settings.glow`
  * adds a deep blue field, a corona round each disc (coronas add up, so a
  * dense cluster brightens instead of clotting), light-blended lines and
- * particles that flow along the focused edges.
+ * particles that flow along the focused edges. `scene.islands` draw under
+ * everything else as faint discs, each with its hub's name and its size
+ * above the rim.
  *
  * Everything is drawn in screen points, so strokes, icons and labels keep
  * their size at any zoom. Nodes are drawn at `GraphScene.displayRadius`; the
@@ -116,6 +118,7 @@ struct GraphRenderer {
         let glow = settings.glow
         drawBackground(in: context, size: size, origin: origin, glow: glow)
         guard !nodes.isEmpty else { return false }
+        drawIslands(in: context, size: size, origin: origin, glow: glow)
 
         // screen geometry, and what is on screen: what is not costs nothing
         let pad: CGFloat = 40
@@ -264,6 +267,52 @@ struct GraphRenderer {
             x += step
         }
         context.fill(dots, with: .color(Color(.sRGB, red: 160 / 255, green: 175 / 255, blue: 200 / 255, opacity: 0.07)))
+    }
+
+    /// Each island as a faint disc under everything else: the ground its community stands on.
+    private func drawIslands(in context: GraphicsContext, size: CGSize, origin: CGPoint, glow: Bool) {
+        let fill = glow ? GraphRGB(r: 120 / 255, g: 140 / 255, b: 1).color(0.045) : GraphRGB(r: 160 / 255, g: 175 / 255, b: 200 / 255).color(0.04)
+        let rim = glow ? GraphRGB(r: 150 / 255, g: 165 / 255, b: 1).color(0.16) : GraphRGB(r: 160 / 255, g: 175 / 255, b: 200 / 255).color(0.14)
+        for island in scene.islands where island.isCommunity {
+            let x = origin.x + island.x * scale
+            let y = origin.y + island.y * scale
+            let r = island.radius * scale
+            if x + r < 0 || x - r > size.width || y + r < 0 || y - r > size.height { continue }
+            let disc = Path(ellipseIn: CGRect(x: x - r, y: y - r, width: r * 2, height: r * 2))
+            context.fill(disc, with: .color(fill))
+            context.stroke(disc, with: .color(rim), lineWidth: 1)
+        }
+    }
+
+    /**
+     * Each island's title above its rim: its hub's name and how many nodes it
+     * holds. The boxes they take, so no node label is written over one.
+     */
+    private func drawIslandTitles(highlighted: Bool, glow: Bool, size: CGSize, in context: GraphicsContext) -> [CGRect] {
+        let origin = CGPoint(x: size.width / 2 + pan.width, y: size.height / 2 + pan.height)
+        var placed: [CGRect] = []
+        var drawn: [(text: String, point: CGPoint)] = []
+        for island in scene.islands where island.isCommunity {
+            let name = island.label.count > 24 ? String(island.label.prefix(23)) + "…" : island.label
+            let text = "\(name) · \(island.nodeIDs.count)"
+            let width = metrics.width(of: text, size: 11, strong: true, in: context)
+            let point = CGPoint(x: origin.x + island.x * scale, y: origin.y + island.y * scale - island.radius * scale - 10)
+            let box = CGRect(x: point.x - width / 2 - 3, y: point.y - 8, width: width + 6, height: 16)
+            if box.maxX < 0 || box.minX > size.width || box.maxY < 0 || box.minY > size.height { continue }
+            if placed.contains(where: { $0.intersects(box) }) { continue }
+            placed.append(box)
+            drawn.append((text, point))
+        }
+        guard !drawn.isEmpty else { return placed }
+        let ink = glow ? GraphRGB(0xaab4e8) : GraphRGB(0x9aa5b8)
+        context.drawLayer { layer in
+            layer.addFilter(.shadow(color: (glow ? GraphRGB(0x06070c) : Self.backgroundRGB).color(0.95), radius: glow ? 4 : 2))
+            layer.opacity = highlighted ? 0.4 : 1
+            for title in drawn {
+                layer.draw(Self.label(title.text, size: 11, strong: true).foregroundColor(ink.color()), at: title.point, anchor: .center)
+            }
+        }
+        return placed
     }
 
     private func stroke(_ batches: [Batch: Path], in context: GraphicsContext) {
@@ -418,7 +467,7 @@ struct GraphRenderer {
             items = shown.filter { scene.largest.contains($0.node.id) || fade >= 0.05 }
                 .sorted { scene.degree(ofID: $0.node.id) > scene.degree(ofID: $1.node.id) }
         }
-        var placed: [CGRect] = []
+        var placed = drawIslandTitles(highlighted: highlight != nil, glow: glow, size: size, in: context)
         var drawn: [(text: String, strong: Bool, point: CGPoint, alpha: Double)] = []
         for spot in items where spot.on {
             guard let node = scene.byID[spot.node.id] else { continue }

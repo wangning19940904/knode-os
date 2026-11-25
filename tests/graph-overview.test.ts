@@ -8,7 +8,7 @@ import { GRAPH_MAX_NODES, graphOverview, graphSearch } from '../src/graph/query.
 import { sync } from '../src/ingest/sync.js';
 import { createApp } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
-import type { GraphEdge, GraphNode } from '../src/types.js';
+import type { GraphCommunity, GraphEdge, GraphNode } from '../src/types.js';
 
 /**
  * The graph overview behind Knowledge → Graph: what the view can ask for
@@ -139,6 +139,21 @@ describe('GET /api/graph', () => {
     const odd = await app.request('/api/graph?limit=abc', { headers });
     expect(odd.status).toBe(200);
     expect(((await odd.json()) as { nodes: GraphNode[] }).nodes.length).toBeGreaterThan(2);
+  });
+
+  it('marks every linked node with its community and lists the communities, for the view\'s islands', async () => {
+    const g = (await (await app.request('/api/graph?edges=typed', { headers })).json()) as { nodes: GraphNode[]; communities: GraphCommunity[] };
+    const byName = new Map(g.nodes.map((n) => [n.name, n]));
+    // Alpha, Beta and Gamma are tied by typed relations; Delta has none, and co-occurrence was not asked for
+    expect(byName.get('Alpha')!.community).toBe(0);
+    expect(byName.get('Beta')!.community).toBe(0);
+    expect(byName.get('Gamma')!.community).toBe(0);
+    expect(byName.get('Delta')!.community).toBeUndefined();
+    expect(g.communities).toHaveLength(1);
+    expect(g.communities[0]).toMatchObject({ id: 0, size: 3 });
+    expect(g.nodes.some((n) => n.id === g.communities[0].hub && n.name === g.communities[0].label)).toBe(true);
+    // an agent's graph search is the read itself: no communities, nothing added to what it pays for
+    expect('communities' in (await graphOverview(ws.store))).toBe(false);
   });
 });
 

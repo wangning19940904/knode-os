@@ -281,7 +281,7 @@ knode-os connect codex    # 在 ~/.codex/config.toml 追加 [mcp_servers.knode-o
 
 ## REST API
 
-`GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/notices · /api/playbooks · /api/playbooks/file?path · /api/tree[?path&depth&dirs] · /api/file · /api/file/citations?path · /api/search · /api/search/explore?q[&mode&k&sources]（各通道排名的段落、查询命中的实体、它们的关系与论断） · /api/search/suggest?q[&limit] · /api/tasks（队列：阶段、在途调用、worker、任务、后台工作、定时任务） · /api/graph[?limit&types&edges] · /api/graph/insights · /api/entities[?q&type&sort&order&offset&limit&merged] · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
+`GET /api/health · /api/config · /api/config/providers · /api/plugins · /api/stats · /api/notices · /api/playbooks · /api/playbooks/file?path · /api/tree[?path&depth&dirs] · /api/file · /api/file/citations?path · /api/search · /api/search/explore?q[&mode&k&sources]（各通道排名的段落、查询命中的实体、它们的关系与论断） · /api/search/suggest?q[&limit] · /api/tasks（队列：阶段、在途调用、worker、任务、后台工作、定时任务） · /api/graph[?limit&types&edges]（每个节点带所属 `community`，并列出图谱视图画成“岛”的 `communities`） · /api/graph/insights · /api/entities[?q&type&sort&order&offset&limit&merged] · /api/documents · /api/okf/validate · /api/traces · /api/suggestions`
 内容语言：`GET /api/languages` · `GET /api/file?path&lang`（有译文时返回该语言的文档，`languages` 说明各译文进度） · `POST /api/file/translate`（`{ path, lang, cancel? }`）
 `PUT /api/config` · `PUT /api/file` · `PUT /api/playbooks/file` · `DELETE /api/playbooks/file`（重置为自带版本） · `DELETE /api/file` · `POST /api/config/test | /api/upload | /api/ingest | /api/ask | /api/mv | /api/mkdir | /api/traces/sync | /api/dream | /api/wiki/generate | /api/suggestions/:id/status`
 
