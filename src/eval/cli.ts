@@ -7,6 +7,7 @@ import { exportAudit, importAudit } from './audit.js';
 import { installExternal } from './install.js';
 import { QuotaGuard, withRefusalRetry } from './quota.js';
 import { formatGrepability, grepability } from './grepability.js';
+import { claimsByDoc, coverage, docResolver, formatCoverage, readClaims, readClaimsFile, readWiki, workspaceDatabaseUrl, type BuildIndex, type ClaimRow } from './coverage.js';
 import { abstainAnswered, formatLint, lintBeforeRun, lintPack } from './lint.js';
 import { loadPack, packsDir, validatePack } from './pack.js';
 import { listRecipes, recipe } from './packs/index.js';
@@ -40,6 +41,14 @@ function authorClient(opts: { author: string | false; authorModel?: string; auth
  * `knode-os eval …` (docs/design/23 §7): build and validate benchmark packs,
  * install the external systems, run a benchmark and render its report.
  */
+
+/** `--judge-decoys`: a whole number of decoys a pack, 0 for none. */
+function judgeDecoysOption(opts: { judgeDecoys?: string }): number {
+  if (opts.judgeDecoys === undefined) return 0;
+  const n = Number(opts.judgeDecoys);
+  if (!Number.isInteger(n) || n < 0 || n > 200) throw new Error('--judge-decoys: a whole number of decoys a pack, 0 to 200');
+  return n;
+}
 
 const csv = (v: string | undefined) => (v ? v.split(',').map((s) => s.trim()).filter(Boolean) : undefined);
 
@@ -354,6 +363,45 @@ export function registerEvalCommands(program: Command): void {
     });
 
   pack
+    .command('coverage <dir>')
+    .description("where a pack's gold answers sit in an existing knode build, per question family: the evidence document's own summary page, entity and timeline pages, other pages, mention pages alone, and the claims (no model; the build's database is only read)")
+    .requiredOption('--workspace <dir>', 'the build: a knode workspace whose wiki/ holds its pages (an evaluation workspace, or a copy of one)')
+    .option('--database-url <url>', "PostgreSQL holding the build's claims (default: what the workspace's knode.config.json names); read in a read-only transaction")
+    .option('--schema <name>', "the build's schema (default: the one whose comment names the workspace's directory, else its directory's name)")
+    .option('--claims <file>', 'read the claims from this JSON Lines export instead ({"path","statement","value"} a line)')
+    .option('--no-claims', 'leave the claims out')
+    .option('--types <list>', 'only tasks of these types, comma-separated')
+    .option('--json <file>', 'write the numbers, and where each question\'s gold was found, as JSON')
+    .action(async (dir: string, opts: { workspace: string; databaseUrl?: string; schema?: string; claims?: string | false; types?: string; json?: string }) => {
+      const p = loadPack(resolvePack(dir));
+      const workspace = path.resolve(opts.workspace);
+      const wikiDir = path.join(workspace, 'wiki');
+      if (!fs.existsSync(wikiDir)) throw new Error(`no wiki/ in ${workspace}`);
+      const resolve = docResolver(p.docs.map((d) => d.path));
+      const index: BuildIndex = readWiki(wikiDir, resolve);
+      let claimCount = 0;
+      if (opts.claims !== false) {
+        let rows: ClaimRow[] | null = null;
+        if (typeof opts.claims === 'string') rows = readClaimsFile(opts.claims);
+        else {
+          const url = opts.databaseUrl ?? workspaceDatabaseUrl(workspace);
+          if (url) {
+            const r = await readClaims(url, { schema: opts.schema, workspace });
+            console.error(`claims: ${r.rows.length} from schema ${r.schema}`);
+            rows = r.rows;
+          } else console.error('claims: the workspace names no PostgreSQL database (give --database-url or --claims): left out');
+        }
+        if (rows) {
+          index.claims = claimsByDoc(rows, resolve);
+          claimCount = rows.length;
+        }
+      }
+      const result = coverage(p, index, { workspace, types: csv(opts.types), claimCount });
+      console.log(formatCoverage(result));
+      if (opts.json) fs.writeFileSync(opts.json, JSON.stringify(result, null, 1) + '\n');
+    });
+
+  pack
     .command('measure <dir>')
     .description('how far a pack can be answered by lookup, without a model: question terms in gold documents, single-document share, corpus size and shape, hops; plus the two cheapest lint checks')
     .option('--write', 'keep the result as measure.json beside the pack')
@@ -446,6 +494,8 @@ export function registerEvalCommands(program: Command): void {
     .option('--repeat-systems <list>', 'with --repeat: only these systems (default: every system that answers)')
     .option('--judge-list-batch <n>', 'lists the judge matches in one call (default 1: a list\'s verdict depends on that list alone, one call a list; 8 was the earlier behaviour and takes an eighth of the calls)')
     .option('--judge-audit <share>', 'judge this share of the verdicts a second time, in calls of their own with the items in another order, and list where the two disagree (default 0.05, at least 20 a pass; 0 = off)')
+    .option('--judge-decoys <n>', "mix n decoys a pack into the judge's grading batches: answers built without a model from the gold and other questions' answers, on topic and wrong; the report gives the share the judge passed (default 0: none)")
+    .option('--allow-judge-change', "go on although the judge differs from the one the run recorded (another --judge/--judge-model, or a reply naming another model than the run's judge answered with) and record the change in run.json and the report; without it the run refuses")
     .option('--repeat-sample <n>', 'with --repeat: repeat only a seeded sample of n tasks per pack, stratified by task type and the same for every repeated system (the first answer still covers every task)')
     .option('--no-lint', 'run even when `eval pack lint` finds something in a pack (it runs first otherwise, and a finding stops the run before anything is spent)')
     .action(async (opts) => {
@@ -481,6 +531,8 @@ export function registerEvalCommands(program: Command): void {
         repeatSample: repeatSampleOption(opts),
         judgeAudit: judgeAuditOption(opts),
         judgeListBatch: judgeListBatchOption(opts),
+        allowJudgeChange: Boolean(opts.allowJudgeChange),
+        judgeDecoys: judgeDecoysOption(opts),
         packs: csv(opts.pack)!.map(resolvePack),
         // a track is recorded as the systems it stands for, so a resumed run asks the same ones
         systems: expandSystems(csv(opts.systems) ?? DEFAULT_SYSTEMS),
@@ -657,10 +709,12 @@ export function registerEvalCommands(program: Command): void {
     .option('--pool <name>', 'the judge\'s calls require this pool (workers started with --pool <name>, and --local slots)')
     .option('--judge-list-batch <n>', 'lists the judge matches in one call (default 1: a list\'s verdict depends on that list alone, one call a list; 8 was the earlier behaviour and takes an eighth of the calls)')
     .option('--judge-audit <share>', 'judge this share of the verdicts a second time, in calls of their own with the items in another order, and list where the two disagree (default 0.05, at least 20 a pass; 0 = off)')
+    .option('--judge-decoys <n>', "mix n decoys a pack into the judge's grading batches: answers built without a model from the gold and other questions' answers, on topic and wrong; the report gives the share the judge passed (default 0: none)")
+    .option('--allow-judge-change', "go on although the judge differs from the one the run recorded (another --judge/--judge-model, or a reply naming another model than the run's judge answered with) and record the change in run.json and the report; without it the run refuses")
     .action(async (runDir: string, opts) => {
       let n: number;
       try {
-        n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, judgeConcurrency: judgeConcurrencyOption(opts), onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts), waitMinutes: waitMinutesOption(opts), pool: poolOption(opts), judgeAudit: judgeAuditOption(opts), judgeListBatch: judgeListBatchOption(opts) });
+        n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, allowJudgeChange: Boolean(opts.allowJudgeChange), judgeDecoys: judgeDecoysOption(opts), judgeConcurrency: judgeConcurrencyOption(opts), onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts), waitMinutes: waitMinutesOption(opts), pool: poolOption(opts), judgeAudit: judgeAuditOption(opts), judgeListBatch: judgeListBatchOption(opts) });
       } catch (err) {
         if (!(err instanceof RunStoppedError)) throw err;
         console.error(`\n${err.message}`);

@@ -36,6 +36,8 @@ export interface MeterEvent extends MeterTag {
   backend?: string;
   /** The pool of the worker that answered (docs/design/32 §2); absent = this machine. */
   pool?: string;
+  /** The model that answered, as the reply named it, where it differs from what was asked or the asking cannot see it (the judge's calls). */
+  served?: string;
 }
 
 /** Parse a shim tag carried as the bearer token: `sys=<system>;stage=<stage>;task=<task>`. */

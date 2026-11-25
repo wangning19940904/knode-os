@@ -27,6 +27,29 @@ export interface CallUsage {
   /** Request and response bodies, where the backend sends them itself (an HTTP endpoint). */
   bytesUp?: number;
   bytesDown?: number;
+  /**
+   * The model that answered, as the reply names it (Claude Code's `modelUsage`: the one that wrote the most),
+   * which a routing layer between the caller and the provider may have changed. Absent when the reply names none.
+   */
+  model?: string;
+}
+
+/** The fields of a usage that count something. */
+type UsageCount = Exclude<keyof CallUsage, 'model'>;
+
+/** The model a Claude Code result names in `modelUsage`: the one that wrote the most output, null with none. */
+export function modelFromClaudeResult(wrapper: unknown): string | null {
+  const mu = obj(obj(wrapper).modelUsage);
+  let best: string | null = null;
+  let most = -1;
+  for (const [name, v] of Object.entries(mu)) {
+    const out = num(obj(v).outputTokens ?? obj(v).output_tokens);
+    if (name.trim() && out > most) {
+      best = name.trim();
+      most = out;
+    }
+  }
+  return best;
 }
 
 const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0);
@@ -76,6 +99,8 @@ export function usageFromClaudeResult(wrapper: unknown): CallUsage | null {
   });
   const cost = num(w.total_cost_usd);
   if (usage && cost) usage.costUsd = cost;
+  const model = modelFromClaudeResult(wrapper);
+  if (usage && model) usage.model = model;
   return usage;
 }
 
@@ -146,7 +171,7 @@ export function readCodexEvents(stdout: string): CodexEvents {
       };
       // a resumed thread's report is its running total: it replaces what the thread had, never adds to it
       if (current.resumed) current.usage = turn;
-      else for (const k of Object.keys(turn) as (keyof CallUsage)[]) current.usage[k] = (current.usage[k] ?? 0) + (turn[k] ?? 0);
+      else for (const k of Object.keys(turn) as UsageCount[]) current.usage[k] = (current.usage[k] ?? 0) + (turn[k] ?? 0);
     } else if (event.type === 'turn.failed') {
       const message = obj(event.error).message;
       if (typeof message === 'string' && message.trim()) error = message.trim();
@@ -156,7 +181,7 @@ export function readCodexEvents(stdout: string): CodexEvents {
     }
   }
   const total = zero();
-  for (const t of threads.values()) for (const k of Object.keys(total) as (keyof CallUsage)[]) total[k] = (total[k] ?? 0) + (t.usage[k] ?? 0);
+  for (const t of threads.values()) for (const k of Object.keys(total) as UsageCount[]) total[k] = (total[k] ?? 0) + (t.usage[k] ?? 0);
   return { usage: counted(total), error, threadId };
 }
 
@@ -182,5 +207,7 @@ export function sanitizeUsage(value: unknown): CallUsage | null {
     usage.bytesUp = cap(u.bytesUp, 1e9);
     usage.bytesDown = cap(u.bytesDown, 1e9);
   }
+  // the model that answered, as the worker's reply named it
+  if (typeof u.model === 'string' && u.model.trim()) usage.model = u.model.trim().slice(0, 120);
   return usage;
 }

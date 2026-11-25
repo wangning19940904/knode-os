@@ -8,6 +8,8 @@ import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings
 import { createConfiguredEmbeddingProvider } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
 import { AUDIT_DEFAULT_SHARE, Judge, JUDGE_SYSTEM, type JudgeAudit } from './judge.js';
+import { judgeChangeOf, recordJudgeChange, ServedJudgeGuard } from './judge-identity.js';
+import { appendDecoy, buildDecoys, decoyRecord, readDecoys, type Decoy } from './decoys.js';
 import { ModelChain, parseChain, SpendLedger } from './chain.js';
 import { setAgentRouting, setAgentStopping } from './agent.js';
 import { Meter } from './meter.js';
@@ -195,6 +197,17 @@ export interface RunOptions {
    * pass; 0: off). Recorded in the run's `judge-audit.jsonl`.
    */
   judgeAudit?: number;
+  /**
+   * Go on when the judge differs from the one `run.json` records — given on the command line, or answering
+   * under it (a routing layer) — and record the change (`judgeChanges`); without it the run refuses
+   * (src/eval/judge-identity.ts).
+   */
+  allowJudgeChange?: boolean;
+  /**
+   * Decoys a pack mixed into the judge's grading batches (src/eval/decoys.ts): answers built without a model
+   * that are on topic and wrong, whose verdicts go to `judge-decoys.jsonl` and the report's pass rate (0: none).
+   */
+  judgeDecoys?: number;
   /** Lists the judge matches in one call (default 1: a list's verdict depends on that list alone; more saves judge calls). */
   judgeListBatch?: number;
   /** Answer each task this many times, for run-to-run variance (default 1: today's keys). */
@@ -531,6 +544,11 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const localJudge = opts.overrides?.judge
     ?? (opts.judgeChain ? chain(opts.judgeChain).asClient()
       : new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 }));
+  // one judge a run (docs/design/38 E3): a resume that would score with another refuses before anything is spent
+  const judgeNow = { connection: opts.judgeChain ?? opts.judgeProvider ?? 'claude-cli', label: localJudge.label };
+  const judgeChange = opts.skipScoring ? null : judgeChangeOf(store.meta(), judgeNow, Boolean(opts.allowJudgeChange), 'run');
+  // the model answering each judge call, checked once the run's metadata is open
+  let servedGuard: ServedJudgeGuard | null = null;
   // the run only publishes (docs/design/32): to serve's broker on this machine, or one of its own
   // the queue's id for the run: the directory's name, made one a queue carries when it is not
   const runId = queueRunId(path.basename(runDir));
@@ -595,6 +613,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       client: judgeClient, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl'),
       width: judgeWidth(remote, judgeFamily(opts.judgeProvider ?? 'claude-cli'), judgeEligible, judgeCap(opts, placement)),
       listBatchSize: opts.judgeListBatch,
+      served: (model) => servedGuard?.served(model),
     });
     const models = { model: opts.model ?? '', buildEffort: opts.buildEffort ?? 'low', answerEffort: opts.answerEffort ?? 'medium' };
     judge.audit(judgeAuditFor(opts.judgeAudit, seed, store));
@@ -655,6 +674,12 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       ...(opts.strata?.length ? { strata: opts.strata } : {}),
     };
     meta.database ??= { kind: database.kind, at: describeDatabase(database) };
+    if (judgeChange) {
+      recordJudgeChange(meta, judgeNow, judgeChange);
+      progress(`judge changed from ${judgeChange.from} to ${judgeChange.to} (--allow-judge-change): recorded in run.json`);
+      store.log('judge changed', { ...judgeChange });
+    }
+    if (!opts.skipScoring) servedGuard = new ServedJudgeGuard(meta, Boolean(opts.allowJudgeChange), 'run', () => store.writeMeta(meta), chainLog);
     meta.agentSample = { limit: agentLimit, updateLimit: agentUpdateLimit, allocation, byPack: meta.agentSample?.byPack ?? {}, updates: meta.agentSample?.updates ?? {} };
     store.writeMeta(meta);
     opened.meta = meta;
@@ -889,7 +914,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     if (stop.signal.aborted) throw remote.stopped ?? new RunCancelledError();
     if (!opts.skipScoring) {
       try {
-        await scoreAnswers(store, judge, { tasks: tasksByKey, corpusDocs, citing }, progress, meter);
+        await scoreAnswers(store, judge, { tasks: tasksByKey, corpusDocs, citing, decoys: { perPack: opts.judgeDecoys ?? 0, seed } }, progress, meter);
       } catch (err) {
         // the pass writes its scores at its end: a stuck judge call leaves the whole pass for a resume (its verdicts are cached)
         if (!(err instanceof PieceStuckError)) throw err;
@@ -908,9 +933,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     }
     throw remote.stopped ?? err;
   } finally {
-    // the stuck pieces of this start of the run, for its report, however it ended
-    if (remote.stuck.length && opened.meta) {
-      opened.meta.stuck = remote.stuck.map((p) => ({ ...p, lastError: p.lastError.slice(0, 500) }));
+    // the stuck pieces of this start of the run, for its report, however it ended; and what the judge's replies named
+    if (opened.meta) {
+      if (remote.stuck.length) opened.meta.stuck = remote.stuck.map((p) => ({ ...p, lastError: p.lastError.slice(0, 500) }));
       store.writeMeta(opened.meta);
     }
     remote.close();
@@ -1027,7 +1052,7 @@ function fileLineCount(file: string): number {
  */
 export async function scoreAnswers(
   store: RunStore, judge: Judge,
-  ctx: { tasks: Map<string, Task>; corpusDocs: Map<string, Set<string>>; citing: Set<string> },
+  ctx: { tasks: Map<string, Task>; corpusDocs: Map<string, Set<string>>; citing: Set<string>; decoys?: { perPack: number; seed: string | number } },
   progress: (m: string) => void = () => {},
   meter?: Meter,
 ): Promise<number> {
@@ -1040,6 +1065,16 @@ export async function scoreAnswers(
   if (!answers.length) return 0;
   progress(`scoring ${answers.length} answers`);
   const citing = ctx.citing;
+  // decoys (docs/design/38 E8): wrong answers mixed into this pass's grading batches, each judged once a run
+  if (ctx.decoys && ctx.decoys.perPack > 0) {
+    const done = new Set(readDecoys(store.dir).map((r) => r.key));
+    const packs = new Set(answers.map((a) => a.pack));
+    const decoys = buildDecoys(ctx.tasks, store.allAnswers().filter((a) => packs.has(a.pack)), ctx.decoys).filter((d) => !done.has(d.id));
+    if (decoys.length) {
+      progress(`judge decoys: ${decoys.length} wrong answers mixed into the grading`);
+      judge.mixDecoys(decoys, (item, v) => appendDecoy(store.dir, decoyRecord(item as Decoy, v)));
+    }
+  }
   // where the judge's calls ran, on every score of the pass (docs/design/27 §8)
   const mark = meter?.mark() ?? 0;
   const pending: ScoreRecord[] = [];
@@ -1069,13 +1104,23 @@ function where(p: Placed | null): { worker?: string; backend?: string } {
  * its records and the packs it names — with no model of its own running, so
  * only while the run itself is stopped.
  */
-export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; judgeAudit?: number; judgeListBatch?: number; judgeConcurrency?: number; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
+export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; allowJudgeChange?: boolean; judgeDecoys?: number; judgeAudit?: number; judgeListBatch?: number; judgeConcurrency?: number; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
   const store = new RunStore(runDir);
   const meta = store.meta();
   if (!meta) throw new Error(`not a run directory: ${runDir}`);
   const meter = new Meter(path.join(runDir, 'meter.jsonl'));
   const quota = new QuotaGuard({ enabled: false, log: (m, d) => opts.onProgress?.(`${m}${d ? ` ${JSON.stringify(d)}` : ''}`) });
   const local = new LlmClient({ provider: opts.judgeProvider ?? 'claude-cli', baseUrl: '', apiKey: '', model: opts.judgeModel ?? '', cliPath: '', cliTimeoutMs: 600_000 });
+  // one judge a run (docs/design/38 E3): the scoring refuses another judge than the run's, unless allowed
+  const judgeNow = { connection: opts.judgeProvider ?? 'claude-cli', label: local.label };
+  const judgeChange = judgeChangeOf(meta, judgeNow, Boolean(opts.allowJudgeChange), 'score');
+  if (judgeChange) {
+    recordJudgeChange(meta, judgeNow, judgeChange);
+    store.writeMeta(meta);
+    store.log('judge changed', { ...judgeChange });
+    opts.onProgress?.(`judge changed from ${judgeChange.from} to ${judgeChange.to} (--allow-judge-change): recorded in run.json`);
+  }
+  const servedGuard = new ServedJudgeGuard(meta, Boolean(opts.allowJudgeChange), 'score', () => store.writeMeta(meta), (m) => opts.onProgress?.(m));
   const tasks = new Map<string, Task>();
   const corpusDocs = new Map<string, Set<string>>();
   const packs: LoadedPack[] = [];
@@ -1102,6 +1147,7 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
     throw remote.stopped ?? err;
   } finally {
     remote.close();
+    store.writeMeta(meta);
   }
 
   async function scoreWith(remote: RemoteEval): Promise<number> {
@@ -1111,7 +1157,7 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
       family, model: opts.judgeModel ?? '', effort: agent?.effort ?? null,
       eligible, backend: agent ? `${agent.family}-cli:${agent.model}` : null,
     });
-    const judge = new Judge({ client, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl'), width: judgeWidth(remote, family, eligible, judgeCap(opts, placement)), listBatchSize: opts.judgeListBatch });
+    const judge = new Judge({ client, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl'), width: judgeWidth(remote, family, eligible, judgeCap(opts, placement)), listBatchSize: opts.judgeListBatch, served: (model) => servedGuard.served(model) });
     for (const pack of packs) {
       for (const t of pack.tasks) tasks.set(`${pack.manifest.id}|${t.id}`, t);
       const docs = new Set(pack.docs.map((d) => d.path));
@@ -1122,7 +1168,7 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
     const citing = new Set(makeSystems(meta!.systems).filter((s) => s.answers && s.kind !== 'reference' && s.cites !== false).map((s) => s.id));
     // the scoring's own slots start last: anything above that throws leaves none behind
     if (placement.local) remote.startLocal(placement.local);
-    return scoreAnswers(store, judge, { tasks, corpusDocs, citing }, opts.onProgress, meter);
+    return scoreAnswers(store, judge, { tasks, corpusDocs, citing, decoys: { perPack: opts.judgeDecoys ?? 0, seed: meta!.seed } }, opts.onProgress, meter);
   }
 }
 

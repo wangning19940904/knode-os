@@ -7,6 +7,7 @@ import { bootstrapMean, holm, mean, minimumDetectableEffect, pairedBootstrap, ro
 import { describeAllocation, questionClasses, SAMPLE_TIERS, type AgentSample, type AnswerScore, type QuestionClass, type TypeEvidence, type TypeTaken } from './allocation.js';
 import { fileLines, RunStore } from './runstore.js';
 import { judgeItemKey } from './score/keys.js';
+import { decoySummary, readDecoys, type DecoySummary, type DecoySummaryRow } from './decoys.js';
 import { SYSTEMS } from './systems/index.js';
 import { toolsOf, toolUse, type ToolUse } from './trace.js';
 import { CORPUS_TASK_TYPES, SEPARATION_TASK_TYPES, type BuildRecord, type ScoreRecord } from './types.js';
@@ -27,7 +28,7 @@ const LIST_METRICS = ['correctness', 'set_precision', 'set_recall', 'set_f1', 'o
 const SEPARATION_METRICS = ['correctness', 'stale_answer', 'confident_wrong', 'distractor_rate', 'citation_precision'] as const;
 const RATE_METRICS = ['correctness', 'em', 'abstain_correct', 'false_refusal', 'hallucinated', 'label_correct', 'all@5', 'injection_success', 'confident_wrong', 'stale_answer'];
 /** Queries a build is amortized over in the cost-normalized table. */
-export const AMORTIZE_AT = [100, 1000] as const;
+export const AMORTIZE_AT = [100, 1000, 10000] as const;
 
 /** The build group a system answers from (its build's cost is its own), or none. */
 export function groupOf(system: string): string | null {
@@ -52,11 +53,23 @@ export interface Efficiency {
   /** Mean weighted tokens per query over the system's own answers. */
   queryTokens: number;
   per1k: number | null;
+  /** The first build's weighted tokens (its update batches apart). */
   buildTokens: number;
+  /** The update batches' incremental builds (`<group>@NN`), summed: absent on reports from before they were counted. */
+  updateTokens?: number;
+  /** What the build cost in all, first build and update batches: what break-even and the amortized columns spread. */
+  totalBuildTokens?: number;
   /** null: the build never pays back (the system costs as much per query as agent-grep, or more). */
   breakEven: number | null;
   amortized: Record<string, number | null>;
   n: number;
+}
+
+/** A build's cost per corpus document: weighted tokens and model calls, over the documents it was given. */
+export interface BuildPerDoc {
+  documents: number;
+  weightedTokens: number;
+  calls: number;
 }
 
 export interface Paired {
@@ -214,6 +227,33 @@ export interface JudgeAuditSummary {
   }[];
 }
 
+/** The judge's pass rate on decoys: wrong, on-topic answers mixed into its grading batches. */
+function decoyLines(s: DecoySummary | undefined): string[] {
+  if (!s) return [];
+  const pct = (x: number, n: number) => (n ? `${x} (${((x / n) * 100).toFixed(0)}%)` : '0');
+  const row = (label: string, r: DecoySummaryRow) => [label, r.n, pct(r.passed, r.n), pct(r.partial, r.n), r.n ? `[${wilson(r.passed, r.n).map((x) => x.toFixed(2)).join(', ')}]` : '—'];
+  const out = ['## Judge decoys', '', `Answers known to be wrong but on topic (\`--judge-decoys\`: the question's gold with its number shifted, another question's gold of the same type, or another question's answer), mixed into the judge's grading batches and never scored. "Passed" is a full grade (2) for a wrong answer: the share is how often the judge lets one through. Interval: Wilson, 95%.`, ''];
+  out.push(mdTable(['decoys', 'n', 'passed (2)', 'partly right (1)', 'passed 95% CI'], [
+    row('**all**', s.all), ...Object.entries(s.byHow).sort().map(([h, r]) => row(h, r)), ...Object.entries(s.byPack).sort().map(([p, r]) => row(p, r)),
+  ]), '');
+  if (s.passedItems.length) {
+    out.push(`### Passed decoys (${s.passedItems.length})`, '');
+    out.push(mdTable(['pack', 'task', 'how', 'decoy answer', 'reference', 'judge\'s reason'], s.passedItems.map((p) => [p.pack, p.taskId, p.how, cellText(p.answer, 120), cellText(p.reference, 120), cellText(p.reason ?? '—', 100)])), '');
+  }
+  return out;
+}
+
+/** The judge changes a resume or scoring went on with (`--allow-judge-change`), from run.json. */
+function judgeChangeLines(meta: ReportData['run']): string[] {
+  const changes = meta?.judgeChanges ?? [];
+  if (!changes.length) return [];
+  return [
+    `## Judge changes (${changes.length})`, '',
+    'The judge differed from the one the run had recorded, and the run was told to go on (`--allow-judge-change`): "configured", another judge on the command line; "served", the judge\'s replies named another model than before (a routing layer changed it). Scores before and after a change come from different judges.', '',
+    mdTable(['at', 'kind', 'from', 'to', 'by'], changes.map((c) => [c.at, c.kind, cellText(c.from), cellText(c.to), c.by])), '',
+  ];
+}
+
 /** The run's judge audit: agreement per kind, and each disagreement with the answer it was about. */
 export function judgeAuditOf(store: RunStore): JudgeAuditSummary | undefined {
   const recs = store.allJudgeAudits();
@@ -278,7 +318,7 @@ export interface ReportData {
    * `weightedTokens` and `costUsd` are means over the answers with usage on record: `unmetered` counts those stopped
    * at their command cap before any was reported; `closed`, the capped ones answered in their closing turn.
    */
-  perQuery: Record<string, Record<string, { latencyP50: number; toolCalls: number; weightedTokens: number; costUsd: number; n: number; capped: number; unmetered?: number; closed?: number; leaked: number; errors: number }>>;
+  perQuery: Record<string, Record<string, { latencyP50: number; latencyP90?: number; toolCalls: number; weightedTokens: number; costUsd: number; n: number; capped: number; unmetered?: number; closed?: number; leaked: number; errors: number }>>;
   /**
    * What the agents did, per pack and agent system: tool calls per answer and
    * the programs (shell agents) or knode tools (the MCP agent) behind them,
@@ -286,7 +326,16 @@ export interface ReportData {
    */
   tools: Record<string, Record<string, ToolUse>>;
   builds: BuildRecord[];
+  /**
+   * Per pack and build group: the queries after which the build (first build and update batches) has paid for
+   * itself against agent-grep, for the group's usual answerer (knode-ask for knode). `breakEvenBySystem` has it
+   * for every system that answers from the build.
+   */
   breakEven: Record<string, Record<string, number | null>>;
+  /** Per pack, build group and every system that answers from that build (knode-ask and each knode agent arm): its break-even. */
+  breakEvenBySystem?: Record<string, Record<string, Record<string, number | null>>>;
+  /** Per pack and build record (first builds and update batches): weighted tokens and model calls per document it was given. */
+  buildPerDoc?: Record<string, Record<string, BuildPerDoc>>;
   /** Corpus-level list tasks (aggregate, timeline, contradiction, profile) per pack and system. */
   lists: Record<string, Record<string, Record<string, Cell>>>;
   /**
@@ -324,6 +373,8 @@ export interface ReportData {
   judgeUsage: { calls: number; weightedTokens: number; costUsd: number };
   /** The judge audit (`--judge-audit`): verdicts judged twice, how often the two agreed, and every disagreement. */
   judgeAudit?: JudgeAuditSummary;
+  /** Decoys mixed into the judge's grading (`--judge-decoys`): how many it graded right although they are wrong. */
+  judgeDecoys?: DecoySummary;
   /**
    * Where the run's model work ran (docs/design/32): per pool and worker, the
    * model calls and agent sessions it answered (replays from the reply cache
@@ -413,6 +464,7 @@ export function buildReportData(runDir: string): ReportData {
     for (const [system, p] of Object.entries(bySystem)) {
       const lat = answers.filter((a) => a.pack === pack && a.system === system).map((a) => a.ms).sort((x, y) => x - y);
       p.latencyP50 = lat[Math.floor(lat.length / 2)] ?? 0;
+      p.latencyP90 = quantile(lat, 0.9);
       p.toolCalls /= p.n;
       // over the answers whose usage is on record: a stopped session's is unknown, not zero
       const metered = Math.max(1, p.n - (p.unmetered ?? 0));
@@ -434,15 +486,10 @@ export function buildReportData(runDir: string): ReportData {
     (tools[pack] ??= {})[system] = toolUse(as);
   }
 
-  // queries after which a build has paid for itself against the grep agent's per-query cost
-  const breakEven: ReportData['breakEven'] = {};
-  for (const b of builds.filter((x) => x.ok && !x.system.includes('@'))) {
-    const answerer = GROUP_ANSWERER[b.system];
-    const grep = perQuery[b.pack]?.[BASELINE]?.weightedTokens;
-    const own = answerer ? perQuery[b.pack]?.[answerer]?.weightedTokens : undefined;
-    if (grep === undefined || own === undefined) continue;
-    (breakEven[b.pack] ??= {})[b.system] = grep > own ? b.usage.weightedTokens / (grep - own) : null;
-  }
+  // queries after which a build (and its update batches) has paid for itself against the grep agent's per-query cost:
+  // for the group's usual answerer, and for every system that answers from the build
+  const { breakEven, breakEvenBySystem } = breakEvenOf(perQuery, builds);
+  const buildPerDoc = buildPerDocOf(builds, store.meta()?.staged);
 
   // pooled paired comparison of correctness against the baseline, over the tasks both answered (repeats averaged per task)
   const perTask = new Map<string, number[]>();
@@ -526,13 +573,15 @@ export function buildReportData(runDir: string): ReportData {
   const variance = varianceOf(answers, scores);
   const repeatPairs = repeatPairsOf(answers, scores);
 
+  const decoys = decoySummary(readDecoys(runDir));
   const judgeEvents = fs.existsSync(path.join(runDir, 'meter.jsonl'))
     ? fs.readFileSync(path.join(runDir, 'meter.jsonl'), 'utf8').split('\n').filter((l) => l.includes('"__judge__"')).length
     : 0;
   return {
-    run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, tools, builds, breakEven, lists, efficiency, updates, pooled, paired, byType, typesByPack, typeDeltas,
+    run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, tools, builds, breakEven, breakEvenBySystem, buildPerDoc, lists, efficiency, updates, pooled, paired, byType, typesByPack, typeDeltas,
     separation, costPerCorrect, ...(ladder.length ? { ladder } : {}), ...(discrimination ? { discrimination } : {}), ...(separability ? { separability } : {}), ...(Object.keys(knodeTools).length ? { knodeTools } : {}),
     variance, repeatPairs, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 }, judgeAudit: judgeAuditOf(store),
+    ...(decoys ? { judgeDecoys: decoys } : {}),
     ranAt: ranAtOf(runDir, store.meta()?.work?.pool ?? 'local'),
   };
 }
@@ -994,7 +1043,74 @@ export function varianceOf(answers: ReturnType<RunStore['allAnswers']>, scores: 
   return out;
 }
 
-/** Correctness per 1k query tokens, and with the build counted: break-even against agent-grep and amortized over 100 / 1000 queries. */
+/** The q-quantile of sorted values (nearest rank), 0 with none. */
+export function quantile(sorted: number[], q: number): number {
+  if (!sorted.length) return 0;
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1))];
+}
+
+/**
+ * What a group's build cost in a pack, all of it: the first build that
+ * succeeded, and every update batch's incremental build (`<group>@NN`) that
+ * did. Null when the group has no successful first build there.
+ */
+export function buildCostOf(builds: BuildRecord[], pack: string, group: string): { first: number; updates: number; total: number; calls: number } | null {
+  const first = builds.find((b) => b.pack === pack && b.system === group && b.ok);
+  if (!first) return null;
+  const ups = builds.filter((b) => b.pack === pack && b.ok && b.system.startsWith(`${group}@`));
+  const updates = ups.reduce((s, b) => s + b.usage.weightedTokens, 0);
+  return { first: first.usage.weightedTokens, updates, total: first.usage.weightedTokens + updates, calls: first.usage.calls + ups.reduce((s, b) => s + b.usage.calls, 0) };
+}
+
+/** Queries after which a build that cost `build` pays for itself against a baseline: null when the system is not cheaper per query. */
+const breakEvenAt = (build: number, baseline: number, own: number): number | null => (own < baseline ? build / (baseline - own) : null);
+
+/**
+ * Break-even per build (docs/design/38 §8.1): for every first build that
+ * succeeded, the queries after which it — its update batches included — has
+ * cost less than answering with agent-grep, for each system of the run that
+ * answers from it (`groupOf`), and under `breakEven` for the group's usual
+ * answerer as before.
+ */
+export function breakEvenOf(perQuery: ReportData['perQuery'], builds: BuildRecord[]): { breakEven: ReportData['breakEven']; breakEvenBySystem: NonNullable<ReportData['breakEvenBySystem']> } {
+  const breakEven: ReportData['breakEven'] = {};
+  const breakEvenBySystem: NonNullable<ReportData['breakEvenBySystem']> = {};
+  for (const b of builds.filter((x) => x.ok && !x.system.includes('@'))) {
+    const grep = perQuery[b.pack]?.[BASELINE]?.weightedTokens;
+    if (grep === undefined) continue;
+    const cost = buildCostOf(builds, b.pack, b.system)!;
+    for (const [system, p] of Object.entries(perQuery[b.pack] ?? {})) {
+      if (system === BASELINE || groupOf(system) !== b.system) continue;
+      ((breakEvenBySystem[b.pack] ??= {})[b.system] ??= {})[system] = breakEvenAt(cost.total, grep, p.weightedTokens);
+    }
+    const answerer = GROUP_ANSWERER[b.system];
+    const own = answerer ? perQuery[b.pack]?.[answerer]?.weightedTokens : undefined;
+    if (own !== undefined) (breakEven[b.pack] ??= {})[b.system] = breakEvenAt(cost.total, grep, own);
+  }
+  return { breakEven, breakEvenBySystem };
+}
+
+/**
+ * Per build record, weighted tokens and model calls per document: a first
+ * build over the documents the run staged for its pack, an update batch over
+ * the files it added (`notes.files`). Records with neither are left out.
+ */
+export function buildPerDocOf(builds: BuildRecord[], staged: Record<string, { documents: number }> | undefined): NonNullable<ReportData['buildPerDoc']> {
+  const out: NonNullable<ReportData['buildPerDoc']> = {};
+  for (const b of builds) {
+    const files = typeof b.notes?.files === 'number' ? b.notes.files : null;
+    const documents = b.system.includes('@') ? files : staged?.[b.pack]?.documents ?? null;
+    if (!documents) continue;
+    (out[b.pack] ??= {})[b.system] = { documents, weightedTokens: b.usage.weightedTokens / documents, calls: b.usage.calls / documents };
+  }
+  return out;
+}
+
+/**
+ * Correctness per 1k query tokens, and with the build counted — its update
+ * batches included: break-even against agent-grep, and correctness per 1k
+ * tokens with the build spread over each of `AMORTIZE_AT` queries.
+ */
 export function efficiencyOf(
   usage: ReportData['usage'], perQuery: ReportData['perQuery'], builds: BuildRecord[],
 ): ReportData['efficiency'] {
@@ -1004,14 +1120,14 @@ export function efficiencyOf(
     for (const [system, p] of Object.entries(bySystem)) {
       const correctness = usage[pack]?.[system]?.correctness?.value ?? null;
       const group = groupOf(system);
-      const build = group ? builds.find((b) => b.pack === pack && b.system === group && b.ok) : undefined;
-      const buildTokens = build?.usage.weightedTokens ?? 0;
+      const cost = group ? buildCostOf(builds, pack, group) : null;
+      const total = cost?.total ?? 0;
       const per1k = (tokens: number) => (correctness === null || tokens <= 0 ? null : correctness / (tokens / 1000));
-      const breakEven = grep === undefined || system === BASELINE ? null : p.weightedTokens < grep ? buildTokens / (grep - p.weightedTokens) : null;
+      const breakEven = grep === undefined || system === BASELINE ? null : breakEvenAt(total, grep, p.weightedTokens);
       (out[pack] ??= {})[system] = {
-        correctness, queryTokens: p.weightedTokens, per1k: per1k(p.weightedTokens), buildTokens,
+        correctness, queryTokens: p.weightedTokens, per1k: per1k(p.weightedTokens), buildTokens: cost?.first ?? 0, updateTokens: cost?.updates ?? 0, totalBuildTokens: total,
         breakEven: system === BASELINE ? 0 : breakEven,
-        amortized: Object.fromEntries(AMORTIZE_AT.map((q) => [String(q), per1k(p.weightedTokens + buildTokens / q)])),
+        amortized: Object.fromEntries(AMORTIZE_AT.map((q) => [String(q), per1k(p.weightedTokens + total / q)])),
         n: p.n,
       };
     }
@@ -1259,12 +1375,31 @@ function placementLines(d: ReportData): string[] {
   return out;
 }
 
+/**
+ * Total cost against queries answered (docs/design/38 §8.1): build (with its
+ * update batches) plus N × the per-query tokens, at N = 0 and each of
+ * `AMORTIZE_AT`, for the baseline and every system that answers from a build.
+ */
+function totalCostLines(pack: string, eff: Record<string, Efficiency>): string[] {
+  const shown = Object.entries(eff).filter(([s, x]) => s === BASELINE || (x.totalBuildTokens ?? x.buildTokens) > 0).sort(([a], [b]) => (a === BASELINE ? -1 : b === BASELINE ? 1 : a.localeCompare(b)));
+  if (shown.length < 2) return [];
+  const at = [0, ...AMORTIZE_AT];
+  const total = (x: Efficiency, n: number) => (x.totalBuildTokens ?? x.buildTokens) + n * x.queryTokens;
+  return [
+    '#### Total cost by queries answered', '',
+    mdTable(['system', ...at.map((n) => `N = ${n.toLocaleString('en-US')}`)], shown.map(([s, x]) => [s, ...at.map((n) => fmtNum(total(x, n)))])), '',
+    chartBlock({ type: 'line', title: `${pack}: total weighted tokens by queries answered`, unit: 'weighted tokens', x: at.map((n) => n.toLocaleString('en-US')), series: shown.slice(0, 8).map(([s, x]) => ({ name: s, values: at.map((n) => Math.round(total(x, n))) })), source: 'builds.jsonl, answers.jsonl' }), '',
+  ];
+}
+
 export function renderReport(d: ReportData): string {
   const meta = d.run;
   const lines: string[] = [];
   lines.push(`# Knowledge benchmark — ${meta?.id ?? ''}`, '');
   if (meta) {
-    lines.push(`- Model: ${meta.model.label} (build effort ${meta.model.buildEffort}, answer effort ${meta.model.answerEffort}); judge: ${meta.judge.label}; embedder: ${meta.embedding}`);
+    const served = meta.judge.served ? `, answering as ${meta.judge.served}` : '';
+    const unnamed = meta.judge.unnamed ? ` (${meta.judge.unnamed} judge replies named no model)` : '';
+    lines.push(`- Model: ${meta.model.label} (build effort ${meta.model.buildEffort}, answer effort ${meta.model.answerEffort}); judge: ${meta.judge.label}${served}${unnamed}; embedder: ${meta.embedding}`);
     // knode's index backend (docs/design/31 D1): runs on PGlite and on PostgreSQL are compared, not pooled
     lines.push(`- knode index: ${meta.database?.at ?? 'pglite'}${meta.database?.poolSize ? ` (pool of ${meta.database.poolSize})` : ''}`);
     lines.push(`- Packs: ${d.packs.join(', ')}; systems: ${d.systems.join(', ')}; corpus fraction ${meta.fraction}, seed ${meta.seed}; git ${meta.gitSha?.slice(0, 10) ?? '?'}`);
@@ -1285,7 +1420,9 @@ export function renderReport(d: ReportData): string {
     lines.push(chartBlock({ type: 'hbar', title: `Correctness difference vs ${BASELINE}`, unit: 'Δ correctness (0–1)', x: sys, series: [{ name: 'Δ correctness', values: d.pooled.map((c) => round(c.diff, 3)) }], source: 'scores.jsonl' }), '');
   }
 
+  lines.push(...judgeChangeLines(meta));
   lines.push(...judgeAuditLines(d.judgeAudit));
+  lines.push(...decoyLines(d.judgeDecoys));
 
   for (const pack of d.packs) {
     lines.push(`## ${pack}`, '');
@@ -1321,8 +1458,8 @@ export function renderReport(d: ReportData): string {
     const pq = d.perQuery[pack];
     if (pq) {
       lines.push('### Per-query cost', '');
-      lines.push(mdTable(['system', 'answers', 'p50 latency', 'tool calls', 'weighted tokens', 'USD (API prices)', 'capped', 'leaked', 'errors'],
-        Object.entries(pq).sort().map(([s, p]) => [s, p.n, fmtMs(p.latencyP50), p.toolCalls.toFixed(1), fmtNum(p.weightedTokens), p.costUsd.toFixed(4), p.capped, p.leaked, p.errors])), '');
+      lines.push(mdTable(['system', 'answers', 'p50 latency', 'p90 latency', 'tool calls', 'weighted tokens', 'USD (API prices)', 'capped', 'leaked', 'errors'],
+        Object.entries(pq).sort().map(([s, p]) => [s, p.n, fmtMs(p.latencyP50), p.latencyP90 === undefined ? '—' : fmtMs(p.latencyP90), p.toolCalls.toFixed(1), fmtNum(p.weightedTokens), p.costUsd.toFixed(4), p.capped, p.leaked, p.errors])), '');
       const stopped = Object.entries(pq).filter(([, p]) => p.unmetered).sort();
       if (stopped.length) lines.push(`Stopped at the command cap before any usage was reported, an empty answer each: ${stopped.map(([s, p]) => `${s} ${p.unmetered} of ${p.n}`).join(', ')}. Their tokens are unknown and are left out of the means above; their correctness is 0, so a comparison of correctness between these systems also compares how often each was stopped.`, '');
       const closed = Object.entries(pq).filter(([, p]) => p.closed).sort();
@@ -1343,13 +1480,15 @@ export function renderReport(d: ReportData): string {
     const eff = d.efficiency[pack];
     if (eff && Object.values(eff).some((x) => x.correctness !== null)) {
       lines.push('### Correctness for its cost', '');
-      lines.push(`Per 1k weighted query tokens; "with build @ N" spreads the build's weighted tokens over N queries; break-even is the queries after which the build has cost less than answering with ${BASELINE}.`, '');
-      lines.push(mdTable(['system', 'correctness', 'tokens / query', 'per 1k tokens', 'build tokens', ...AMORTIZE_AT.map((q) => `with build @ ${q}`), 'break-even queries'],
+      lines.push(`Per 1k weighted query tokens; "with build @ N" spreads the build's weighted tokens — the first build and every update batch — over N queries; break-even is the queries after which that build has cost less than answering with ${BASELINE}, for each system that answers from it.`, '');
+      const amort = (x: Efficiency, q: number) => x.amortized[String(q)];
+      lines.push(mdTable(['system', 'correctness', 'tokens / query', 'per 1k tokens', 'build tokens', 'update tokens', ...AMORTIZE_AT.map((q) => `with build @ ${q}`), 'break-even queries'],
         Object.entries(eff).sort().map(([s, x]) => [
-          s, x.correctness === null ? '—' : round(x.correctness, 3).toFixed(3), fmtNum(x.queryTokens), x.per1k === null ? '—' : round(x.per1k, 4).toFixed(4), fmtNum(x.buildTokens),
-          ...AMORTIZE_AT.map((q) => (x.amortized[String(q)] === null ? '—' : round(x.amortized[String(q)]!, 4).toFixed(4))),
+          s, x.correctness === null ? '—' : round(x.correctness, 3).toFixed(3), fmtNum(x.queryTokens), x.per1k === null ? '—' : round(x.per1k, 4).toFixed(4), fmtNum(x.buildTokens), x.updateTokens ? fmtNum(x.updateTokens) : '—',
+          ...AMORTIZE_AT.map((q) => (amort(x, q) === null || amort(x, q) === undefined ? '—' : round(amort(x, q)!, 4).toFixed(4))),
           s === BASELINE ? '—' : x.breakEven === null ? 'never' : fmtNum(x.breakEven),
         ])), '');
+      lines.push(...totalCostLines(pack, eff));
     }
     const ups = d.updates[pack];
     if (ups?.length) {
@@ -1372,11 +1511,22 @@ export function renderReport(d: ReportData): string {
     const b = d.builds.filter((x) => x.pack === pack);
     if (b.length) {
       lines.push('### Build cost', '');
-      lines.push(mdTable(['build', 'ok', 'wall', 'LLM time', 'calls', 'input', 'cached', 'output', 'weighted tokens', 'embedding tokens', 'USD (API prices)', 'disk', 'peak RSS', 'break-even queries'],
+      const perDoc = d.buildPerDoc?.[pack] ?? {};
+      const bySys = d.breakEvenBySystem?.[pack] ?? {};
+      const beText = (x: BuildRecord) => {
+        const per = bySys[x.system];
+        if (per && Object.keys(per).length) return Object.entries(per).sort().map(([s, v]) => `${s} ${v === null ? 'never' : fmtNum(v)}`).join('; ');
+        const v = d.breakEven[pack]?.[x.system];
+        return v === undefined ? '—' : v === null ? 'never' : fmtNum(v);
+      };
+      lines.push(`Per document: over the documents the run staged for the pack (a first build) or the files an update batch added. Break-even counts the first build and its update batches together, for each system that answers from the build, against ${BASELINE}.`, '');
+      lines.push(mdTable(['build', 'ok', 'wall', 'LLM time', 'calls', 'input', 'cached', 'output', 'weighted tokens', 'embedding tokens', 'USD (API prices)', 'tokens / document', 'calls / document', 'disk', 'peak RSS', 'break-even queries'],
         b.map((x) => [
           x.system, x.ok ? 'yes' : `no: ${(x.error ?? '').slice(0, 40)}`, fmtMs(x.ms), fmtMs(x.usage.llmMs), x.usage.calls, fmtNum(x.usage.inputTokens), fmtNum(x.usage.cachedInputTokens), fmtNum(x.usage.outputTokens),
-          fmtNum(x.usage.weightedTokens), fmtNum(x.usage.embeddingTokens), x.usage.costUsd.toFixed(3), `${(x.bytes / 1e6).toFixed(1)} MB`, x.peakRssBytes ? `${(x.peakRssBytes / 1e6).toFixed(0)} MB` : '—',
-          d.breakEven[pack]?.[x.system] === undefined ? '—' : d.breakEven[pack][x.system] === null ? 'never' : fmtNum(d.breakEven[pack][x.system]),
+          fmtNum(x.usage.weightedTokens), fmtNum(x.usage.embeddingTokens), x.usage.costUsd.toFixed(3),
+          perDoc[x.system] ? fmtNum(perDoc[x.system].weightedTokens) : '—', perDoc[x.system] ? perDoc[x.system].calls.toFixed(1) : '—',
+          `${(x.bytes / 1e6).toFixed(1)} MB`, x.peakRssBytes ? `${(x.peakRssBytes / 1e6).toFixed(0)} MB` : '—',
+          x.system.includes('@') ? '—' : beText(x),
         ])), '');
       const stages = b.filter((x) => Object.keys(x.stages).length);
       for (const x of stages) {
